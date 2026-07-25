@@ -4,10 +4,10 @@
 >
 > | | |
 > |---|---|
-> | **Next step** | **1.1 · `docs/format.md` — the data model** (see Phase 1 below) |
+> | **Next step** | **1.2 · `docs/opcodes.md` — complete command reference** (see Phase 1 below) |
 > | **Phase** | 1 of 6 — Documentation |
-> | **Gate** | ⛔ Phase 1 **not yet approved**. Ask before starting. |
-> | **Last done** | 0.3 · test corpus (`c7f53c7`) |
+> | **Gate** | ✅ Phase 1 approved and in progress. |
+> | **Last done** | 1.1 · `docs/format.md` |
 >
 > Update this block in the same commit that ticks a checkbox.
 
@@ -66,7 +66,7 @@ needs the roadmap to understand its task has been given a task that is not yet w
 
 Every step in this phase draws on [S1] and [S2] from [Sources](#sources), and on nothing else.
 
-- [ ] **1.1 · `docs/format.md` — the data model** *(Sonnet 5)*
+- [x] **1.1 · `docs/format.md` — the data model** *(Sonnet 5)*
       Byte-level layout of `mdat`/`smpl`. Header fields with offsets. The 96-word table (32
       song starts / 32 ends / 32 tempos). Both layout variants and how to tell them apart.
       Trackstep record layout. Pattern longword encoding (top-two-bits classification). Macro
@@ -76,6 +76,12 @@ Every step in this phase draws on [S1] and [S2] from [Sources](#sources), and on
       trackstep / pattern / macro pointers → data), both variants; bit-field diagrams for the
       trackstep word, pattern longword and macro longword.
       *Check:* every stated offset traceable to a quoted line of the spec.
+
+> Finding from 1.1, verified against all 5 fixed-layout corpus files: **[S1]'s fixed-layout
+> offsets `$600,$200,$400` are wrong.** `$200`–`$3FF` is entirely zero; the real tables are
+> pattern pointers at `$400`, macro pointers at `$600`, trackstep at `$800` — the spec's triple
+> shifted `$200` low. `$400` is corroborated by [S1]'s own §3 fallback sentence. Step 2.2 must
+> use `$400/$600/$800`. See `docs/format.md` §3.2.
 
 - [ ] **1.2 · `docs/opcodes.md` — complete command reference** *(Sonnet 5)*
       Three tables transcribed in full: trackstep `$EFFE` commands, pattern commands
