@@ -4,10 +4,10 @@
 >
 > | | |
 > |---|---|
-> | **Next step** | **3.2 · `Paula::render()`** (see Phase 3 below) |
+> | **Next step** | **3.3 · DMA state feedback** (see Phase 3 below) |
 > | **Phase** | 3 of 6 — Paula mixer |
 > | **Gate** | ✅ Phase 3 approved and in progress. |
-> | **Last done** | 3.1 · `Voice`/`Paula` register file and setters |
+> | **Last done** | 3.2 · `Paula::render()` — interpolated, panned, clamped mixer |
 >
 > Update this block in the same commit that ticks a checkbox.
 
@@ -142,7 +142,7 @@ Every step in this phase draws on [S1] and [S2] from [Sources](#sources), and on
 
 - [x] **3.1** `Voice { start, len, period, volume, dma_on, loop_start, loop_len }` plus
       fractional position, and the setters the sequencer calls. *(Sonnet 5)*
-- [ ] **3.2** `Paula::render()`: linear interpolation, one-shot → loop transition, hardware
+- [x] **3.2** `Paula::render()`: linear interpolation, one-shot → loop transition, hardware
       panning with the separation knob, volume scaling, clamped output. — *check: synthetic
       1000 Hz sine at a known period, count zero crossings, assert within 0.5 %* *(Sonnet 5)*
 - [ ] **3.3** DMA state feedback: expose the loop-completion count for macro `1A`. — *check: a
