@@ -4,10 +4,10 @@
 >
 > | | |
 > |---|---|
-> | **Next step** | **4.2 · Trackstep runner** (see Phase 4 below) |
+> | **Next step** | **4.3 · Pattern decoder** (see Phase 4 below) |
 > | **Phase** | 4 of 6 — Sequencer (the hard part) |
 > | **Gate** | ✅ Phase 4 approved and in progress. |
-> | **Last done** | 4.1 · Tick scheduling — `TickClock`, exact-rational jiffy boundaries |
+> | **Last done** | 4.2 · Trackstep runner — `Sequencer`, `$EFFE` line commands, `$80`/`$FF`/`$FE` track words, song start/end/loop, `PlaySection` repeat |
 >
 > Update this block in the same commit that ticks a checkbox.
 
@@ -153,9 +153,22 @@ Every step in this phase draws on [S1] and [S2] from [Sources](#sources), and on
 - [x] **4.1** Tick scheduling: `samples_until_next_tick`, the 50 Hz path and the CIA path,
       block-size independence. — *check: 1 second rendered as one 48000-frame call and as 480
       hundred-frame calls is bit-identical* *(Opus 5)*
-- [ ] **4.2** Trackstep runner: `$EFFE` commands, `$80` hold with transpose, `$FF`/`$FE` stop,
+- [x] **4.2** Trackstep runner: `$EFFE` commands, `$80` hold with transpose, `$FF`/`$FE` stop,
       song start/end/loop. — *check: trace the first 200 ticks and verify against
       `docs/format.md`* *(Opus 5)*
+> Finding from 4.2: the format gives the trackstep exactly one shared line
+> pointer (one `PlaySection`/song-start/song-end index, not one per track),
+> so the "8 tracks, 1 line" model is settled. What is *not* settled, because
+> it needs a pattern to exist at all: whether the line advance is gated on
+> every active track's pattern reaching `$F0 <End>`, or fires unconditionally
+> per tick. `Sequencer::advance()` is deliberately an explicit,
+> externally-triggered step (not tied to `TickClock`) so step 4.3 can wire in
+> whichever trigger the pattern decoder needs without reshaping this step's
+> API. Also inferred, absent a stated rule: `PlaySection`'s `times` counts
+> *additional* repeats after the one just played (mirrors pattern `$F1
+> <Loop>`'s "repeats ... `aa` times"), and reaching past `song_end` with no
+> redirecting command falls back to looping to `song_start`.
+
 - [ ] **4.3** Pattern decoder: longword classification, notes with detune, notes with wait,
       portamento, `$F0`–`$FF`. Triggers macros with channel, note, volume. — *check: pattern
       dump is self-consistent* *(Opus 5)*

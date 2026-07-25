@@ -679,6 +679,14 @@ copy error; see [`opcodes.md`](opcodes.md) for the exact byte layouts.
 - The rounding convention for period arithmetic (note→period, portamento's
   per-step multiply) — [S1] states the formulas' inputs but never a
   rounding rule.
+- What actually triggers a trackstep line advance: [S1] ties it to a
+  pattern's `$F0 <End>` (`docs/opcodes.md` §2), but does not say whether
+  *every* active track's pattern must reach it before the shared line
+  pointer moves, or whether any one track's `$F0` is enough. The format
+  itself settles that there is exactly one shared line pointer (one
+  `PlaySection`/song-start/song-end index, not per-track), just not the
+  gating condition. Left to step 4.3, once a pattern decoder exists to make
+  the question answerable.
 *Resolved, previously open:* whether pattern/macro jump targets are absolute
 `mdat` offsets or pattern-relative. They are pattern-relative longword step
 indices, verified across all 229 jump/loop commands in the corpus — see the

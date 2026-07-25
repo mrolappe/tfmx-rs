@@ -24,6 +24,7 @@ const FIXED_TRACKSTEP_OFFSET: u32 = 0x800;
 const MAX_PATTERNS: u8 = 128;
 const MAX_MACROS: u8 = 128;
 const POINTER_ENTRY_LEN: usize = 4;
+const TRACKSTEP_LINE_LEN: usize = 16;
 
 /// Which of the two on-disk header layouts a module uses. See
 /// `docs/format.md` §3: detection is a plain zero check on the three longs
@@ -95,7 +96,12 @@ impl<'a> Module<'a> {
                     FIXED_MACRO_PTR_OFFSET,
                 )
             } else {
-                (Layout::Packed, raw_trackstep, raw_pattern_ptr, raw_macro_ptr)
+                (
+                    Layout::Packed,
+                    raw_trackstep,
+                    raw_pattern_ptr,
+                    raw_macro_ptr,
+                )
             };
 
         Ok(Module {
@@ -166,6 +172,20 @@ impl<'a> Module<'a> {
     /// `$07 STOP`. `docs/format.md` §7.
     pub fn macro_(&self, n: u8) -> Result<&'a [u8], AccessError> {
         pointer_table_entry(self.mdat, self.macro_ptr_offset, n, MAX_MACROS)
+    }
+
+    /// Trackstep line `line`'s 16 raw bytes (8 words, one per track).
+    /// `docs/format.md` §5; decoding the words is the trackstep runner's job
+    /// (step 4.2), not this accessor's.
+    pub fn trackstep_line(&self, line: u16) -> Result<&'a [u8; 16], AccessError> {
+        let start = (self.trackstep_offset as usize)
+            .checked_add(line as usize * TRACKSTEP_LINE_LEN)
+            .ok_or(AccessError::OutOfRange)?;
+        let end = start
+            .checked_add(TRACKSTEP_LINE_LEN)
+            .ok_or(AccessError::OutOfRange)?;
+        let bytes = self.mdat.get(start..end).ok_or(AccessError::OutOfRange)?;
+        Ok(bytes.try_into().expect("slice of TRACKSTEP_LINE_LEN bytes"))
     }
 
     /// Signed 8-bit PCM sample bytes `[offset, offset+len)` from `smpl`.
@@ -255,20 +275,14 @@ mod tests {
     fn rejects_bad_magic() {
         let mut mdat = vec![0u8; HEADER_LEN];
         mdat[0..10].copy_from_slice(b"NOT-A-TFMX");
-        assert_eq!(
-            Module::parse(&mdat, &[]).unwrap_err(),
-            ParseError::BadMagic
-        );
+        assert_eq!(Module::parse(&mdat, &[]).unwrap_err(), ParseError::BadMagic);
     }
 
     #[test]
     fn rejects_truncated_header() {
         let mut mdat = vec![0u8; HEADER_LEN - 1];
         mdat[0..10].copy_from_slice(b"TFMX-SONG ");
-        assert_eq!(
-            Module::parse(&mdat, &[]).unwrap_err(),
-            ParseError::TooShort
-        );
+        assert_eq!(Module::parse(&mdat, &[]).unwrap_err(), ParseError::TooShort);
     }
 
     #[test]
@@ -292,8 +306,8 @@ mod tests {
             eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
             return;
         };
-        let smpl = read_corpus("smpl.turrican 2 level 1-desert")
-            .expect("smpl present alongside mdat");
+        let smpl =
+            read_corpus("smpl.turrican 2 level 1-desert").expect("smpl present alongside mdat");
         let module = Module::parse(&mdat, &smpl).expect("valid header parses");
 
         assert_eq!(module.layout(), Layout::Packed);
@@ -323,8 +337,7 @@ mod tests {
                 eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
                 return;
             };
-            let smpl =
-                read_corpus(&format!("smpl.{name}")).expect("smpl present alongside mdat");
+            let smpl = read_corpus(&format!("smpl.{name}")).expect("smpl present alongside mdat");
             let module = Module::parse(&mdat, &smpl).unwrap_or_else(|e| panic!("{name}: {e:?}"));
             assert_eq!(module.layout(), expected, "{name}");
         }
@@ -336,8 +349,8 @@ mod tests {
             eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
             return;
         };
-        let smpl = read_corpus("smpl.turrican 2 level 1-desert")
-            .expect("smpl present alongside mdat");
+        let smpl =
+            read_corpus("smpl.turrican 2 level 1-desert").expect("smpl present alongside mdat");
         let module = Module::parse(&mdat, &smpl).expect("valid header parses");
 
         // docs/format.md §6: pattern-pointer table at $3078, entry 0 = $00000A48,
@@ -376,13 +389,47 @@ mod tests {
     }
 
     #[test]
+    fn trackstep_line_known_file() {
+        let Some(mdat) = read_corpus("mdat.turrican intro") else {
+            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+            return;
+        };
+        let smpl = read_corpus("smpl.turrican intro").expect("smpl present alongside mdat");
+        let module = Module::parse(&mdat, &smpl).expect("valid header parses");
+
+        // Song 0 starts at line 75; `$800 + 75*16 = $838` reads a $EFFE
+        // MasterVolSlide(B) command, verified by direct byte inspection.
+        assert_eq!(module.song_start(0), 75);
+        let line = module.trackstep_line(75).expect("line in range");
+        assert_eq!(
+            line,
+            &[
+                0xEF, 0xFE, 0x00, 0x04, 0x00, 0x00, 0x00, 0x40, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00,
+                0xFF, 0x00
+            ]
+        );
+    }
+
+    #[test]
+    fn trackstep_line_out_of_range_is_err_not_panic() {
+        let mut mdat = vec![0u8; HEADER_LEN];
+        mdat[0..10].copy_from_slice(b"TFMX-SONG ");
+        let module = Module::parse(&mdat, &[]).expect("minimal header parses");
+
+        assert_eq!(
+            module.trackstep_line(u16::MAX).unwrap_err(),
+            AccessError::OutOfRange
+        );
+    }
+
+    #[test]
     fn sample_access_known_file() {
         let Some(mdat) = read_corpus("mdat.turrican 2 level 1-desert") else {
             eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
             return;
         };
-        let smpl = read_corpus("smpl.turrican 2 level 1-desert")
-            .expect("smpl present alongside mdat");
+        let smpl =
+            read_corpus("smpl.turrican 2 level 1-desert").expect("smpl present alongside mdat");
         let smpl_len = smpl.len() as u32;
         let module = Module::parse(&mdat, &smpl).expect("valid header parses");
 
