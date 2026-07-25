@@ -4,10 +4,10 @@
 >
 > | | |
 > |---|---|
-> | **Next step** | **6.1 · Golden-hash regression tests**. |
-> | **Phase** | 5 of 6 — CLI — complete; Phase 6 not yet approved |
-> | **Gate** | Phase 5 complete — awaiting approval to start Phase 6 |
-> | **Last done** | 5.2 · `tfmx-cli info` — prints header text, the 32-entry song/tempo table, detected layout, and runs the song to collect the `unsupported_ops()` histogram; `run_info()` tested directly (in-process), verified end to end across the corpus |
+> | **Next step** | **6.2 · A/B listening pass against a reference recording**. |
+> | **Phase** | 6 of 6 — Verification and tuning — approved, in progress |
+> | **Gate** | none — awaiting 6.2 |
+> | **Last done** | 6.1 · Golden-hash regression tests — SHA-256 of the first 10 s of song 0 for every corpus module in `tfmx-cli/tests/golden.txt`, regenerated via `TFMX_REGEN_GOLDEN=1 cargo test -p tfmx-cli --test golden`; perturbing `Paula`'s volume-scale constant confirmed to fail it |
 >
 > Update this block in the same commit that ticks a checkbox.
 
@@ -210,9 +210,21 @@ Every step in this phase draws on [S1] and [S2] from [Sources](#sources), and on
 
 ### Phase 6 — Verification and tuning
 
-- [ ] **6.1** Golden-hash regression tests: SHA-256 of the first 10 s per module in
+- [x] **6.1** Golden-hash regression tests: SHA-256 of the first 10 s per module in
       `tests/golden.txt`, with a documented regeneration command. — *check: perturbing the
       volume scale makes it fail* *(Sonnet 5)*
+
+> Finding from 6.1: the golden-hash render surfaced a real bug the 1-second `info` check never
+> reached. `mdat.r-type` song 0's declared (inclusive) `song_end` is line 79, which the song
+> loops back onto every ~80 ticks; `decode_track_word` read that line's track-0 word (hi byte
+> `$FA`) as pattern number 250, out of the 128-pattern range, and `Player::render` propagated
+> the resulting `AccessError` as fatal, aborting the whole render partway through. `$00`-`$7F`,
+> `$80`, `$FE`, `$FF` are the only hi-byte values `docs/format.md` §5 documents; `$81`-`$FD` is
+> unstated. Fixed by masking the pattern-number branch to 7 bits (`number & 0x7F`) instead of
+> using the raw byte, matching the existing tolerance for the voice nibble in `Player::voice_of`
+> — 128 patterns only ever need 7 bits, so a stray top bit is dropped rather than erroring out
+> the render. All 10 corpus files now render 10 s of song 0 without error; `tfmx/src/sequencer.rs`
+> carries a unit test built from the real `mdat.r-type` word.
 - [ ] **6.2** A/B listening pass against a reference recording. Judge in this order: **tempo**
       (the classic bug), pitch, instrument attack, timbre. — *check: per-module notes in
       `docs/status.md`, remaining deviations listed rather than hidden* *(Opus 5)*

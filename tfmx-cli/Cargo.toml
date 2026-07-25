@@ -12,3 +12,6 @@ authors.workspace = true
 tfmx = { path = "../tfmx" }
 clap = { version = "4", features = ["derive"] }
 hound = "3"
+
+[dev-dependencies]
+sha2 = "0.10"

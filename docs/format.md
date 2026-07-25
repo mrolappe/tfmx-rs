@@ -309,6 +309,17 @@ stopped) followed by a line `0000 0100 FF00 FF00 FF00 FF00 FF00 FF00`
 words = parameters) are listed in full in [`opcodes.md`](opcodes.md) §1;
 this document only establishes the record shape.
 
+**Uncertain** — [S1] gives no meaning to hi bytes `$81`-`$FD`: only
+`$00`-`$7F`, `$80`, `$FE` and `$FF` are documented. **[C]** `mdat.r-type`
+song 0's own declared (inclusive) `song_end`, trackstep line 79, contains
+one: track 0's word is `$FA01`. Since only 7 bits are ever needed for a
+pattern number (128 patterns max), this crate reads a hi byte outside the
+three sentinels as a pattern number with the top bit masked off (`$FA` →
+`$7A` = 122) rather than rejecting it — the same tolerance already applied
+to the voice nibble in `Player::voice_of` (`tfmx/src/player.rs`). Verified end to end:
+`mdat.r-type` song 0 now renders past line 79 on every loop without an
+out-of-range error. `ROADMAP.md`, "Finding from 6.1".
+
 ---
 
 ## 6. Pattern data

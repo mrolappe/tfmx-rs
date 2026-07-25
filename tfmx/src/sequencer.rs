@@ -155,8 +155,14 @@ fn decode_track_word(word: u16) -> TrackSlot {
         },
         0xFE => TrackSlot::StopVoice { voice: lo },
         0xFF => TrackSlot::StopChannel,
+        // `docs/format.md` §5 only documents $00-$7F as a pattern number;
+        // $81-$FD is unstated. Masked rather than rejected, matching the
+        // voice-nibble tolerance in `Player::voice_of` -- 128 patterns only
+        // ever need 7 bits, so a stray top bit is dropped instead of
+        // erroring out the whole render (see the test for the real corpus
+        // word this comes from).
         number => TrackSlot::Pattern {
-            number,
+            number: number & 0x7F,
             transpose: lo as i8,
         },
     }
@@ -843,6 +849,27 @@ mod tests {
             decode_track_word(0x0001),
             TrackSlot::Pattern {
                 number: 0x00,
+                transpose: 1
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_undocumented_high_bit_as_masked_pattern_number() {
+        // $FA01: hi byte $FA falls outside every documented case ($00-$7F
+        // pattern, $80 hold, $FE stop voice, $FF stop channel) --
+        // `docs/format.md` §5 gives no meaning to $81-$FD. Real word from
+        // `mdat.r-type` song 0 trackstep line 79, the song's declared
+        // (inclusive) end line, which real playback does reach every loop.
+        // Only 7 bits are ever needed for a pattern number (max 128
+        // patterns), so this crate reads $80 as a sentinel bit and masks it
+        // off for every other value rather than erroring out the whole
+        // render over one stray bit -- the same tolerance already applied
+        // to the voice nibble in `Player::voice_of`.
+        assert_eq!(
+            decode_track_word(0xFA01),
+            TrackSlot::Pattern {
+                number: 0x7A,
                 transpose: 1
             }
         );
