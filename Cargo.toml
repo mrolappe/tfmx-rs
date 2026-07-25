@@ -1,0 +1,15 @@
+[workspace]
+members = ["tfmx", "tfmx-cli"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mrolappe/tfmx-rs"
+authors = ["Marco Rolappe"]
+
+[profile.release]
+# Playback is a tight per-sample loop; let LLVM see the whole crate graph.
+lto = true
+codegen-units = 1

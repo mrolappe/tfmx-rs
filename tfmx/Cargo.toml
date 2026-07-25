@@ -1,0 +1,15 @@
+[package]
+name = "tfmx"
+description = "Decoder and software mixer for Amiga TFMX music modules"
+keywords = ["amiga", "tfmx", "chiptune", "audio", "module"]
+categories = ["multimedia::audio", "parser-implementations"]
+readme = "../README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# No dependencies, deliberately: the core must build unchanged for
+# wasm32-unknown-unknown and stay usable in no_std contexts later.
+[dependencies]
