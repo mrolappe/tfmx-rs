@@ -4,10 +4,10 @@
 >
 > | | |
 > |---|---|
-> | **Next step** | **2.2 · Layout detection** (see Phase 2 below) |
+> | **Next step** | **2.3 · Bounds-checked accessors** (see Phase 2 below) |
 > | **Phase** | 2 of 6 — Parser |
 > | **Gate** | ✅ Phase 2 approved and in progress. |
-> | **Last done** | 2.1 · `Module::parse` (magic, text area, 96-word table) |
+> | **Last done** | 2.2 · Layout detection and pointer-table resolution |
 >
 > Update this block in the same commit that ticks a checkbox.
 
@@ -131,7 +131,7 @@ Every step in this phase draws on [S1] and [S2] from [Sources](#sources), and on
 - [x] **2.1** `Module::parse(mdat, smpl) -> Result<Module, ParseError>`: magic, text area,
       96-word table. Borrowed slices, no sample copying. — *check: unit test asserts magic,
       song count, tempo values for a known file* *(Sonnet 5)*
-- [ ] **2.2** Layout detection (zero check at `$1D0`) and resolution of the trackstep,
+- [x] **2.2** Layout detection (zero check at `$1D0`) and resolution of the trackstep,
       pattern-pointer and macro-pointer tables. — *check: all 10 corpus files parse; detected
       variant matches `testdata/README.md`* *(Sonnet 5)*
 - [ ] **2.3** Bounds-checked accessors `pattern(n)`, `macro_(n)`, `sample(offset, len)` — the
