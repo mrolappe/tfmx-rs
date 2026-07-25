@@ -4,10 +4,10 @@
 >
 > | | |
 > |---|---|
-> | **Next step** | **1.2 · `docs/opcodes.md` — complete command reference** (see Phase 1 below) |
+> | **Next step** | **1.3 · `docs/playback-model.md` — how sound is produced** (see Phase 1 below) |
 > | **Phase** | 1 of 6 — Documentation |
 > | **Gate** | ✅ Phase 1 approved and in progress. |
-> | **Last done** | 1.1 · `docs/format.md` |
+> | **Last done** | 1.2 · `docs/opcodes.md` |
 >
 > Update this block in the same commit that ticks a checkbox.
 
@@ -83,7 +83,7 @@ Every step in this phase draws on [S1] and [S2] from [Sources](#sources), and on
 > shifted `$200` low. `$400` is corroborated by [S1]'s own §3 fallback sentence. Step 2.2 must
 > use `$400/$600/$800`. See `docs/format.md` §3.2.
 
-- [ ] **1.2 · `docs/opcodes.md` — complete command reference** *(Sonnet 5)*
+- [x] **1.2 · `docs/opcodes.md` — complete command reference** *(Sonnet 5)*
       Three tables transcribed in full: trackstep `$EFFE` commands, pattern commands
       `$F0`–`$FF`, macro opcodes `$00`–`$21`. Columns: opcode, mnemonic, operand layout,
       effect, confidence (documented / inferred / unknown). Opcodes `$22`–`$29` and the `$FE`
