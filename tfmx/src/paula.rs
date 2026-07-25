@@ -31,6 +31,10 @@ pub struct Voice {
     /// Sub-sample playback position within `[start, start+len)`, as a
     /// `FRAC_BITS`-fraction fixed-point value; mixer-internal only (step 3.2).
     frac: u64,
+    /// Times the active sample region has completed a play-through since
+    /// the last `reset_loop_completions` call -- the `$1A` feedback path.
+    /// `docs/playback-model.md` §6.
+    loop_completions: u32,
 }
 
 impl Voice {
@@ -67,6 +71,7 @@ impl Voice {
                 self.start = self.loop_start;
                 self.len = self.loop_len;
             }
+            self.loop_completions = self.loop_completions.wrapping_add(1);
         }
 
         value
@@ -128,6 +133,17 @@ impl Paula {
 
     pub fn set_dma(&mut self, voice: u8, on: bool) {
         self.voices[voice as usize].dma_on = on;
+    }
+
+    /// Times `voice`'s active sample region has completed a play-through
+    /// since the last `reset_loop_completions` call -- the `$1A <Wait on
+    /// DMA>` feedback path. `docs/playback-model.md` §6.
+    pub fn loop_completions(&self, voice: u8) -> u32 {
+        self.voices[voice as usize].loop_completions
+    }
+
+    pub fn reset_loop_completions(&mut self, voice: u8) {
+        self.voices[voice as usize].loop_completions = 0;
     }
 
     /// Synthesizes `out.len() / 2` interleaved stereo frames from whatever
@@ -349,6 +365,53 @@ mod tests {
             out.iter().all(|&s| s == i16::MAX),
             "expected four full-scale voices summed and clamped to i16::MAX, got {out:?}"
         );
+    }
+
+    #[test]
+    fn loop_completions_counts_wraparounds() {
+        let sample_rate = 8_000u32;
+        // one source sample consumed per output frame.
+        let period = (PAULA_CLOCK_HZ / sample_rate as f64).round() as u16;
+        let source = vec![100i8; 100]; // 50-word loop region
+
+        let mut paula = Paula::new(0);
+        paula.set_period(0, period);
+        paula.set_volume(0, 64);
+        paula.set_sample_region(0, 0, 50);
+        paula.set_loop_region(0, 0, 50);
+        paula.set_dma(0, true);
+
+        assert_eq!(paula.loop_completions(0), 0);
+
+        let mut out = vec![0i16; 1000 * 2]; // 10 loop lengths
+        paula.render(&source, sample_rate, &mut out);
+
+        assert_eq!(paula.loop_completions(0), 10);
+    }
+
+    #[test]
+    fn reset_loop_completions_zeroes_only_target_voice() {
+        let sample_rate = 8_000u32;
+        let period = (PAULA_CLOCK_HZ / sample_rate as f64).round() as u16;
+        let source = vec![100i8; 100];
+
+        let mut paula = Paula::new(0);
+        for voice in 0..2u8 {
+            paula.set_period(voice, period);
+            paula.set_volume(voice, 64);
+            paula.set_sample_region(voice, 0, 50);
+            paula.set_loop_region(voice, 0, 50);
+            paula.set_dma(voice, true);
+        }
+
+        let mut out = vec![0i16; 500 * 2]; // 5 loop lengths
+        paula.render(&source, sample_rate, &mut out);
+        assert_eq!(paula.loop_completions(0), 5);
+        assert_eq!(paula.loop_completions(1), 5);
+
+        paula.reset_loop_completions(0);
+        assert_eq!(paula.loop_completions(0), 0);
+        assert_eq!(paula.loop_completions(1), 5);
     }
 
     #[test]
