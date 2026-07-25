@@ -4,10 +4,10 @@
 >
 > | | |
 > |---|---|
-> | **Next step** | **6.2 · A/B listening pass against a reference recording**. |
-> | **Phase** | 6 of 6 — Verification and tuning — approved, in progress |
-> | **Gate** | none — awaiting 6.2 |
-> | **Last done** | 6.1 · Golden-hash regression tests — SHA-256 of the first 10 s of song 0 for every corpus module in `tfmx-cli/tests/golden.txt`, regenerated via `TFMX_REGEN_GOLDEN=1 cargo test -p tfmx-cli --test golden`; perturbing `Paula`'s volume-scale constant confirmed to fail it |
+> | **Next step** | none — Phase 6 and M1 are both complete. Awaiting approval to start M2 (desktop realtime, `cpal` output). |
+> | **Phase** | 6 of 6 — Verification and tuning — approved, complete |
+> | **Gate** | M1 is done — stop for explicit approval before any M2 work |
+> | **Last done** | 6.2 · A/B listening pass against `uade123` via signal-processing proxies (tempo/pitch/attack/timbre) — tempo clean on all 10 corpus modules, pitch not conclusively checkable this way (rests on existing unit tests + 6.1 golden-hash instead), timbre broadly similar with two modules lower and unverified. Findings in `docs/status.md` |
 >
 > Update this block in the same commit that ticks a checkbox.
 
@@ -225,9 +225,21 @@ Every step in this phase draws on [S1] and [S2] from [Sources](#sources), and on
 > — 128 patterns only ever need 7 bits, so a stray top bit is dropped rather than erroring out
 > the render. All 10 corpus files now render 10 s of song 0 without error; `tfmx/src/sequencer.rs`
 > carries a unit test built from the real `mdat.r-type` word.
-- [ ] **6.2** A/B listening pass against a reference recording. Judge in this order: **tempo**
+- [x] **6.2** A/B listening pass against a reference recording. Judge in this order: **tempo**
       (the classic bug), pitch, instrument attack, timbre. — *check: per-module notes in
       `docs/status.md`, remaining deviations listed rather than hidden* *(Opus 5)*
+
+> 6.2 could not be literal listening; it used signal-processing proxies against `uade123` instead
+> (envelope cross-correlation for tempo, long-term log-spectrum detune for pitch, onset rise time
+> for attack, spectral-shape correlation for timbre) — see `docs/status.md` for the full method
+> and per-module numbers. Tempo is clean on all 10 corpus modules (drift under one measurement
+> frame everywhere). Pitch could not be conclusively verified by signal analysis alone on this
+> polyphonic material against a differently-implemented reference; confidence there rests on the
+> existing `note_period()` and `Paula` period/frequency unit tests plus the 6.1 golden-hash lock,
+> not on this pass. Timbre is broadly similar (8/10 modules ≥0.71 spectral-shape correlation);
+> `turrican outside` and `turrican 2 level 3-flight` are lower (0.567, 0.642) and unverified either
+> way. `docs/status.md` names an actual human listening pass as the honest next step if either is
+> ever suspected of a real bug — not more automated analysis.
 
 ---
 
