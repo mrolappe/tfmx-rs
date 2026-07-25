@@ -4,12 +4,21 @@ A Rust library and cross-platform player for the Amiga **TFMX** music format.
 
 ## Resuming work
 
-**[ROADMAP.md](ROADMAP.md) is the progress tracker and the authoritative step list.** Start
-there: the first unticked box is what comes next, and each step carries its deliverable, its
-verification and a recommended minimum model. Tick the box in the same commit that completes
-the step.
+**[ROADMAP.md](ROADMAP.md) is the progress tracker and the authoritative step list.** Read its
+**Status block at the top** — it names the next step, the current phase, and whether that phase
+has been approved yet. Each step carries its deliverable, its verification and a recommended
+minimum model. Tick the checkbox *and* update the Status block in the same commit that
+completes the step.
 
 `git log` is the record of what happened — commit subjects name their step, e.g. `(step 0.3)`.
+
+## Delegating to agents
+
+Give an agent **only what its step needs**: the step's own block from ROADMAP.md, the sources
+it cites, the `docs/` files it builds on, the hard rules below, and its verification criterion.
+Do not hand over the whole roadmap, the plan history, or earlier steps' reasoning. If a step
+cannot stand on its own as a brief, sharpen the step rather than widening the context. See
+"Delegating a step" in ROADMAP.md.
 
 ## Hard rules
 

@@ -1,5 +1,16 @@
 # Roadmap
 
+> ## ▶ Status
+>
+> | | |
+> |---|---|
+> | **Next step** | **1.1 · `docs/format.md` — the data model** (see Phase 1 below) |
+> | **Phase** | 1 of 6 — Documentation |
+> | **Gate** | ⛔ Phase 1 **not yet approved**. Ask before starting. |
+> | **Last done** | 0.3 · test corpus (`c7f53c7`) |
+>
+> Update this block in the same commit that ticks a checkbox.
+
 Progress tracker and the authoritative step list. **Tick a box in the same commit that
 completes the step.** `git log` records what happened; this file records what is next.
 
@@ -17,6 +28,23 @@ one is always fine.
 - **No GPL source is ever read.** Every existing TFMX replayer is GPL-2.0; this code is written
   from the published spec. Reference players are executed as black boxes for A/B listening
   only. See the provenance section of [README.md](README.md).
+
+## Delegating a step
+
+Each step below is written to be handed over **verbatim and on its own**. An agent working a
+step gets exactly this and nothing more:
+
+1. The step's own block (deliverable, diagrams, check) — not the other steps, not the phase
+   history, not the conversation that led here.
+2. The relevant entries from [Sources](#sources), and the already-written files in `docs/`
+   that its step builds on.
+3. The hard rules that bind it: **never read GPL replayer source**, English only, and for core
+   code — no dependencies, no allocation after load, no I/O, no threads.
+4. Its verification criterion, and the instruction to run it before reporting done.
+
+Do not pass this file wholesale, the plan history, or prior steps' reasoning. An agent that
+needs the roadmap to understand its task has been given a task that is not yet well specified
+— sharpen the step instead of widening the context.
 
 ---
 
@@ -36,8 +64,7 @@ one is always fine.
 
 ### Phase 1 — Documentation (before any player code)
 
-Source material: the [libxmp spec](https://github.com/libxmp/libxmp/blob/master/docs/formats/tfmx-format.txt)
-and the [playback-tfmx notes](https://github.com/RetrovertApp/playback-tfmx/blob/master/TFMX.md).
+Every step in this phase draws on [S1] and [S2] from [Sources](#sources), and on nothing else.
 
 - [ ] **1.1 · `docs/format.md` — the data model** *(Sonnet 5)*
       Byte-level layout of `mdat`/`smpl`. Header fields with offsets. The 96-word table (32
@@ -143,6 +170,18 @@ and the [playback-tfmx notes](https://github.com/RetrovertApp/playback-tfmx/blob
   drag-and-drop for mdat/smpl.
 - **Beyond:** TFMX 7V support (a separate parser path — the format is substantially different,
   not a flag), GemX macro opcodes, tools (pattern dump, sample export).
+
+## Sources
+
+Cite these by tag when briefing a step.
+
+| Tag | Source | What it gives |
+|---|---|---|
+| **S1** | [libxmp `docs/formats/tfmx-format.txt`](https://github.com/libxmp/libxmp/blob/master/docs/formats/tfmx-format.txt) — J. H. Pickard, *The TFMX Professional 2.0 Song File Format* | The authoritative spec: header layout, trackstep, pattern and macro opcode listings, the note table |
+| **S2** | [RetrovertApp/playback-tfmx `TFMX.md`](https://github.com/RetrovertApp/playback-tfmx/blob/master/TFMX.md) | Background on 7V, a worked macro dump, scope notes. **Prose only — the surrounding repo is GPL-2.0, do not read its code.** |
+| **S3** | [ExoticA wiki: TFMX](https://www.exotica.org.uk/wiki/TFMX) | Context, module inventory |
+| **S4** | [VGMPF: MDAT](https://www.vgmpf.com/Wiki/index.php?title=MDAT) / [SMPL](https://www.vgmpf.com/Wiki/index.php?title=SMPL) | Short format overviews, cross-check only |
+| **S5** | `testdata/` (fetch with `sh testdata/fetch.sh`) | 10 real modules, 5 packed / 5 fixed layout |
 
 ## Known risks
 
