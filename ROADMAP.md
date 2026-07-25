@@ -4,10 +4,10 @@
 >
 > | | |
 > |---|---|
-> | **Next step** | **1.3 · `docs/playback-model.md` — how sound is produced** (see Phase 1 below) |
+> | **Next step** | **1.4 · `docs/architecture.md` — the code shape** (see Phase 1 below) |
 > | **Phase** | 1 of 6 — Documentation |
-> | **Gate** | ✅ Phase 1 approved and in progress. |
-> | **Last done** | 1.2 · `docs/opcodes.md` |
+> | **Gate** | ✅ Phase 1 approved and in progress. 1.4 is the last step before the Phase 2 gate. |
+> | **Last done** | 1.3 · `docs/playback-model.md` |
 >
 > Update this block in the same commit that ticks a checkbox.
 
@@ -92,7 +92,7 @@ Every step in this phase draws on [S1] and [S2] from [Sources](#sources), and on
       `18` sampleloop, `1E` addvol+note.
       *Check:* no gaps in the opcode ranges; every entry has an effect or sits in Unresolved.
 
-- [ ] **1.3 · `docs/playback-model.md` — how sound is produced** *(Sonnet 5)*
+- [x] **1.3 · `docs/playback-model.md` — how sound is produced** *(Sonnet 5)*
       The chain trackstep → pattern → macro → Paula registers → mixer. Paula voice semantics:
       period → frequency (`3_546_895 / period`), volume 0–64, DMA on/off, one-shot-then-loop,
       the DMA restart delay quirk. Timing: the jiffy, the 50 Hz divider path vs. the CIA path,
@@ -103,6 +103,12 @@ Every step in this phase draws on [S1] and [S2] from [Sources](#sources), and on
       *Diagrams:* Mermaid flowchart of the signal chain with the DMA feedback edge drawn; a
       state diagram of one voice's DMA lifecycle; a timeline of ticks inside a render block.
       *Check:* someone who has not read the spec could implement the timing from this alone.
+
+> Finding from 1.3, verified across all 229 `$F1`/`$F2`/`$F8` commands in the corpus: **there are
+> two distinct offset spaces.** Pointer-table entries and sample offsets are absolute byte
+> offsets; jump/loop/gosub targets (`$F1`/`$F2`/`$F8`, `$05`/`$06`/`$15`, `$1C`/`$1D`) are
+> **longword step indices relative to the enclosing pattern or macro**. No target reaches its own
+> pattern's length, and odd targets rule out byte offsets. Step 4.3 must not treat them alike.
 
 - [ ] **1.4 · `docs/architecture.md` — the code shape** *(Sonnet 5)*
       Crate layout, the register seam and why it sits there, the `render()` contract,
