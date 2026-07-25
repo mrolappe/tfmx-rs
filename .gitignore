@@ -1,5 +1,9 @@
 /target
-/testdata/
 /.codegraph/
 *.wav
 .DS_Store
+
+# The test corpus is copyrighted music. Track only how to fetch it, never the audio.
+/testdata/*
+!/testdata/README.md
+!/testdata/fetch.sh
