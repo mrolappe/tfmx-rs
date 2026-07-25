@@ -174,6 +174,28 @@ stateDiagram-v2
     Off --> Off: "DMA held off ≥1 jiffy\nbefore next $01\n(restart-delay quirk, §2.4)"
 ```
 
+### 2.6 Stereo panning
+
+Neither [S1] nor [S2] documents Paula stereo behavior at all — TFMX's macro
+opcodes never target a pan register because there isn't one; panning is a
+fixed property of which of Paula's four hardware DMA channels a voice uses.
+
+The channel-to-side wiring is **[HW]**, standard Amiga hardware, not
+TFMX-specific: voices 0 and 3 are hard-panned left, voices 1 and 2
+hard-panned right. A conforming player has no choice here — it is not a
+register any macro opcode can change.
+
+What *is* this crate's own invention is the `separation` knob
+`Paula::new()` takes (0–100): how much of a voice's signal reaches its own
+channel versus bleeds into the opposite one. 100 reproduces the hardware's
+hard pan (no bleed, matching real Amiga output); 0 sums every voice equally
+into both channels (mono fold-down). Nothing in the source material calls
+for this — it exists because a hard-panned four-voice mix is an unforgiving
+listening experience on headphones, and other TFMX-adjacent tools expose a
+similar control. Treat any value between 0 and 100 as a straight linear
+crossfade between those two endpoints; there is no documented "correct"
+default, so pick one at the player/CLI layer, not in `Paula` itself.
+
 ---
 
 ## 3. Timing
