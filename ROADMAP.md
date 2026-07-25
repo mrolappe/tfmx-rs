@@ -4,10 +4,10 @@
 >
 > | | |
 > |---|---|
-> | **Next step** | **4.3 · Pattern decoder** (see Phase 4 below) |
+> | **Next step** | **4.4 · Macro interpreter** (see Phase 4 below) |
 > | **Phase** | 4 of 6 — Sequencer (the hard part) |
 > | **Gate** | ✅ Phase 4 approved and in progress. |
-> | **Last done** | 4.2 · Trackstep runner — `Sequencer`, `$EFFE` line commands, `$80`/`$FF`/`$FE` track words, song start/end/loop, `PlaySection` repeat |
+> | **Last done** | 4.3 · Pattern decoder — `PatternEntry`/`NoteTiming`/`PatternCommand`, `PatternRunner` (per-jiffy step, `$F3` waits, `$F1` repeat, `$F8`/`$F9` gosub), `$F0`–`$FF` decoded |
 >
 > Update this block in the same commit that ticks a checkbox.
 
@@ -169,9 +169,16 @@ Every step in this phase draws on [S1] and [S2] from [Sources](#sources), and on
 > <Loop>`'s "repeats ... `aa` times"), and reaching past `song_end` with no
 > redirecting command falls back to looping to `song_start`.
 
-- [ ] **4.3** Pattern decoder: longword classification, notes with detune, notes with wait,
+- [x] **4.3** Pattern decoder: longword classification, notes with detune, notes with wait,
       portamento, `$F0`–`$FF`. Triggers macros with channel, note, volume. — *check: pattern
       dump is self-consistent* *(Opus 5)*
+
+> Finding from 4.3: the Finding from 1.3 holds live — every `$F1`/`$F2`/`$F8` target reachable
+> from a song in the corpus lands inside the named pattern's own longword count when read as a
+> relative step index. Two corpus quirks a pattern walker must tolerate: a song's last trackstep
+> line can already be pattern data (`mdat.r-type` song 0 line 79), so not every "pattern number"
+> reachable from the trackstep table points at a pattern; and most patterns end in an infinite
+> `$F1`, leaving their `$F0 <End>` unreachable.
 - [ ] **4.4** Macro interpreter: per-voice PC and wait counters, note table, transpose + detune
       → period, envelope, vibrato, portamento, sample start/length/loop, DMA, one-shot,
       wait-on-DMA. Unknown `$22`–`$29` recorded, never guessed. — *check: 30 s render is not
