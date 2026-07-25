@@ -4,10 +4,10 @@
 >
 > | | |
 > |---|---|
-> | **Next step** | **4.1 · Tick scheduling** (see Phase 4 below) |
-> | **Phase** | 3 of 6 — Paula mixer, complete; Phase 4 not yet approved |
-> | **Gate** | ⏸ Phase 3 complete — stop for approval before starting Phase 4. |
-> | **Last done** | 3.3 · DMA state feedback — `loop_completions`/`reset_loop_completions` |
+> | **Next step** | **4.2 · Trackstep runner** (see Phase 4 below) |
+> | **Phase** | 4 of 6 — Sequencer (the hard part) |
+> | **Gate** | ✅ Phase 4 approved and in progress. |
+> | **Last done** | 4.1 · Tick scheduling — `TickClock`, exact-rational jiffy boundaries |
 >
 > Update this block in the same commit that ticks a checkbox.
 
@@ -150,7 +150,7 @@ Every step in this phase draws on [S1] and [S2] from [Sources](#sources), and on
 
 ### Phase 4 — Sequencer (the hard part)
 
-- [ ] **4.1** Tick scheduling: `samples_until_next_tick`, the 50 Hz path and the CIA path,
+- [x] **4.1** Tick scheduling: `samples_until_next_tick`, the 50 Hz path and the CIA path,
       block-size independence. — *check: 1 second rendered as one 48000-frame call and as 480
       hundred-frame calls is bit-identical* *(Opus 5)*
 - [ ] **4.2** Trackstep runner: `$EFFE` commands, `$80` hold with transpose, `$FF`/`$FE` stop,

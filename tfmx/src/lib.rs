@@ -6,5 +6,7 @@
 
 mod module;
 mod paula;
+mod sequencer;
 pub use module::{Module, ParseError};
 pub use paula::{Paula, Voice};
+pub use sequencer::{tick_fraction, TickClock};
