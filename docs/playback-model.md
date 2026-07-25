@@ -155,6 +155,10 @@ immediate restart.
 
 ### 2.5 Voice DMA lifecycle
 
+> **TODO:** this diagram has two rendering issues to fix later: some
+> transition labels overlap other text, and labels contain literal `\n`
+> sequences instead of Mermaid `<br/>` line breaks.
+
 ```mermaid
 stateDiagram-v2
     [*] --> Off

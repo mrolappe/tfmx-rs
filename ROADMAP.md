@@ -4,10 +4,10 @@
 >
 > | | |
 > |---|---|
-> | **Next step** | **2.1 · `Module::parse`** (see Phase 2 below) |
+> | **Next step** | **2.2 · Layout detection** (see Phase 2 below) |
 > | **Phase** | 2 of 6 — Parser |
-> | **Gate** | ⛔ Phase 1 **complete**. Phase 2 **not yet approved**. Ask before starting. |
-> | **Last done** | 1.4 · `docs/architecture.md` — Phase 1 done |
+> | **Gate** | ✅ Phase 2 approved and in progress. |
+> | **Last done** | 2.1 · `Module::parse` (magic, text area, 96-word table) |
 >
 > Update this block in the same commit that ticks a checkbox.
 
@@ -128,7 +128,7 @@ Every step in this phase draws on [S1] and [S2] from [Sources](#sources), and on
 
 ### Phase 2 — Parser
 
-- [ ] **2.1** `Module::parse(mdat, smpl) -> Result<Module, ParseError>`: magic, text area,
+- [x] **2.1** `Module::parse(mdat, smpl) -> Result<Module, ParseError>`: magic, text area,
       96-word table. Borrowed slices, no sample copying. — *check: unit test asserts magic,
       song count, tempo values for a known file* *(Sonnet 5)*
 - [ ] **2.2** Layout detection (zero check at `$1D0`) and resolution of the trackstep,
