@@ -4,10 +4,10 @@
 >
 > | | |
 > |---|---|
-> | **Next step** | **Phase 5 — CLI**, pending explicit approval (Phase 4 is now complete). |
-> | **Phase** | 4 of 6 — Sequencer (the hard part) — **all steps done** |
-> | **Gate** | ⏸ Awaiting approval to start Phase 5. |
-> | **Last done** | 4.4 · Macro interpreter — `MacroInterpreter` (`$00`–`$21`, `$1B`/`$22`–`$29` recorded via `UnsupportedOps`), note table + transpose/detune → period, envelope/vibrato/portamento, sample start/length/loop, DMA, one-shot, wait-on-DMA; `Player` ties trackstep + 8 `PatternRunner`s + 4 `MacroInterpreter`s + `Paula` behind one `render()` |
+> | **Next step** | **5.2 · `tfmx-cli info`**. |
+> | **Phase** | 5 of 6 — CLI — approved, in progress |
+> | **Gate** | — |
+> | **Last done** | 5.1 · `tfmx-cli render` — clap subcommand reads `mdat`/`smpl`, builds a `Player`, streams rendered blocks into a `hound` WAV writer; `run_render()` tested directly (in-process), verified end to end with a real corpus render |
 >
 > Update this block in the same commit that ticks a checkbox.
 
@@ -203,7 +203,7 @@ Every step in this phase draws on [S1] and [S2] from [Sources](#sources), and on
 
 ### Phase 5 — CLI
 
-- [ ] **5.1** `tfmx-cli render <mdat> <smpl> -o out.wav [--song N] [--seconds S] [--rate HZ]
+- [x] **5.1** `tfmx-cli render <mdat> <smpl> -o out.wav [--song N] [--seconds S] [--rate HZ]
       [--separation P]`. — *check: playable WAV of the requested length* *(Haiku 4.5)*
 - [ ] **5.2** `tfmx-cli info`: header text, songs, tempos, detected layout, and the
       `unsupported_ops()` histogram. — *check: run across the corpus* *(Haiku 4.5)*
