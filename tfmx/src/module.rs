@@ -16,6 +16,15 @@ const FIXED_PATTERN_PTR_OFFSET: u32 = 0x400;
 const FIXED_MACRO_PTR_OFFSET: u32 = 0x600;
 const FIXED_TRACKSTEP_OFFSET: u32 = 0x800;
 
+// docs/format.md §6: "maximum of 128 patterns per song file" [S1], stated
+// for both layouts. §9: the same 128-entry size for macros is inferred from
+// the corpus only (the fixed layout's macro-pointer table spans exactly
+// $600-$800), not stated by [S1]; applied here to both layouts for lack of
+// a documented alternative.
+const MAX_PATTERNS: u8 = 128;
+const MAX_MACROS: u8 = 128;
+const POINTER_ENTRY_LEN: usize = 4;
+
 /// Which of the two on-disk header layouts a module uses. See
 /// `docs/format.md` §3: detection is a plain zero check on the three longs
 /// at `$1D0`, not a heuristic.
@@ -32,6 +41,8 @@ pub enum Layout {
 /// A parsed `mdat`/`smpl` pair. Borrows both buffers; never copies.
 #[derive(Debug)]
 pub struct Module<'a> {
+    mdat: &'a [u8],
+    smpl: &'a [u8],
     text: &'a [u8],
     song_start: [u16; TABLE_ENTRIES],
     song_end: [u16; TABLE_ENTRIES],
@@ -51,11 +62,19 @@ pub enum ParseError {
     BadMagic,
 }
 
+/// Why a [`Module`] accessor (`pattern`, `macro_`, `sample`) failed: an
+/// index or a file-derived offset fell outside the buffer it indexes into.
+/// This is the trust boundary for untrusted `mdat`/`smpl` input --
+/// `docs/architecture.md` §5.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AccessError {
+    OutOfRange,
+}
+
 impl<'a> Module<'a> {
     /// Parses the fixed `mdat` header: magic, free-text area, the 96-word
-    /// song-start/song-end/tempo table, and the `$1D0` layout table. Does
-    /// not touch `smpl` (step 2.3's `sample()`).
-    pub fn parse(mdat: &'a [u8], _smpl: &'a [u8]) -> Result<Module<'a>, ParseError> {
+    /// song-start/song-end/tempo table, and the `$1D0` layout table.
+    pub fn parse(mdat: &'a [u8], smpl: &'a [u8]) -> Result<Module<'a>, ParseError> {
         if mdat.len() < HEADER_LEN {
             return Err(ParseError::TooShort);
         }
@@ -80,6 +99,8 @@ impl<'a> Module<'a> {
             };
 
         Ok(Module {
+            mdat,
+            smpl,
             text: &mdat[TEXT_OFFSET..TEXT_OFFSET + TEXT_LEN],
             song_start: read_word_table(mdat, SONG_START_OFFSET),
             song_end: read_word_table(mdat, SONG_END_OFFSET),
@@ -131,6 +152,56 @@ impl<'a> Module<'a> {
     pub fn macro_ptr_offset(&self) -> u32 {
         self.macro_ptr_offset
     }
+
+    /// Pattern `n`'s data, from its start to the end of `mdat` -- the
+    /// pattern decoder (step 4.3) walks it longword by longword until it
+    /// hits an `$F0` End command; there is no length field to bounds it
+    /// more tightly. `docs/format.md` §6.
+    pub fn pattern(&self, n: u8) -> Result<&'a [u8], AccessError> {
+        pointer_table_entry(self.mdat, self.pattern_ptr_offset, n, MAX_PATTERNS)
+    }
+
+    /// Macro `n`'s data, from its start to the end of `mdat`. Same shape as
+    /// [`Module::pattern`]; the macro interpreter (step 4.4) terminates on
+    /// `$07 STOP`. `docs/format.md` §7.
+    pub fn macro_(&self, n: u8) -> Result<&'a [u8], AccessError> {
+        pointer_table_entry(self.mdat, self.macro_ptr_offset, n, MAX_MACROS)
+    }
+
+    /// Signed 8-bit PCM sample bytes `[offset, offset+len)` from `smpl`.
+    /// `docs/format.md` §8.
+    pub fn sample(&self, offset: u32, len: u32) -> Result<&'a [i8], AccessError> {
+        let start = offset as usize;
+        let end = start
+            .checked_add(len as usize)
+            .ok_or(AccessError::OutOfRange)?;
+        let bytes = self.smpl.get(start..end).ok_or(AccessError::OutOfRange)?;
+        // Safety: i8 and u8 have identical size, alignment and bit validity;
+        // this only reinterprets the sign of each byte.
+        Ok(unsafe { core::slice::from_raw_parts(bytes.as_ptr().cast::<i8>(), bytes.len()) })
+    }
+}
+
+fn pointer_table_entry(
+    mdat: &[u8],
+    table_offset: u32,
+    n: u8,
+    max: u8,
+) -> Result<&[u8], AccessError> {
+    if n >= max {
+        return Err(AccessError::OutOfRange);
+    }
+    let entry_offset = (table_offset as usize)
+        .checked_add(n as usize * POINTER_ENTRY_LEN)
+        .ok_or(AccessError::OutOfRange)?;
+    let entry_end = entry_offset
+        .checked_add(POINTER_ENTRY_LEN)
+        .ok_or(AccessError::OutOfRange)?;
+    if entry_end > mdat.len() {
+        return Err(AccessError::OutOfRange);
+    }
+    let data_offset = read_long(mdat, entry_offset) as usize;
+    mdat.get(data_offset..).ok_or(AccessError::OutOfRange)
 }
 
 fn read_word_table(mdat: &[u8], offset: usize) -> [u16; TABLE_ENTRIES] {
@@ -257,5 +328,74 @@ mod tests {
             let module = Module::parse(&mdat, &smpl).unwrap_or_else(|e| panic!("{name}: {e:?}"));
             assert_eq!(module.layout(), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn pattern_and_macro_access_known_file() {
+        let Some(mdat) = read_corpus("mdat.turrican 2 level 1-desert") else {
+            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+            return;
+        };
+        let smpl = read_corpus("smpl.turrican 2 level 1-desert")
+            .expect("smpl present alongside mdat");
+        let module = Module::parse(&mdat, &smpl).expect("valid header parses");
+
+        // docs/format.md §6: pattern-pointer table at $3078, entry 0 = $00000A48,
+        // whose first longword decodes as 98 2F 50 07.
+        let pattern0 = module.pattern(0).expect("pattern 0 in range");
+        assert_eq!(&pattern0[0..4], &[0x98, 0x2F, 0x50, 0x07]);
+
+        // docs/format.md §7: macro-pointer table at $31DC, entry 0 = $000022EC,
+        // whose first longword decodes as 00 00 00 00.
+        let macro0 = module.macro_(0).expect("macro 0 in range");
+        assert_eq!(&macro0[0..4], &[0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn pattern_index_out_of_range_is_err_not_panic() {
+        let mut mdat = vec![0u8; HEADER_LEN];
+        mdat[0..10].copy_from_slice(b"TFMX-SONG ");
+        let module = Module::parse(&mdat, &[]).expect("minimal header parses");
+
+        assert_eq!(module.pattern(128).unwrap_err(), AccessError::OutOfRange);
+        assert_eq!(module.macro_(128).unwrap_err(), AccessError::OutOfRange);
+    }
+
+    #[test]
+    fn corrupted_pointer_table_is_err_not_panic() {
+        // Fixed layout: pattern pointers are claimed to live at $400, but
+        // this buffer ends at HEADER_LEN ($1DC) -- reading entry 0 there,
+        // or following whatever garbage offset it might contain, must not
+        // panic even though nothing valid is actually present.
+        let mut mdat = vec![0u8; HEADER_LEN];
+        mdat[0..10].copy_from_slice(b"TFMX-SONG ");
+        let module = Module::parse(&mdat, &[]).expect("minimal header parses");
+
+        assert_eq!(module.pattern(0).unwrap_err(), AccessError::OutOfRange);
+        assert_eq!(module.macro_(0).unwrap_err(), AccessError::OutOfRange);
+    }
+
+    #[test]
+    fn sample_access_known_file() {
+        let Some(mdat) = read_corpus("mdat.turrican 2 level 1-desert") else {
+            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+            return;
+        };
+        let smpl = read_corpus("smpl.turrican 2 level 1-desert")
+            .expect("smpl present alongside mdat");
+        let smpl_len = smpl.len() as u32;
+        let module = Module::parse(&mdat, &smpl).expect("valid header parses");
+
+        let sample = module.sample(0, 4).expect("in-range sample slice");
+        assert_eq!(sample.len(), 4);
+
+        assert_eq!(
+            module.sample(smpl_len - 1, 2).unwrap_err(),
+            AccessError::OutOfRange
+        );
+        assert_eq!(
+            module.sample(0, u32::MAX).unwrap_err(),
+            AccessError::OutOfRange
+        );
     }
 }
