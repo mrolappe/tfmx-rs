@@ -4,10 +4,10 @@
 >
 > | | |
 > |---|---|
-> | **Next step** | **1.4 · `docs/architecture.md` — the code shape** (see Phase 1 below) |
-> | **Phase** | 1 of 6 — Documentation |
-> | **Gate** | ✅ Phase 1 approved and in progress. 1.4 is the last step before the Phase 2 gate. |
-> | **Last done** | 1.3 · `docs/playback-model.md` |
+> | **Next step** | **2.1 · `Module::parse`** (see Phase 2 below) |
+> | **Phase** | 2 of 6 — Parser |
+> | **Gate** | ⛔ Phase 1 **complete**. Phase 2 **not yet approved**. Ask before starting. |
+> | **Last done** | 1.4 · `docs/architecture.md` — Phase 1 done |
 >
 > Update this block in the same commit that ticks a checkbox.
 
@@ -62,7 +62,7 @@ needs the roadmap to understand its task has been given a task that is not yet w
 > longs at `$1D0` are either all zero (fixed-address layout) or all plausible ascending
 > in-file offsets (packed). The corpus splits 5/5, so neither parser path can rot unnoticed.
 
-### Phase 1 — Documentation (before any player code)
+### Phase 1 — Documentation (before any player code) ✅
 
 Every step in this phase draws on [S1] and [S2] from [Sources](#sources), and on nothing else.
 
@@ -110,13 +110,21 @@ Every step in this phase draws on [S1] and [S2] from [Sources](#sources), and on
 > **longword step indices relative to the enclosing pattern or macro**. No target reaches its own
 > pattern's length, and odd targets rule out byte offsets. Step 4.3 must not treat them alike.
 
-- [ ] **1.4 · `docs/architecture.md` — the code shape** *(Sonnet 5)*
+- [x] **1.4 · `docs/architecture.md` — the code shape** *(Sonnet 5)*
       Crate layout, the register seam and why it sits there, the `render()` contract,
       threading/allocation rules (neither inside the core), the public API, and the deliberate
       simplifications with their upgrade triggers.
       *Diagrams:* Mermaid module dependency graph with the seam marked; sequence diagram of one
       `render()` call.
       *Check:* names in the doc match the planned module names.
+
+> Finding from 1.4: the roadmap named `Paula::render()` but never named the type that owns tick
+> scheduling, leaving it unclear which `render()` step 4.1's block-size-independence check tests.
+> `docs/architecture.md` resolves this with **two `render()`s at different levels**:
+> `Paula::render(smpl, out)` mixes one chunk against constant register state (step 3.2's target),
+> and the newly introduced **`Player`** wraps tick scheduling around it (step 4.1's target).
+> `Sequencer` owns the tempo fraction; `Player` owns the accumulator phase that must survive
+> across calls. Other new names: `AccessError`, `UnsupportedOps`, `Paula::loop_completions`.
 
 ### Phase 2 — Parser
 
