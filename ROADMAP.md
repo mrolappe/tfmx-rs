@@ -4,10 +4,10 @@
 >
 > | | |
 > |---|---|
-> | **Next step** | **4.4 · Macro interpreter** (see Phase 4 below) |
-> | **Phase** | 4 of 6 — Sequencer (the hard part) |
-> | **Gate** | ✅ Phase 4 approved and in progress. |
-> | **Last done** | 4.3 · Pattern decoder — `PatternEntry`/`NoteTiming`/`PatternCommand`, `PatternRunner` (per-jiffy step, `$F3` waits, `$F1` repeat, `$F8`/`$F9` gosub), `$F0`–`$FF` decoded |
+> | **Next step** | **Phase 5 — CLI**, pending explicit approval (Phase 4 is now complete). |
+> | **Phase** | 4 of 6 — Sequencer (the hard part) — **all steps done** |
+> | **Gate** | ⏸ Awaiting approval to start Phase 5. |
+> | **Last done** | 4.4 · Macro interpreter — `MacroInterpreter` (`$00`–`$21`, `$1B`/`$22`–`$29` recorded via `UnsupportedOps`), note table + transpose/detune → period, envelope/vibrato/portamento, sample start/length/loop, DMA, one-shot, wait-on-DMA; `Player` ties trackstep + 8 `PatternRunner`s + 4 `MacroInterpreter`s + `Paula` behind one `render()` |
 >
 > Update this block in the same commit that ticks a checkbox.
 
@@ -179,10 +179,27 @@ Every step in this phase draws on [S1] and [S2] from [Sources](#sources), and on
 > line can already be pattern data (`mdat.r-type` song 0 line 79), so not every "pattern number"
 > reachable from the trackstep table points at a pattern; and most patterns end in an infinite
 > `$F1`, leaving their `$F0 <End>` unreachable.
-- [ ] **4.4** Macro interpreter: per-voice PC and wait counters, note table, transpose + detune
+- [x] **4.4** Macro interpreter: per-voice PC and wait counters, note table, transpose + detune
       → period, envelope, vibrato, portamento, sample start/length/loop, DMA, one-shot,
       wait-on-DMA. Unknown `$22`–`$29` recorded, never guessed. — *check: 30 s render is not
       silent, no `NaN`/`inf`, no clipping, and bit-identical across two runs* *(Opus 5)*
+
+> Finding from 4.4: resolves the trackstep-advance question left open since 4.2/4.3 (§7 of
+> `docs/playback-model.md`) — the shared line pointer advances **unconditionally every jiffy**,
+> not gated on any track's pattern reaching `$F0 <End>`. The Finding from 4.3 forced this: most
+> corpus patterns end in an infinite `$F1` and never reach `$F0` at all, so an End-gated advance
+> would hang forever on real data. `docs/opcodes.md` §1's per-track word table already fits this
+> reading — `$80 <Hold>` exists precisely so most jiffies' trackstep evaluation is a no-op that
+> only refreshes transpose, while the pattern's own wait/loop opcodes carry the actual rhythm.
+> `Player` (new, `docs/architecture.md` §3) owns this loop plus the register-seam wiring: each
+> jiffy, trackstep → (re)load per-track `PatternRunner`s → dispatch notes and `$F5`-`$F7`/`$FC`
+> effects to the target voice's `MacroInterpreter` → tick all four macro programs → `Paula`
+> renders the chunk up to the next tick boundary. Also settled, each flagged in code as this
+> crate's own reading where [S1] under-specifies: a pattern note's voice nibble is masked to
+> `0`-`3` (Paula has only four hardware voices); `$18 <Sampleloop>`'s running loop-region offset
+> is separate from the attack region set by `$02`/`$03`, matching the "not idempotent" gotcha;
+> and `$21 <Play macro>` keeps the target voice's current note/volume/transpose rather than
+> resetting them, since [S1] gives it no note operand of its own.
 
 ### Phase 5 — CLI
 

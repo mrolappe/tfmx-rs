@@ -200,6 +200,15 @@ impl<'a> Module<'a> {
         // this only reinterprets the sign of each byte.
         Ok(unsafe { core::slice::from_raw_parts(bytes.as_ptr().cast::<i8>(), bytes.len()) })
     }
+
+    /// The entire `smpl` buffer as signed 8-bit PCM. `Player` (step 4.4)
+    /// holds this once and passes it to `Paula::render` on every chunk,
+    /// since `Voice` register values are offsets anywhere within it --
+    /// `docs/architecture.md` §2. `docs/format.md` §8.
+    pub fn smpl(&self) -> &'a [i8] {
+        // Safety: same reinterpret-cast as `sample`, over the whole buffer.
+        unsafe { core::slice::from_raw_parts(self.smpl.as_ptr().cast::<i8>(), self.smpl.len()) }
+    }
 }
 
 fn pointer_table_entry(

@@ -146,6 +146,14 @@ impl Paula {
         self.voices[voice as usize].loop_completions = 0;
     }
 
+    /// A copy of `voice`'s register state -- test-only seam so callers in
+    /// other modules (the macro interpreter's tests) can assert on what the
+    /// register writes actually landed, without a production getter.
+    #[cfg(test)]
+    pub(crate) fn voice(&self, voice: u8) -> Voice {
+        self.voices[voice as usize]
+    }
+
     /// Synthesizes `out.len() / 2` interleaved stereo frames from whatever
     /// `Voice` state is currently latched, reading PCM out of `smpl`.
     /// Register state is constant across the call. `docs/architecture.md` §3.
@@ -159,7 +167,8 @@ impl Paula {
                     continue;
                 }
                 // 8-bit PCM volume-scaled and expanded into i16 range.
-                let amp = voice.next_sample(smpl, sample_rate) * (voice.volume as f64 / 64.0) * 256.0;
+                let amp =
+                    voice.next_sample(smpl, sample_rate) * (voice.volume as f64 / 64.0) * 256.0;
                 let (own_ch, other_ch) = if is_left_voice(i) {
                     (&mut left, &mut right)
                 } else {
@@ -316,7 +325,11 @@ mod tests {
         paula.render(&source, sample_rate, &mut out);
 
         let left: Vec<i16> = out.iter().step_by(2).copied().collect();
-        assert!(left[10] > 0, "expected attack-region output, got {}", left[10]);
+        assert!(
+            left[10] > 0,
+            "expected attack-region output, got {}",
+            left[10]
+        );
         assert!(
             left[150] < 0,
             "expected loop-region output after transition, got {}",
@@ -340,7 +353,10 @@ mod tests {
         let mut out = vec![1i16; 40 * 2]; // pre-filled non-zero
         paula.render(&source, sample_rate, &mut out);
 
-        assert!(out.iter().all(|&s| s == 0), "expected silence at volume 0, got {out:?}");
+        assert!(
+            out.iter().all(|&s| s == 0),
+            "expected silence at volume 0, got {out:?}"
+        );
     }
 
     #[test]
@@ -432,7 +448,10 @@ mod tests {
 
         let left: Vec<i16> = out.iter().step_by(2).copied().collect();
         let right: Vec<i16> = out.iter().skip(1).step_by(2).copied().collect();
-        assert!(left.iter().any(|&s| s != 0), "left channel should carry voice 0's signal");
+        assert!(
+            left.iter().any(|&s| s != 0),
+            "left channel should carry voice 0's signal"
+        );
         assert!(
             right.iter().all(|&s| s == 0),
             "separation 100 should leave the opposite channel silent, got {right:?}"
