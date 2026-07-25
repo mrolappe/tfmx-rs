@@ -4,10 +4,10 @@
 >
 > | | |
 > |---|---|
-> | **Next step** | **3.1 · `Voice`** (see Phase 3 below) |
+> | **Next step** | **3.2 · `Paula::render()`** (see Phase 3 below) |
 > | **Phase** | 3 of 6 — Paula mixer |
-> | **Gate** | ⛔ Phase 2 **complete**. Phase 3 **not yet approved**. Ask before starting. |
-> | **Last done** | 2.3 · Bounds-checked accessors — Phase 2 done |
+> | **Gate** | ✅ Phase 3 approved and in progress. |
+> | **Last done** | 3.1 · `Voice`/`Paula` register file and setters |
 >
 > Update this block in the same commit that ticks a checkbox.
 
@@ -140,7 +140,7 @@ Every step in this phase draws on [S1] and [S2] from [Sources](#sources), and on
 
 ### Phase 3 — Paula mixer
 
-- [ ] **3.1** `Voice { start, len, period, volume, dma_on, loop_start, loop_len }` plus
+- [x] **3.1** `Voice { start, len, period, volume, dma_on, loop_start, loop_len }` plus
       fractional position, and the setters the sequencer calls. *(Sonnet 5)*
 - [ ] **3.2** `Paula::render()`: linear interpolation, one-shot → loop transition, hardware
       panning with the separation knob, volume scaling, clamped output. — *check: synthetic

@@ -5,4 +5,6 @@
 //! `playback-model.md` (how sound is produced) and `architecture.md` (code shape).
 
 mod module;
+mod paula;
 pub use module::{Module, ParseError};
+pub use paula::{Paula, Voice};
