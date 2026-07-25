@@ -13,6 +13,8 @@ struct Cli {
 enum Command {
     /// Render a song to a WAV file.
     Render(RenderArgs),
+    /// Print header text, songs, tempos, layout and unsupported opcodes seen.
+    Info(InfoArgs),
 }
 
 #[derive(clap::Args)]
@@ -29,6 +31,17 @@ struct RenderArgs {
     rate: u32,
     #[arg(long, default_value_t = 100)]
     separation: u8,
+}
+
+#[derive(clap::Args)]
+struct InfoArgs {
+    mdat: PathBuf,
+    smpl: PathBuf,
+    #[arg(long, default_value_t = 0)]
+    song: u8,
+    /// How long to run the song for while collecting the unsupported-opcode histogram.
+    #[arg(long, default_value_t = 30)]
+    seconds: u32,
 }
 
 #[derive(Debug)]
@@ -106,10 +119,62 @@ fn run_render(args: &RenderArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+fn run_info(args: &InfoArgs, out: &mut impl std::io::Write) -> Result<(), CliError> {
+    let mdat = std::fs::read(&args.mdat)?;
+    let smpl = std::fs::read(&args.smpl)?;
+    let module = tfmx::Module::parse(&mdat, &smpl)?;
+
+    writeln!(out, "Text:")?;
+    for line in module.text().chunks(40) {
+        writeln!(out, "{}", String::from_utf8_lossy(line).trim_end())?;
+    }
+
+    writeln!(out, "Layout: {:?}", module.layout())?;
+
+    writeln!(out, "Songs:")?;
+    for n in 0..32u8 {
+        writeln!(
+            out,
+            "  {n:2}: start={} end={} tempo={}",
+            module.song_start(n),
+            module.song_end(n),
+            module.tempo(n)
+        )?;
+    }
+
+    const SAMPLE_RATE: u32 = 44_100;
+    const SEPARATION: u8 = 100;
+    let mut player = tfmx::Player::new(&module, args.song, SAMPLE_RATE, SEPARATION)?;
+    let total_frames = SAMPLE_RATE as usize * args.seconds as usize;
+    let mut buf = vec![0i16; 4096 * 2];
+    let mut frames_left = total_frames;
+    while frames_left > 0 {
+        let chunk_frames = frames_left.min(4096);
+        player.render(&mut buf[..chunk_frames * 2])?;
+        frames_left -= chunk_frames;
+    }
+
+    writeln!(out, "Unsupported ops:")?;
+    let mut any = false;
+    for opcode in 0..=255u8 {
+        let count = player.unsupported_ops().get(opcode);
+        if count > 0 {
+            writeln!(out, "  ${opcode:02X}: {count}")?;
+            any = true;
+        }
+    }
+    if !any {
+        writeln!(out, "  (none)")?;
+    }
+
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
     let result = match &cli.command {
         Command::Render(args) => run_render(args),
+        Command::Info(args) => run_info(args, &mut std::io::stdout().lock()),
     };
     if let Err(e) = result {
         eprintln!("tfmx-cli: {e}");
@@ -124,6 +189,73 @@ mod tests {
     fn read_corpus(name: &str) -> Option<Vec<u8>> {
         let path = format!("{}/../testdata/{}", env!("CARGO_MANIFEST_DIR"), name);
         std::fs::read(path).ok()
+    }
+
+    fn corpus_path(name: &str) -> Option<PathBuf> {
+        let path = PathBuf::from(format!("{}/../testdata/{}", env!("CARGO_MANIFEST_DIR"), name));
+        path.exists().then_some(path)
+    }
+
+    /// Step 5.2's own check: `info` reports the header text, the song/tempo
+    /// table and the detected layout -- cross-checked against the known
+    /// values already established by `tfmx::Module`'s own tests.
+    #[test]
+    fn info_prints_text_layout_and_songs() {
+        let Some(mdat) = corpus_path("mdat.turrican intro") else {
+            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+            return;
+        };
+        let smpl = corpus_path("smpl.turrican intro").expect("smpl present alongside mdat");
+
+        let args = InfoArgs {
+            mdat,
+            smpl,
+            song: 0,
+            seconds: 1,
+        };
+        let mut out = Vec::new();
+        run_info(&args, &mut out).expect("info succeeds on a valid corpus file");
+        let text = String::from_utf8(out).expect("output is UTF-8");
+
+        assert!(text.contains("(Empty)"));
+        assert!(text.contains("Layout: Fixed"));
+        assert!(text.contains("0: start=75 end=129 tempo=3"));
+        assert!(text.contains("1: start=52 end=74 tempo=120"));
+        assert!(text.contains("Unsupported ops:"));
+    }
+
+    /// Step 5.2's roadmap check: `info` runs across the whole corpus.
+    #[test]
+    fn info_runs_across_full_corpus_without_error() {
+        let names = [
+            "turrican intro",
+            "turrican outside",
+            "r-type",
+            "x-out (title)",
+            "turrican 2 title (st)",
+            "turrican 2 level 1-desert",
+            "turrican 2 level 3-flight",
+            "turrican 3 level 1",
+            "apidya (title)",
+            "apidya (level 1)",
+        ];
+
+        for name in names {
+            let Some(mdat) = corpus_path(&format!("mdat.{name}")) else {
+                eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+                return;
+            };
+            let smpl = corpus_path(&format!("smpl.{name}")).expect("smpl present alongside mdat");
+
+            let args = InfoArgs {
+                mdat,
+                smpl,
+                song: 0,
+                seconds: 1,
+            };
+            let mut out = Vec::new();
+            run_info(&args, &mut out).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
     }
 
     /// Step 5.1's own check: `render` produces a playable WAV of the

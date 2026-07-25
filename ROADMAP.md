@@ -4,10 +4,10 @@
 >
 > | | |
 > |---|---|
-> | **Next step** | **5.2 · `tfmx-cli info`**. |
-> | **Phase** | 5 of 6 — CLI — approved, in progress |
-> | **Gate** | — |
-> | **Last done** | 5.1 · `tfmx-cli render` — clap subcommand reads `mdat`/`smpl`, builds a `Player`, streams rendered blocks into a `hound` WAV writer; `run_render()` tested directly (in-process), verified end to end with a real corpus render |
+> | **Next step** | **6.1 · Golden-hash regression tests**. |
+> | **Phase** | 5 of 6 — CLI — complete; Phase 6 not yet approved |
+> | **Gate** | Phase 5 complete — awaiting approval to start Phase 6 |
+> | **Last done** | 5.2 · `tfmx-cli info` — prints header text, the 32-entry song/tempo table, detected layout, and runs the song to collect the `unsupported_ops()` histogram; `run_info()` tested directly (in-process), verified end to end across the corpus |
 >
 > Update this block in the same commit that ticks a checkbox.
 
@@ -205,7 +205,7 @@ Every step in this phase draws on [S1] and [S2] from [Sources](#sources), and on
 
 - [x] **5.1** `tfmx-cli render <mdat> <smpl> -o out.wav [--song N] [--seconds S] [--rate HZ]
       [--separation P]`. — *check: playable WAV of the requested length* *(Haiku 4.5)*
-- [ ] **5.2** `tfmx-cli info`: header text, songs, tempos, detected layout, and the
+- [x] **5.2** `tfmx-cli info`: header text, songs, tempos, detected layout, and the
       `unsupported_ops()` histogram. — *check: run across the corpus* *(Haiku 4.5)*
 
 ### Phase 6 — Verification and tuning
