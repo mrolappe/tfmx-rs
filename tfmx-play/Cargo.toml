@@ -13,3 +13,4 @@ tfmx = { path = "../tfmx" }
 clap = { version = "4", features = ["derive"] }
 cpal = "0.15"
 ctrlc = "3"
+crossterm = "0.28"

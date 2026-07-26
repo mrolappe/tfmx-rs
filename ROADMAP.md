@@ -4,10 +4,10 @@
 >
 > | | |
 > |---|---|
-> | **Next step** | 7.2 · Transport controls (space/n/p/q via raw-mode terminal keys) |
-> | **Phase** | 7 of 7 (M2) — Desktop realtime player — approved, in progress |
-> | **Gate** | M2 approved 2026-07-26. Known open issue: `docs/status.md`'s "Open follow-up" section — a human listening pass found `apidya (title)` (and to a lesser extent a `turrican` module) still doesn't sound right even after the confirmed `frac`-reset fix in `Paula::set_dma`. Not blocking M2, but not to be assumed fixed either. |
-> | **Last done** | 7.1 · `tfmx-play` scaffold and realtime `cpal` output (no controls yet) — new binary crate, plays through the default output device at its own sample rate, confirmed by manual run: audible playback, clean exit on Ctrl+C |
+> | **Next step** | none — Phase 7 and M2 are both complete. Awaiting approval to start M3 (`tfmx-web`, wasm-bindgen). |
+> | **Phase** | 7 of 7 (M2) — Desktop realtime player — approved, complete |
+> | **Gate** | M2 is done — stop for explicit approval before any M3 work. Known open issue carried over: `docs/status.md`'s "Open follow-up" section — a human listening pass found `apidya (title)` (and to a lesser extent a `turrican` module) still doesn't sound right even after the confirmed `frac`-reset fix in `Paula::set_dma`. Not blocking M2/M3, but not to be assumed fixed either — see that doc before touching playback correctness again. |
+> | **Last done** | 7.2 · Transport controls (space=pause/resume, n/p=song, q=quit) via raw-mode terminal keys — confirmed by manual run: status line updates correctly in place, pause/resume gapless, song-switch audible |
 >
 > Update this block in the same commit that ticks a checkbox.
 
@@ -249,7 +249,7 @@ New binary crate `tfmx-play`, terminal-based (plain raw-mode keys, no TUI framew
 `Player::render()` unchanged, per `docs/architecture.md` §7/§9 — realtime is a new *consumer* of
 the core, not a change to it.
 
-### Phase 7 — `tfmx-play`
+### Phase 7 — `tfmx-play` ✅
 
 - [x] **7.1** `tfmx-play <mdat> <smpl> [--song N]`: new binary crate, opens the default `cpal`
       output device, drives `Player::render()` from its audio callback, runs until Ctrl+C. No
@@ -262,13 +262,25 @@ the core, not a change to it.
       *check: unit tests cover CLI arg parsing and the `i16`→device-format conversion function; a
       manual run audibly plays a corpus module through the default output device and exits
       cleanly on Ctrl+C* *(Opus 5)*
-- [ ] **7.2** Transport controls: raw-mode terminal keys — space = pause/resume, `n`/`p` = next/
+- [x] **7.2** Transport controls: raw-mode terminal keys — space = pause/resume, `n`/`p` = next/
       previous song (rebuilds `Player` for the new song from the already-parsed `Module`), `q` =
       quit. Key events reach the audio callback via a channel; paused output is silence, not a
       stopped stream (avoids device reopen latency). — *check: unit tests cover the
       command-channel state machine (pause/resume/song-switch/quit) independent of any real
       device or terminal; a manual run confirms pause is silent and gapless, resume continues
       without a glitch, and song-switch changes what's audible* *(Opus 5)*
+
+> Finding from 7.2: raw mode turns off the terminal's normal LF→CRLF translation, so a plain
+> `eprintln!`/`\n` after `crossterm::terminal::enable_raw_mode()` only moves the cursor down, not
+> back to column 0 — repeated status prints stair-step further right on every line instead of
+> updating in place. Fix: never print a bare `\n` once raw mode is on; use `MoveToColumn(0)` +
+> `Clear(ClearType::CurrentLine)` + `Print(..)` (no trailing newline) instead, and print anything
+> that *does* want normal line behavior (e.g. the one-time controls hint) before raw mode is
+> enabled, not after. A final bare `eprintln!()` right before `disable_raw_mode()` keeps the
+> shell's next prompt off the end of the last status line.
+
+M2 is complete: `cpal` output, play/pause/stop, and song selection, exactly the milestone's own
+one-line scope — no further phases planned for it right now.
 
 ---
 
