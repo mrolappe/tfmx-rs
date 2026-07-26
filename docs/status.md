@@ -942,3 +942,39 @@ the already-understood single-voice 2-jiffy attack lag), not the basis for a new
 missing audio. **No code change made** -- this is exactly how `$00`'s documented `<DMAoff+Reset>`
 semantics behave when composition data retriggers a voice faster than one clean attack cycle; not an
 implementation defect in this crate.
+
+## Update (2026-07-26, next session): the two remaining all-voice silence gaps are trackstep-data-driven, not a bug
+
+Did the recorded most-concrete-untried lead: re-ran `tfmx-cli render --stems` and `lint` on
+`turrican intro` (song 0, 3 s) -- not redone since the two retrigger fixes (`c919266`, `5c0b35f`)
+landed.
+
+**`lint`: no findings** (clean, same as post-fix before -- no new bug surfaced by this re-run alone).
+
+**Per-voice RMS over 20 ms windows (throwaway Python, `wave`/`struct`, no numpy, not committed)
+confirmed both gaps still exist**, then `tfmx-cli trace` pinned down *why*, jiffy by jiffy:
+
+- **t=1.28s (trackstep line 91)**: the line's own `Tracks([...])` command carries
+  `StopVoice { voice: 1 }` plus fresh `Note` triggers for voices 3, 0, and 2, all in the same jiffy.
+- **t=2.00s (trackstep line 100)**: the identical shape -- `StopVoice { voice: 1 }` plus fresh
+  triggers for voices 3, 0, 2 in the same jiffy. Voice 0 is even triggered *twice* within that one
+  jiffy, by two different tracks (track 1's pattern 40 and track 4's pattern 82) both assigning to
+  it; the second trigger wins and immediately supersedes the first (the already-understood
+  `trigger()`/`reset_effects()` behavior from the previous update, not a new mechanism).
+
+Under `$00`'s documented `<DMAoff+Reset>` semantics (already confirmed systemic, zero exceptions,
+in an earlier session), three simultaneous fresh triggers plus an explicit stop force all four
+voices' DMA off at once for one to two jiffies. **This is baked into the composition's own
+trackstep data, not an artifact of this crate's dispatch order, jiffy counting, or trigger timing.**
+
+**This directly answers part (a) of the open question recorded two sessions back**: yes, the
+trackstep data places these attacks/stops on the same jiffy by construction -- any spec-faithful
+player, including `uade123`, would show the same brief all-voice dip at these two exact timestamps.
+**Both t=1.28s and t=2.00-2.16s are now ruled out as an explanation for the "different melody"
+complaint** -- they are expected, composition-driven quiet moments, not missing-audio bugs.
+
+**Still open, unchanged**: the core "different melody" complaint itself. With both recorded leads
+from this investigation (the retrigger bug, now fixed; and these two silence gaps, now explained)
+exhausted without resolving it, the remaining discrepancy is most likely in note/pitch/instrument
+dispatch rather than in timing or silence gaps -- no concrete next lead identified yet. Final
+correctness sign-off still needs the user's ear on the full render.
