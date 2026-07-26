@@ -755,3 +755,61 @@ from earlier sessions interact with this; the `$FB <PlayPattern>` gap (confirmed
 triggered by this module, per the "Session 2026-07-26 (later)" section above); and the original
 "different melody" phase-gate complaint, which predates all of these timing findings and may or may
 not be explained by them once the timing question is settled.
+
+## Update (2026-07-26, next session): the 2-jiffy attack lag is confirmed systemic -- with zero exceptions
+
+Did the recorded next step, but by a stronger method than planned: rather than hand-picking a few
+isolated later notes for an audio A/B, wrote a throwaway trace-parsing script (Python, reads
+`tfmx-cli trace`'s text output, not committed) that measures the jiffy lag from every *genuine*
+`trigger()` call to that voice's own `$01 DMAon`, across the whole first 30s / 785 triggers of
+`turrican intro`. "Genuine" means the incoming macro number differs from whatever was last
+triggered on that voice -- this guarantees the full `trigger()` reset path (`tfmx/src/macro_interp.rs`
+line ~339), not the same-instrument in-place update `note_on` added by `c919266`, which does not
+reset `step`/`wait` and would conflate a still-running instrument's own internal DMA pulses (e.g.
+macro 48's tremolo, `docs/status.md` above) with attack latency.
+
+First pass produced a confusing scatter (lag values 2 through 5, and a `lag=4` outlier on the very
+first note of the whole song). Traced the outlier by hand: voice 0's first-ever trigger (`macro=10
+note=21 volume=0`, t=0.08s) never reaches its *own* `$01` at all -- one jiffy later the same voice is
+re-triggered by a completely different instrument (`macro=43`), via a full `trigger()` reset, before
+macro 10's own DMAon ever fires. The `dma_on=true` my script found a few jiffies later belonged to
+macro 43, not macro 10 -- a measurement bug, not an engine anomaly. **This turned out to be the
+common case, not an edge case**: of 202 genuine triggers in the sample, 144 (71%) are themselves
+superseded by a further re-trigger on the same voice before their own DMAon ever fires. This corpus
+multiplexes several logical parts onto few Paula channels by retriggering very fast (this piece's
+26/s-ish note rate, already noted a few updates back, divided over 4 voices means a given voice's
+"current instrument" often changes every 1-2 jiffies) -- most individual `Note` events in the
+trackstep data never actually reach `$01` before something else claims the voice.
+
+Filtering these interruptions out (only counting a trigger's lag if no later trigger touches that
+voice before its `dma_on` flips true) gives a clean result: **56 of 56 measurable genuine,
+uninterrupted triggers show a lag of exactly 2 jiffies. Zero exceptions.** The two triggers near the
+end of the 30s window that show `lag=None` are truncation artifacts (the trace ended before their
+own DMAon jiffy arrived), not counter-examples.
+
+**This confirms last update's hypothesis in its clean form**: every fresh `trigger()` in this module
+takes exactly 2 jiffies to reach its own `$01 DMAon` -- not "sometimes 0, sometimes 5" as the
+unfiltered data first suggested. `$00`'s handler in `tfmx/src/macro_interp.rs` is literally commented
+`// <DMAoff+Reset>*` -- turning DMA off is documented as part of what the opcode *does*, not an
+accidental side effect of a generic pause -- so this 2-jiffy dead zone at the start of every note is
+very likely genuine TFMX/hardware-faithful behavior that a correct `uade123` would also exhibit, not
+an implementation bug in this crate's suspend semantics. That reframes the open question: since each
+voice's own attack lag looks spec-correct and uniform, the t=1.28s/t=2.00-2.08s all-four-voices-silent
+gaps most likely come from *multiple* voices' 2-jiffy windows landing on the same jiffy -- and the
+question is whether that overlap is intrinsic to the trackstep data (in which case any faithful
+implementation, including `uade123`, should show it too, which would be in tension with "the
+reference is not quiet there") or caused by a dispatch-timing difference in this crate that
+synchronizes attacks the reference staggers.
+
+**Not yet done, next session**: (a) at t=1.28s and t=2.00-2.08s specifically, list every voice's
+trigger jiffy contributing to the gap and check whether the trackstep/pattern data's own timing
+values (each track's independent `Wait`/`Detune`/`Hold` offsets) already put them on the same jiffy
+by construction, or whether something in this crate's dispatch order nudges them together; (b) if the
+overlap is data-intrinsic, revisit whether `uade123` really has zero simultaneous silence there (the
+earlier "not quiet" confirmation was by ear, at normal listening levels -- a few 2-jiffy per-voice
+dips landing on the same jiffy might be brief enough to not register as "quiet" to the ear even if
+technically present); (c) the 71% same-voice-interruption rate is a striking number on its own
+and worth a sanity check independent of the silence-gap investigation: is a "note" that never reaches
+`$01` before being superseded audible at all (e.g. via portamento/vibrato applied to the *previous*
+still-sounding note), or is `dispatch_pattern_entry`/`note_on` silently dropping notes the composition
+intended to be heard, which would be a different, new bug class entirely.
