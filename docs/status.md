@@ -853,3 +853,92 @@ synthetic-module experiment is built.
 **Final correctness sign-off still needs the user's ear**, per the project's standing rule -- the WAV
 capture/RMS comparison speeds up iteration but does not replace a listen before any fix is claimed
 done.
+
+## Update (2026-07-26, next session): synthetic-module A/B attempted, shelved -- two real `uade123` invariants found along the way
+
+Did the recorded plan: built a throwaway Python generator (not committed) that hand-pokes a minimal
+`mdat`/`smpl` pair, same technique this crate's own tests already use
+(`tfmx/src/player.rs::trackstep_master_vol_slide_moves_on_the_first_jiffy`), with 2-4 voices each
+running a macro shaped exactly like the confirmed-linear macro 10 (`$00` pause -> setup -> `$08
+AddNote` suspend -> `$01 DMAon`), triggered at controlled per-voice jiffy offsets (same jiffy, 1/2/3
+apart). **This crate's own side is clean**: `tfmx-cli trace` on all four offset variants reproduces the
+2-jiffy attack lag exactly as designed, zero exceptions -- fully consistent with the previous session's
+785-trigger corpus finding.
+
+**Getting `uade123` to accept and meaningfully play the synthetic file took much more work than
+expected, and surfaced two real, previously-undocumented invariants**, found by black-box bisection
+against a known-good corpus file (`mdat.turrican 2 title (st)`, then `mdat.turrican intro` -- see
+below), never by reading `uade123`'s GPL source:
+
+1. **Its module-validity check rejects any file whose pattern-pointer or macro-pointer table has been
+   touched at all**, even when every new pointer is well-formed, in range, and points at valid
+   bytecode -- confirmed by bisecting a hybrid file (real header/tables + synthetic trackstep/pattern/
+   macro content) down to "only the pointer tables changed" reproducing `module check failed`, while
+   "everything else identical, pointer tables untouched" passes. Workaround: inject synthetic bytecode
+   at *existing* pattern/macro addresses in a real corpus file (patterns/macros with a large enough
+   byte budget, e.g. slots 1-4 and macro slot 1 in `mdat.turrican intro`), terminated by the interpreter's
+   own `$F0 End`/`$07 STOP` so the unread tail of the original bytes never matters, rather than ever
+   rewriting `$400`/`$600`'s 128-entry tables.
+2. **A subsong's declared trackstep line range must not extend into another subsong's declared start
+   line, or `uade123`'s playback engine aborts that subsong instantly** (`"song end: player"` at
+   t=0.0s, confirmed with `-1`/`--one` to rule out a silent auto-advance into a later subsong masking
+   it). Bisected exactly: `mdat.turrican intro` declares song 1 starting at trackstep line 52; forcing
+   song 0's own end to line 51 plays normally, line 52 aborts immediately. Also found, more surprising:
+   **even forcing song 0's own start/end to sensible-looking values reproduced the same instant abort**
+   when tested in isolation with `-1` -- i.e. every earlier "it played fine" result in this session's own
+   bisection (before `-1` was added to rule out auto-advance) was actually capturing fragments of a
+   *different*, unmodified subsong bleeding into the same continuous WAV capture, not subsong 0 at all.
+   Final workaround: touch **nothing** in the header's song table (leave song 0's real
+   `start=75 end=129 tempo=3` exactly as shipped, already proven valid by `uade123` playing the file
+   normally); only overwrite the trackstep *lines inside* that already-valid range (line 75 = trigger
+   assignment, next ~20 lines = `$80 Hold`).
+
+**Even after both workarounds, the experiment's actual payload never showed up in `uade123`'s
+rendered audio.** With every invariant respected, `uade123`'s output was **byte-identical in its first
+~150ms across all four offset variants** for voice 0 (offset 0 in every variant, so its patch is
+byte-identical too -- consistent) but showed **zero measurable difference between variants for voices
+1-3**, which do carry the different per-voice offsets and should have produced clearly staggered
+onsets 80-720ms apart. Root cause not found: `uade123`'s real playback engine is evidently not
+dispatching the synthetic tracks 1-3 the way this crate's model (or the file's own byte-level structure,
+confirmed valid by `Module::parse`) predicts, for a reason that could not be narrowed further without
+either reading GPL source (off-limits) or many more bisection rounds.
+
+**Decision (discussed with the user): shelve this specific black-box A/B rather than keep guessing.**
+This crate's own timing model already has strong, self-consistent support (previous session's
+785-trigger, zero-exception measurement); the marginal value of continuing to reverse-engineer
+`uade123`'s undocumented behavior is judged not worth further session time right now. The generator
+script and both invariants above are recorded here so a future session doesn't have to rediscover them
+if this angle is revisited. Not committed (throwaway, per the project's established pattern for this
+kind of analysis tooling).
+
+## Update (2026-07-26, next session): resolved -- superseded notes are not silently dropped, they cut the previous sound short
+
+Answered the other still-open item from two updates back: "is a note that never reaches `$01` before
+being superseded audible at all... or is `dispatch_pattern_entry`/`note_on` silently dropping notes the
+composition intended to be heard."
+
+**Resolved by code reading, not speculation.** `MacroInterpreter::trigger()` (`tfmx/src/macro_interp.rs`)
+unconditionally sets `self.dma_on = false` and calls `reset_effects()` (clearing vibrato/portamento/
+envelope) the instant it runs -- and `note_on` only skips `trigger()` when the incoming macro number
+equals `self.instrument` *and* the program hasn't reached `$07 STOP` (`c919266`'s fix). So every
+**genuine** trigger (a different instrument, or the same one after it stopped) forces DMA off that same
+jiffy, regardless of whether its own note ever survives to reach its own `$01 DMAon` -- `Player::run_jiffy`
+commits `paula.set_dma(voice, self.dma_on)` once per jiffy after dispatch, so this is not a delayed or
+optional effect. **This rules out the specific alternative the open question raised** (that a superseded
+note might still be indirectly audible via portamento/vibrato riding on the previous still-sounding
+note) -- `reset_effects()` clears exactly those three effects unconditionally on every genuine trigger,
+superseded or not.
+
+**Quantified the practical impact** with a throwaway trace-parsing script (not committed, same method as
+the earlier 785-trigger analysis) over a 30 s trace of `turrican intro`: of 202 genuine triggers across
+all four voices (matching the earlier session's own count exactly, a good cross-check), 68 (34%) are
+superseded by a further genuine trigger before their own `$01` fires. Grouping consecutive
+supersessions into runs, the longest continuous "instrument never gets to sound" run found is **3
+jiffies** (voice 1, recurring every ~4.24s in what looks like a rhythmic pattern in the composition);
+most runs are 1-2 jiffies. So the answer is a middle ground between the question's two framings: a
+superseded note's own content is genuinely never heard, and the act of triggering it does audibly cut
+off whatever was playing before -- but in this corpus file the resulting gaps are short (comparable to
+the already-understood single-voice 2-jiffy attack lag), not the basis for a new, larger bug class of
+missing audio. **No code change made** -- this is exactly how `$00`'s documented `<DMAoff+Reset>`
+semantics behave when composition data retriggers a voice faster than one clean attack cycle; not an
+implementation defect in this crate.
