@@ -4,9 +4,9 @@
 >
 > | | |
 > |---|---|
-> | **Next step** | M3 complete. Stop for explicit approval before any "Beyond" work (see Gate). |
-> | **Phase** | 10 of 10 (M3) — Demo page — complete |
-> | **Gate** | **M3 complete, awaiting approval to start "Beyond" work.** Known open issue carried over: `docs/status.md`'s "Open follow-up" section — a human listening pass found `apidya (title)` (and to a lesser extent a `turrican` module) still doesn't sound right even after the confirmed `frac`-reset fix in `Paula::set_dma`. Not blocking M2/M3, but not to be assumed fixed either — see that doc before touching playback correctness again. |
+> | **Next step** | **11.1 · Voice mute in `Paula`** — the first step of M4, approved and not yet started. |
+> | **Phase** | 11 of 11 (M4) — Diagnostics tooling — not started |
+> | **Gate** | M3 complete and approved. **M4/Phase 11 was planned and approved on 2026-07-26** and may be started; stop at the end of Phase 11. The open issue in `docs/status.md`'s "Open follow-up" section is what M4 exists to attack — a human listening pass found `apidya (title)` (and to a lesser extent a `turrican` module) still doesn't sound right even after the confirmed `frac`-reset fix in `Paula::set_dma`. Read that doc before touching playback correctness. Note M4 delivers *tools and a diagnosis*, not a fix: what to repair is decided at the Phase 11 gate. |
 > | **Last done** | 10.1 · `tfmx-web/demo/` (`index.html`, `demo.css`, `demo.js`, `pair-files.mjs` + test). Drop zone (click-to-choose or drag/drop) pairs files by the `mdat.*`/`smpl.*` filename convention, with a visible error if the pair doesn't resolve unambiguously; play/pause via `AudioContext.suspend()`/`resume()` (mirrors `tfmx-play`'s pause: `render()`/`process()` never runs while suspended, so the jiffy clock genuinely freezes rather than advancing under muted output); song-select is a plain 0–31 dropdown, wired to the existing `set-song` port message. A single `AudioContext` is created once and reused across loads, never closed/recreated. Fixed a real, non-demo-specific bug found via the song-select control: `Sequencer::advance()` (`tfmx/src/sequencer.rs`) propagated a hard `AccessError` when a song slot's `song_start`/`song_end` pointed past the module's actual trackstep table — confirmed in a real corpus file (`apidya (title)` song 31: `song_start = song_end = 511`, one line past its 511-line table), and fatal in practice because an uncaught exception in `AudioWorkletProcessor.process()` permanently silences the node. Now treated the same as an authored `$EFFE 0000 Stop` line (regression test: `advance_treats_an_unreadable_line_as_an_implicit_stop`). Three from-scratch Safari-only bugs surfaced and fixed during manual verification, none reproducible in Firefox: (1) `AudioContext` was never explicitly `resume()`d, which Safari enforces strictly; (2) `resume()`/`fileInput.click()` both need live transient user activation, and awaiting one before the other let Safari's short-lived gesture credit expire, so the picker sometimes needed several clicks and a stale pending call could fire later, looking like it came from an unrelated button — fixed by calling `fileInput.click()` synchronously first, un-awaited; (3) `#controls`'s CSS used an ID selector (`display: flex`), which outranked the UA stylesheet's `[hidden]` rule and left the controls visible/clickable before any pair was loaded — fixed with `#controls:not([hidden])`. — confirmed manually by the user (`tfmx-web/demo/index.html`, served from `tfmx-web/`, corpus mdat/smpl pairs): drop-to-play, pause/resume, and song-switching all work in Firefox and Safari. |
 >
 > Update this block in the same commit that ticks a checkbox.
@@ -357,10 +357,115 @@ work.
 
 ---
 
+## M4 — Diagnostics tooling
+
+The player is unobservable: `Player`'s only public getter is `unsupported_ops()`. Nothing outside
+the crate can see the current trackstep line, which pattern each track runs, per-voice macro state,
+or Paula's register values. That is why `docs/status.md`'s open follow-up is stuck — its own named
+next step is a "trackstep/pattern trace diagnostic" that exists only as throwaway code from a past
+conversation, and step 6.2's automated proxies measured pitch/timbre correlation rather than the
+question actually being asked, which is *does this sound like a coherent song at all*.
+
+This milestone builds the observation seam and the three tools that turn it into answers, ordered
+so the fastest route to **hearing** the problem lands first. It delivers tools and a corpus-wide
+diagnosis, **not a fix** — what to repair is a separate call at the phase gate.
+
+**Design decisions carried into these steps:**
+- **The trace seam is generic, not dynamic.** `Player::render` gains a private generic sibling
+  `render_inner<F: FnMut(TraceEvent)>(&mut self, out, trace: F)`; `render()` calls it with `|_| {}`,
+  which monomorphizes to exactly today's code. That is what keeps the step 6.1 golden hashes
+  byte-identical and proves the seam is inert. This mirrors the crate's existing idiom —
+  `PatternRunner::advance` and `MacroInterpreter::tick` already take `emit: impl FnMut(..)`.
+- **Mute happens at the mix, not the fetch.** In `Paula::render`, `voice.next_sample(..)` must still
+  run for a muted voice so playback position, loop completions and the attack→loop handoff evolve
+  identically; only the accumulated amplitude is dropped. This is what makes the four stems sum back
+  to the full mix — a testable property, and the reason stems are a trustworthy diagnostic rather
+  than a re-simulation.
+- **Stems are four renders, not four output buffers.** `render()` is deterministic, so soloing each
+  voice in turn costs ~20 lines of CLI code against reshaping `Paula::render`. 4× render time is
+  irrelevant offline. (`ponytail:` 4× cost; single-pass Paula output if it ever matters.)
+- **Trace output is text; other formats are a match arm away.** Format selection is a plain
+  `--format` enum over one pure function per format (`fn write_text(e: &TraceEvent, out: &mut impl
+  Write)`), not a trait. Adding JSON or TOON later is a new function plus one arm.
+- **Core stays core.** `TraceEvent` is a plain enum in `tfmx` — no dependency, no allocation, no I/O,
+  still builds for `wasm32`. All formatting, folding and analysis lives in `tfmx-cli`, the same
+  boundary already drawn at the CLI, `cpal` and wasm edges.
+
+### Phase 11 — Observation seam and diagnostic tools
+
+- [ ] **11.1** Voice mute in `Paula`: `muted: [bool; 4]` plus `set_voice_muted(voice, bool)`, and a
+      forwarding `Player::set_voice_muted`. Copy `self.muted` into a local before the `iter_mut()`
+      loop (borrow), call `next_sample` unconditionally, skip only the `+=` into the pan
+      accumulators. Also promote `Paula::voice(&self, voice) -> Voice` from `#[cfg(test)]
+      pub(crate)` to a public getter — 11.3 needs it and `Voice`'s fields are already `pub`. —
+      *check: unit tests that (a) muting makes a single-voice render silent, (b) a muted voice's
+      playback position still advances, (c) all four solo renders sum sample-for-sample to the full
+      mix on non-clipping material; golden hashes unchanged* *(Sonnet 5)*
+- [ ] **11.2** `tfmx-cli render` gains `--solo N`, `--mute N[,N..]` and `--stems`; `--stems` derives
+      four filenames from `-o` (`out.wav` → `out-v0.wav` … `out-v3.wav`) and runs four soloed
+      renders. — *check: unit tests on the filename derivation and on mute/solo → mask resolution as
+      pure functions; a manual run produces four WAVs whose sum matches the single-file render.*
+      **Then actually listen**: per-voice stems of `apidya (title)` and the suspect `turrican`
+      module, with what was heard recorded in `docs/status.md`. *(Sonnet 5)*
+- [ ] **11.3** `TraceEvent` (new `tfmx/src/trace.rs`, re-exported from `lib.rs`) and
+      `Player::render_traced`. Variants: `Jiffy { frame, line, tempo, stopped }`,
+      `Trackstep(TrackstepLine)`, `Pattern { track, pattern, step, entry }`,
+      `Trigger { voice, macro_number, note, volume, transpose }`, `Voice { voice, state }`.
+      `Trigger` is emitted from `dispatch_pattern_entry` rather than derived by the consumer,
+      precisely because `voice_of()`'s nibble masking is a documented uncertainty — a masking bug
+      has to be visible. Thread `trace: &mut impl FnMut(TraceEvent)` through `run_jiffy` and
+      `dispatch_pattern_entry`. `Voice` events fire for all four voices at each jiffy's end;
+      de-duplication is the consumer's job, not the core's. Record the seam in
+      `docs/architecture.md` alongside the register seam. — *check: (a) `render()` and
+      `render_traced(.., |_| {})` are bit-identical on a corpus module; (b) the existing golden
+      hashes are unchanged — the load-bearing proof the seam is inert; (c) a 1 s traced render emits
+      ~50 `Jiffy` events with monotonically non-decreasing `frame`* *(Opus 5)*
+- [ ] **11.4** `tfmx-cli trace <mdat> <smpl> [--song N] [--seconds S] [--voice N] [--track N]
+      [--format text]`, writing to an injected `&mut impl Write` following `run_info`'s existing
+      testable shape. Suppresses unchanged `Voice` events. Aligned, greppable, `diff`-able between
+      two runs. — *check: unit tests over a hand-built `Vec<TraceEvent>` → expected text, with no
+      corpus and no player involved; a corpus run of two songs produces visibly different traces*
+      *(Sonnet 5)*
+- [ ] **11.5** `tfmx-cli lint`, and `info` made static. `info` drops its hidden silent render and
+      its histogram (its test updates with it); everything requiring playback moves to `lint`.
+      `lint <mdat> <smpl> [--song N] [--seconds S]` folds a traced render plus PCM statistics into a
+      report, as a **pure function over `&[TraceEvent]`** so every finding is testable from a
+      synthetic event vector. *Summary:* jiffies run, tempos seen, trackstep lines visited, looped
+      or stopped, distinct patterns per track, distinct macros and note-on count per voice,
+      pattern-command histogram, unsupported-opcode histogram. *Findings:* `dead-voice` (DMA never
+      on), `frozen-voice` (period/volume/region unchanged >2 s with DMA on), `no-retrigger` (sample
+      region never changes for the whole run — **the `apidya (title)` symptom as described**),
+      `single-pattern`, `stopped-early`, `silence`, `clipping`, `unsupported-ops`. — *check: unit
+      tests drive each finding from a synthetic event vector; then run `lint` across all 10 corpus
+      modules and record the table in `docs/status.md` — that corpus-wide result is the actual
+      deliverable* *(Opus 5)*
+- [ ] **11.6** Mutation robustness test (`tfmx/tests/`): a seeded LCG (no dependency) flips bytes in
+      corpus `mdat`/`smpl` buffers, then asserts `Module::parse` followed by ~1 s of
+      `Player::render` never panics — `Err` is a fine outcome, a panic is not. The stable-toolchain
+      version of `cargo-fuzz`, targeting a class of bug that has already bitten twice: step 6.1's
+      out-of-range pattern number and step 10.1's `song_start` past the trackstep table, the latter
+      fatal in the browser because a panic in `AudioWorkletProcessor.process()` silences the node
+      permanently. — *check: passes over a few thousand mutations of all 10 corpus files;
+      deliberately reverting the `number & 0x7F` mask in `sequencer.rs` makes it fail* *(Sonnet 5)*
+
+Phase 11's gate: whatever the stems and `lint` turn up is written into `docs/status.md`. Deciding
+what to repair — and whether the next round is that repair or the export tooling below — is a
+separate call made there. **Human listening is required before this phase is called done**, per the
+project's standing rule; no correctness claim rests on automated analysis alone.
+
+---
+
 ## Later milestones
 
+- **Export and static analysis** (the natural round after M4 — all of it wants a *static* module
+  walker that resolves a song to its reachable patterns, macros and sample regions, rather than M4's
+  runtime seam): machine-readable module dump, sample export (the `smpl` file has no directory —
+  regions exist only as `$02`/`$03`/`$18` operands inside macros, so this is an analysis job, not a
+  file split), round-trippable text disassembly (assemble → identical `mdat` would be the strongest
+  parser validation this project could have), MIDI/SFZ export, piano-roll and structure diagrams,
+  cross-module sample fingerprinting.
 - **Beyond:** TFMX 7V support (a separate parser path — the format is substantially different,
-  not a flag), GemX macro opcodes, tools (pattern dump, sample export).
+  not a flag), GemX macro opcodes, tracker TUI in `tfmx-play`, web visualizer in the M3 demo.
 
 ## Sources
 
