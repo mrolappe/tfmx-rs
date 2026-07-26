@@ -1,6 +1,8 @@
+use std::io::Write;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use tfmx::TraceEvent;
 
 #[derive(Parser)]
 #[command(name = "tfmx-cli", about = "Render and inspect TFMX modules")]
@@ -15,6 +17,8 @@ enum Command {
     Render(RenderArgs),
     /// Print header text, songs, tempos, layout and unsupported opcodes seen.
     Info(InfoArgs),
+    /// Print the state-machine trace of a render: one line per event.
+    Trace(TraceArgs),
 }
 
 #[derive(clap::Args)]
@@ -83,6 +87,29 @@ struct InfoArgs {
     /// How long to run the song for while collecting the unsupported-opcode histogram.
     #[arg(long, default_value_t = 30)]
     seconds: u32,
+}
+
+#[derive(clap::Args)]
+struct TraceArgs {
+    mdat: PathBuf,
+    smpl: PathBuf,
+    #[arg(long, default_value_t = 0)]
+    song: u8,
+    #[arg(long, default_value_t = 30)]
+    seconds: u32,
+    /// Restrict `Trigger`/`Voice` events to this voice (0-3).
+    #[arg(long)]
+    voice: Option<u8>,
+    /// Restrict `Pattern` events to this track (0-7).
+    #[arg(long)]
+    track: Option<u8>,
+    #[arg(long, value_enum, default_value_t = TraceFormat::Text)]
+    format: TraceFormat,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
+enum TraceFormat {
+    Text,
 }
 
 #[derive(Debug)]
@@ -233,11 +260,110 @@ fn run_info(args: &InfoArgs, out: &mut impl std::io::Write) -> Result<(), CliErr
     Ok(())
 }
 
+/// One `TraceEvent` as one aligned, greppable text line. The one-function-
+/// per-format seam `docs/status.md`'s M4 plan calls for: JSON/TOON later is
+/// a new function plus one `TraceFormat` arm, not a trait.
+fn write_text_event(e: &TraceEvent, out: &mut impl Write) -> std::io::Result<()> {
+    match e {
+        TraceEvent::Jiffy {
+            frame,
+            line,
+            tempo,
+            stopped,
+        } => writeln!(
+            out,
+            "JIFFY     frame={frame} line={line} tempo={tempo} stopped={stopped}"
+        ),
+        TraceEvent::Trackstep(line) => writeln!(out, "TRACKSTEP {line:?}"),
+        TraceEvent::Pattern {
+            track,
+            pattern,
+            step,
+            entry,
+        } => writeln!(
+            out,
+            "PATTERN   track={track} pattern={pattern} step={step} entry={entry:?}"
+        ),
+        TraceEvent::Trigger {
+            voice,
+            macro_number,
+            note,
+            volume,
+            transpose,
+        } => writeln!(
+            out,
+            "TRIGGER   voice={voice} macro={macro_number} note={note} volume={volume} transpose={transpose}"
+        ),
+        TraceEvent::Voice { voice, state } => {
+            writeln!(out, "VOICE     voice={voice} state={state:?}")
+        }
+    }
+}
+
+/// Folds a trace event stream to text: `Jiffy`/`Trackstep` events always
+/// pass through as timeline context; `Pattern` is restricted to `track` and
+/// `Trigger`/`Voice` to `voice` when given; a `Voice` event is dropped when
+/// its state is unchanged from the last one emitted for that voice -- the
+/// noise a diagnostic actually needs cut (step 11.4).
+fn write_trace(
+    events: &[TraceEvent],
+    voice: Option<u8>,
+    track: Option<u8>,
+    out: &mut impl Write,
+) -> std::io::Result<()> {
+    let mut last_voice_state: [Option<tfmx::Voice>; 4] = [None; 4];
+    for e in events {
+        match e {
+            TraceEvent::Pattern { track: t, .. } if track.is_some_and(|f| f != *t) => continue,
+            TraceEvent::Trigger { voice: v, .. } if voice.is_some_and(|f| f != *v) => continue,
+            TraceEvent::Voice { voice: v, state } => {
+                if voice.is_some_and(|f| f != *v) {
+                    continue;
+                }
+                let slot = &mut last_voice_state[*v as usize];
+                if *slot == Some(*state) {
+                    continue;
+                }
+                *slot = Some(*state);
+            }
+            _ => {}
+        }
+        write_text_event(e, out)?;
+    }
+    Ok(())
+}
+
+fn run_trace(args: &TraceArgs, out: &mut impl Write) -> Result<(), CliError> {
+    let mdat = std::fs::read(&args.mdat)?;
+    let smpl = std::fs::read(&args.smpl)?;
+    let module = tfmx::Module::parse(&mdat, &smpl)?;
+
+    const SAMPLE_RATE: u32 = 44_100;
+    const SEPARATION: u8 = 100;
+    let mut player = tfmx::Player::new(&module, args.song, SAMPLE_RATE, SEPARATION)?;
+
+    let mut events = Vec::new();
+    let total_frames = SAMPLE_RATE as usize * args.seconds as usize;
+    let mut buf = vec![0i16; 4096 * 2];
+    let mut frames_left = total_frames;
+    while frames_left > 0 {
+        let chunk_frames = frames_left.min(4096);
+        player.render_traced(&mut buf[..chunk_frames * 2], |e| events.push(e))?;
+        frames_left -= chunk_frames;
+    }
+
+    match args.format {
+        TraceFormat::Text => write_trace(&events, args.voice, args.track, out)?,
+    }
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
     let result = match &cli.command {
         Command::Render(args) => run_render(args),
         Command::Info(args) => run_info(args, &mut std::io::stdout().lock()),
+        Command::Trace(args) => run_trace(args, &mut std::io::stdout().lock()),
     };
     if let Err(e) = result {
         eprintln!("tfmx-cli: {e}");
@@ -415,5 +541,179 @@ mod tests {
     fn derive_stem_paths_without_extension_has_no_dot() {
         let paths = derive_stem_paths(std::path::Path::new("out"));
         assert_eq!(paths[0], PathBuf::from("out-v0"));
+    }
+
+    fn voice_state(period: u16, volume: u8) -> tfmx::Voice {
+        let mut state = tfmx::Voice::default();
+        state.start = 100;
+        state.len = 50;
+        state.period = period;
+        state.volume = volume;
+        state.dma_on = true;
+        state
+    }
+
+    #[test]
+    fn write_trace_formats_a_jiffy_event() {
+        let events = vec![TraceEvent::Jiffy {
+            frame: 42,
+            line: 5,
+            tempo: 6,
+            stopped: false,
+        }];
+        let mut out = Vec::new();
+        write_trace(&events, None, None, &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "JIFFY     frame=42 line=5 tempo=6 stopped=false\n"
+        );
+    }
+
+    #[test]
+    fn write_trace_formats_a_trackstep_event() {
+        let events = vec![TraceEvent::Trackstep(tfmx::TrackstepLine::Command(
+            tfmx::LineCommand::Stop,
+        ))];
+        let mut out = Vec::new();
+        write_trace(&events, None, None, &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "TRACKSTEP Command(Stop)\n"
+        );
+    }
+
+    #[test]
+    fn write_trace_keeps_only_the_requested_track_pattern_events() {
+        let events = vec![
+            TraceEvent::Pattern {
+                track: 0,
+                pattern: 1,
+                step: 0,
+                entry: tfmx::PatternEntry::Command(tfmx::PatternCommand::End),
+            },
+            TraceEvent::Pattern {
+                track: 1,
+                pattern: 2,
+                step: 0,
+                entry: tfmx::PatternEntry::Command(tfmx::PatternCommand::End),
+            },
+        ];
+        let mut out = Vec::new();
+        write_trace(&events, None, Some(1), &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("track=0"));
+        assert!(text.contains("track=1"));
+    }
+
+    #[test]
+    fn write_trace_keeps_only_the_requested_voice_trigger_events() {
+        let events = vec![
+            TraceEvent::Trigger {
+                voice: 0,
+                macro_number: 1,
+                note: 12,
+                volume: 64,
+                transpose: 0,
+            },
+            TraceEvent::Trigger {
+                voice: 2,
+                macro_number: 3,
+                note: 24,
+                volume: 64,
+                transpose: 0,
+            },
+        ];
+        let mut out = Vec::new();
+        write_trace(&events, Some(2), None, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("voice=0"));
+        assert!(text.contains("voice=2"));
+    }
+
+    #[test]
+    fn write_trace_suppresses_an_unchanged_voice_event() {
+        let state = voice_state(428, 64);
+        let events = vec![
+            TraceEvent::Voice { voice: 0, state },
+            TraceEvent::Voice { voice: 0, state },
+        ];
+        let mut out = Vec::new();
+        write_trace(&events, None, None, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.matches("VOICE").count(), 1);
+    }
+
+    #[test]
+    fn write_trace_emits_a_changed_voice_event_again() {
+        let events = vec![
+            TraceEvent::Voice {
+                voice: 0,
+                state: voice_state(428, 64),
+            },
+            TraceEvent::Voice {
+                voice: 0,
+                state: voice_state(214, 64),
+            },
+        ];
+        let mut out = Vec::new();
+        write_trace(&events, None, None, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.matches("VOICE").count(), 2);
+    }
+
+    #[test]
+    fn write_trace_tracks_unchanged_state_independently_per_voice() {
+        let state = voice_state(428, 64);
+        let events = vec![
+            TraceEvent::Voice { voice: 0, state },
+            TraceEvent::Voice { voice: 1, state },
+        ];
+        let mut out = Vec::new();
+        write_trace(&events, None, None, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.matches("VOICE").count(), 2);
+    }
+
+    /// Step 11.4's roadmap check: a corpus run of two songs produces
+    /// visibly different traces.
+    #[test]
+    fn trace_of_two_different_songs_differs() {
+        let Some(mdat) = corpus_path("mdat.turrican intro") else {
+            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+            return;
+        };
+        let smpl = corpus_path("smpl.turrican intro").expect("smpl present alongside mdat");
+
+        let mut song0 = Vec::new();
+        run_trace(
+            &TraceArgs {
+                mdat: mdat.clone(),
+                smpl: smpl.clone(),
+                song: 0,
+                seconds: 1,
+                voice: None,
+                track: None,
+                format: TraceFormat::Text,
+            },
+            &mut song0,
+        )
+        .expect("trace succeeds on a valid corpus file");
+
+        let mut song1 = Vec::new();
+        run_trace(
+            &TraceArgs {
+                mdat,
+                smpl,
+                song: 1,
+                seconds: 1,
+                voice: None,
+                track: None,
+                format: TraceFormat::Text,
+            },
+            &mut song1,
+        )
+        .expect("trace succeeds on a valid corpus file");
+
+        assert_ne!(song0, song1);
     }
 }
