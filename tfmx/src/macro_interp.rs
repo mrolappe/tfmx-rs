@@ -61,7 +61,7 @@ impl UnsupportedOps {
 /// jiffies, `value` moves by `amount` towards `target`, clamped on arrival.
 /// `docs/playback-model.md` §5.1.
 #[derive(Debug, Clone, Copy)]
-struct Envelope {
+pub(crate) struct Envelope {
     amount: u8,
     every: u8,
     target: u8,
@@ -69,7 +69,7 @@ struct Envelope {
 }
 
 impl Envelope {
-    fn new(amount: u8, every: u8, target: u8) -> Self {
+    pub(crate) fn new(amount: u8, every: u8, target: u8) -> Self {
         Self {
             amount,
             every,
@@ -80,7 +80,7 @@ impl Envelope {
 
     /// Advances one jiffy. Returns `false` once `volume` has reached
     /// `target` -- the caller drops the envelope on `false`.
-    fn tick(&mut self, volume: &mut u8) -> bool {
+    pub(crate) fn tick(&mut self, volume: &mut u8) -> bool {
         if self.every != 0 {
             self.counter = self.counter.wrapping_sub(1);
             if self.counter != 0 {

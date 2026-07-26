@@ -344,10 +344,10 @@ impl<'a> Sequencer<'a> {
                     }
                 }
             }
-            // Nothing in this crate yet consumes a master-volume slide
-            // (there is no master-volume concept on `Paula`); recognized
-            // and timed like any other line command, executed by a later
-            // step once there is somewhere to apply it.
+            // `Sequencer` only recognizes and times these -- it has no
+            // access to `Paula`. `Player::run_jiffy` reads the decoded
+            // `TrackstepLine` this call returns and starts the slide on
+            // `Paula` there ([S1] never distinguishes 0003 from 0004).
             LineCommand::MasterVolSlideA { .. }
             | LineCommand::MasterVolSlideB { .. }
             | LineCommand::Unknown { .. } => self.step_line(),

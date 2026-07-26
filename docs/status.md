@@ -506,3 +506,42 @@ Plan agreed with the user, explicitly deferred to a fresh session (not started t
    "real but not sufficient" fix in this investigation), the next untried item is comparing the
    very first `TRIGGER`/`PATTERN` trace events against the reference's audible attack timbre at
    t=0 (never attempted this session).
+
+## Update (2026-07-26, next session): master volume implemented, default-0 theory falsified
+
+Implemented the plan above (TDD, per the project's hard rule): `Paula` now owns `master_volume`
+(0..=64) and an optional slide, reusing `macro_interp::Envelope`'s existing "every `every` jiffies,
+move by 1 towards `target`, clamp on arrival" mechanic (made `pub(crate)`) rather than
+re-implementing the same shape a third time. `Sequencer::advance` still only recognizes and times
+`$EFFE 0003`/`0004`, as before; `Player::run_jiffy` now reads the returned `LineCommand` and starts
+the slide on `Paula`, and `dispatch_pattern_entry` does the same for pattern `$FA <Fade>` (both
+share the identical mechanic per `docs/playback-model.md` §5.1). New tests: `Paula`-level slide/
+clamp/render-scaling unit tests, plus a player-level test proving the trackstep wiring end to end
+against a synthetic module (not against `turrican intro`'s own data -- see below for why).
+
+**Step 2 of the plan (default to 0 at song start) was tried and found wrong before any listening
+was needed.** `Player::new` defaulted `Paula`'s master volume to 0; `cargo test --workspace`'s
+golden-hash regression immediately caught it: `apidya (level 1)` (confirmed **TFMX Pro**, not the
+unrelated 7V `apidya (title)` -- `docs/status.md`'s step-11.2 update, `apidya (level 1) | TFMX Pro`)
+never issues a master-volume command anywhere in a 15 s trace, and under the default-0 policy
+rendered **completely silent** (`tfmx-cli lint`: `peak amplitude 0`) despite ~280 real note-ons
+across all four voices. A crate-wide default below 64 is inconsistent with any module that manages
+master volume only implicitly -- which is most of the corpus. Corrected: `Player::new` now stands
+on `Paula::new`'s own neutral default (64, no attenuation); only a module that explicitly starts a
+slide ever moves away from it.
+
+**Consequence for the `turrican intro` investigation: the fade-in theory is falsified, not
+confirmed.** With the corrected (64) default, `turrican intro`'s trackstep line 75
+(`MasterVolSlideB { divisor: 0, target: 64 }`) is a genuine no-op -- current already equals target,
+so the slide starts and immediately drops itself. This master-volume mechanism is now real and
+correctly wired for any module that does use it non-trivially, but it does **not** explain
+`turrican intro`'s drum-at-the-start symptom. Re-verified via the full workspace test suite +
+golden-hash diff: of all 10 corpus files, only `apidya (title)`'s hash changed (that file's parser
+already reads 7V data as Pro-2.0 garbage -- `docs/status.md`'s step-11.2 update -- so a garbage
+`$EFFE`/`$FA` sequence newly doing *something* there is expected noise, not a regression); the
+other 9, including `turrican intro` and `apidya (level 1)`, are byte-identical to before this
+session's change.
+
+**Next untried item, still open, next session**: step 5's own fallback -- compare the very first
+`TRIGGER`/`PATTERN` trace events against the reference's audible attack timbre at t=0. Master
+volume as a mechanism is done; it is no longer the lead suspect for this symptom.

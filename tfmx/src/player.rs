@@ -6,7 +6,8 @@ use crate::macro_interp::{MacroEvent, MacroInterpreter, UnsupportedOps};
 use crate::module::{AccessError, Module};
 use crate::paula::Paula;
 use crate::sequencer::{
-    PatternCommand, PatternEntry, PatternRunner, Sequencer, TickClock, TrackSlot,
+    LineCommand, PatternCommand, PatternEntry, PatternRunner, Sequencer, TickClock, TrackSlot,
+    TrackstepLine,
 };
 use crate::trace::TraceEvent;
 
@@ -52,6 +53,15 @@ impl<'a> Player<'a> {
     ) -> Result<Self, AccessError> {
         let sequencer = Sequencer::new(module, song)?;
         let clock = TickClock::new(sequencer.tempo());
+        // `Paula::new`'s own default (64, no attenuation) stands at song
+        // start too: `docs/status.md`'s "Update (2026-07-26, later)" section
+        // tried defaulting to 0 (a fade-in read of turrican intro's opening
+        // slide) and found it falsified by the rest of the corpus --
+        // `apidya (level 1)` (confirmed TFMX Pro, not the unrelated 7V
+        // `apidya (title)`) never touches master volume and would render
+        // permanently silent (`tfmx-cli lint` on it: peak amplitude 0)
+        // despite ~280 real note-ons. A crate-wide default below 64 is
+        // inconsistent with any module that doesn't manage it explicitly.
         Ok(Self {
             module,
             smpl: module.smpl(),
@@ -186,6 +196,13 @@ fn run_jiffy<'a>(
     // one `Sequencer::advance()` call per jiffy.
     if !sequencer.is_stopped() {
         let line = sequencer.advance()?;
+        if let TrackstepLine::Command(
+            LineCommand::MasterVolSlideA { divisor, target }
+            | LineCommand::MasterVolSlideB { divisor, target },
+        ) = &line
+        {
+            paula.start_master_volume_slide(*divisor as u8, *target as u8);
+        }
         trace(TraceEvent::Trackstep(line));
     }
 
@@ -218,7 +235,7 @@ fn run_jiffy<'a>(
                     step,
                     entry,
                 });
-                dispatch_pattern_entry(entry, transpose, macros, trace);
+                dispatch_pattern_entry(entry, transpose, macros, paula, trace);
             })?;
         }
     }
@@ -238,6 +255,8 @@ fn run_jiffy<'a>(
         macros[voice_of(channel)].play_macro(macro_number, detune);
     }
 
+    paula.tick_master_volume();
+
     for voice in 0..4u8 {
         trace(TraceEvent::Voice {
             voice,
@@ -254,6 +273,7 @@ fn dispatch_pattern_entry(
     entry: PatternEntry,
     transpose: i8,
     macros: &mut [MacroInterpreter; 4],
+    paula: &mut Paula,
     trace: &mut impl FnMut(TraceEvent),
 ) {
     match entry {
@@ -294,11 +314,12 @@ fn dispatch_pattern_entry(
             PatternCommand::Portamento { speed, voice, rate } => {
                 macros[voice_of(voice)].start_portamento(speed, rate as i8 as i16)
             }
+            PatternCommand::Fade { speed, target } => {
+                paula.start_master_volume_slide(speed, target)
+            }
             // Recognized, timed by `PatternRunner`, and left unconsumed --
-            // same status as pattern `MasterVolSlide`: nothing in this
-            // crate owns a master volume or cross-track pattern jump yet.
-            PatternCommand::Fade { .. }
-            | PatternCommand::PlayPattern { .. }
+            // nothing in this crate owns a cross-track pattern jump yet.
+            PatternCommand::PlayPattern { .. }
             | PatternCommand::Lock { .. }
             | PatternCommand::End
             | PatternCommand::Loop { .. }
@@ -482,5 +503,84 @@ mod tests {
             last_frame.unwrap() > 4096 * 9,
             "frame should keep advancing across chunked calls, not reset each call, got {last_frame:?}"
         );
+    }
+
+    /// `docs/status.md`'s "Update (2026-07-26, later)" section tried
+    /// defaulting song start to 0 and found it falsified: `apidya (level 1)`
+    /// (confirmed TFMX Pro) never touches master volume and would render
+    /// permanently silent under that policy despite real note-ons. Song
+    /// start now stands on `Paula::new`'s own neutral default.
+    #[test]
+    fn player_new_defaults_master_volume_to_full_scale() {
+        let mut mdat = vec![0u8; 0x800];
+        mdat[0..10].copy_from_slice(b"TFMX-SONG ");
+        let module = Module::parse(&mdat, &[]).expect("valid header parses");
+        let player = Player::new(&module, 0, 44100, 100).expect("song 0 in range");
+        assert_eq!(player.paula.master_volume(), 64);
+    }
+
+    /// End-to-end proof that a trackstep `$EFFE 0003`/`0004` line is applied
+    /// to `Paula`: a synthetic one-line module sliding down to 0 (divisor 0,
+    /// so `docs/playback-model.md` §5.1's shared envelope mechanic moves by
+    /// 1 every jiffy with no waiting). Deliberately not `turrican intro`'s
+    /// own real slide, which targets 64 from a default of 64 and is
+    /// therefore a no-op -- this proves the wiring independent of that now-
+    /// understood-inert real-world data point.
+    #[test]
+    fn trackstep_master_vol_slide_moves_on_the_first_jiffy() {
+        const STOP_LINE: [u8; 16] = [
+            0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00,
+            0xFF, 0x00,
+        ];
+        let mut effe_line = [0u8; 16];
+        effe_line[0..2].copy_from_slice(&0xEFFEu16.to_be_bytes()); // $EFFE
+        effe_line[2..4].copy_from_slice(&0x0003u16.to_be_bytes()); // MasterVolSlideA
+        effe_line[4..6].copy_from_slice(&0u16.to_be_bytes()); // divisor 0
+        effe_line[6..8].copy_from_slice(&0u16.to_be_bytes()); // target 0
+
+        let mut mdat = vec![0u8; 0x800 + 2 * 16];
+        mdat[0..10].copy_from_slice(b"TFMX-SONG ");
+        mdat[0x140..0x142].copy_from_slice(&1u16.to_be_bytes()); // song_end
+        mdat[0x180..0x182].copy_from_slice(&1u16.to_be_bytes()); // tempo
+        mdat[0x800..0x810].copy_from_slice(&effe_line);
+        mdat[0x810..0x820].copy_from_slice(&STOP_LINE);
+        let module = Module::parse(&mdat, &[]).expect("valid header parses");
+
+        let mut player = Player::new(&module, 0, 44100, 100).expect("song 0 in range");
+        assert_eq!(player.paula.master_volume(), 64);
+
+        let mut out = vec![0i16; 2]; // one frame is enough: the first tick is due immediately
+        player.render(&mut out).expect("stays in range");
+
+        assert_eq!(
+            player.paula.master_volume(),
+            63,
+            "divisor 0 moves master volume by 1 on the very first jiffy"
+        );
+    }
+
+    /// Pattern `$FA <Fade>` was recognized and timed but never consumed --
+    /// same bucket as `PlayPattern`/`Lock` until now. Unlike those, this one
+    /// is fixed: it must start the shared master-volume slide on `Paula`.
+    #[test]
+    fn fade_pattern_command_starts_a_master_volume_slide() {
+        let mut macros = core::array::from_fn(|_| MacroInterpreter::new());
+        let mut paula = Paula::new(100);
+        paula.set_master_volume(0);
+
+        dispatch_pattern_entry(
+            PatternEntry::Command(PatternCommand::Fade {
+                speed: 1,
+                target: 40,
+            }),
+            0,
+            &mut macros,
+            &mut paula,
+            &mut |_| {},
+        );
+        paula.tick_master_volume();
+        paula.tick_master_volume();
+
+        assert_eq!(paula.master_volume(), 2);
     }
 }

@@ -3,6 +3,8 @@
 //! sequencer writes `Voice` fields through `Paula`'s setters, and
 //! `Paula::render()` (step 3.2) reads them.
 
+use crate::macro_interp::Envelope;
+
 const VOICE_COUNT: usize = 4;
 
 /// PAL Paula reference clock. `docs/playback-model.md` §2.1.
@@ -101,6 +103,14 @@ pub struct Paula {
     voices: [Voice; VOICE_COUNT],
     separation: u8,
     muted: [bool; VOICE_COUNT],
+    /// 0..=64, mixed in as an overall attenuation alongside each voice's own
+    /// `volume`. Defaults to 64 (no attenuation) -- a bare mixer with no
+    /// slide ever started has no reason to silence itself. The song-start
+    /// policy of defaulting to 0 (`docs/status.md`'s "Update (2026-07-26,
+    /// later)" section) belongs to whoever knows it's song start, not here;
+    /// see `Player::new`.
+    master_volume: u8,
+    master_volume_slide: Option<Envelope>,
 }
 
 impl Paula {
@@ -110,6 +120,8 @@ impl Paula {
             voices: [Voice::default(); VOICE_COUNT],
             separation,
             muted: [false; VOICE_COUNT],
+            master_volume: 64,
+            master_volume_slide: None,
         }
     }
 
@@ -175,12 +187,43 @@ impl Paula {
         self.voices[voice as usize]
     }
 
+    /// Starts (or replaces) a master-volume slide: every `every` jiffies,
+    /// move by 1 towards `target`, clamping on arrival. Shared mechanic for
+    /// pattern `$FA <Fade>` and trackstep `$EFFE 0003`/`0004`.
+    /// `docs/playback-model.md` §5.1.
+    pub fn start_master_volume_slide(&mut self, every: u8, target: u8) {
+        self.master_volume_slide = Some(Envelope::new(1, every, target));
+    }
+
+    /// Advances one jiffy; a no-op once no slide is active or it has
+    /// reached its target.
+    pub fn tick_master_volume(&mut self) {
+        if let Some(envelope) = &mut self.master_volume_slide
+            && !envelope.tick(&mut self.master_volume)
+        {
+            self.master_volume_slide = None;
+        }
+    }
+
+    /// The current master-volume value (0..=64).
+    #[cfg(test)]
+    pub(crate) fn master_volume(&self) -> u8 {
+        self.master_volume
+    }
+
+    /// Sets the master volume directly, bypassing any slide. Used by
+    /// `Player::new` to apply the song-start default.
+    pub fn set_master_volume(&mut self, value: u8) {
+        self.master_volume = value;
+    }
+
     /// Synthesizes `out.len() / 2` interleaved stereo frames from whatever
     /// `Voice` state is currently latched, reading PCM out of `smpl`.
     /// Register state is constant across the call. `docs/architecture.md` §3.
     pub fn render(&mut self, smpl: &[i8], sample_rate: u32, out: &mut [i16]) {
         let (own, bleed) = pan_weights(self.separation);
         let muted = self.muted;
+        let master = self.master_volume as f64 / 64.0;
         for frame in out.chunks_exact_mut(2) {
             let mut left = 0.0_f64;
             let mut right = 0.0_f64;
@@ -189,8 +232,10 @@ impl Paula {
                     continue;
                 }
                 // 8-bit PCM volume-scaled and expanded into i16 range.
-                let amp =
-                    voice.next_sample(smpl, sample_rate) * (voice.volume as f64 / 64.0) * 256.0;
+                let amp = voice.next_sample(smpl, sample_rate)
+                    * (voice.volume as f64 / 64.0)
+                    * master
+                    * 256.0;
                 if muted[i] {
                     continue;
                 }
@@ -216,6 +261,83 @@ mod tests {
     fn new_creates_four_silent_voices() {
         let paula = Paula::new(0);
         assert_eq!(paula.voices, [Voice::default(); 4]);
+    }
+
+    #[test]
+    fn new_defaults_master_volume_to_full_scale() {
+        // A bare mixer with no slide ever started must not silently
+        // attenuate -- that policy belongs to whoever knows it's song
+        // start (`Player::new`), not to `Paula` itself.
+        let paula = Paula::new(0);
+        assert_eq!(paula.master_volume(), 64);
+    }
+
+    #[test]
+    fn master_volume_slide_moves_by_one_every_divisor_jiffies_and_clamps() {
+        let mut paula = Paula::new(0);
+        paula.set_master_volume(0);
+        paula.start_master_volume_slide(2, 3);
+
+        paula.tick_master_volume();
+        assert_eq!(paula.master_volume(), 0, "first tick just starts the counter");
+        paula.tick_master_volume();
+        assert_eq!(paula.master_volume(), 1);
+        paula.tick_master_volume();
+        paula.tick_master_volume();
+        assert_eq!(paula.master_volume(), 2);
+        paula.tick_master_volume();
+        paula.tick_master_volume();
+        assert_eq!(paula.master_volume(), 3);
+        paula.tick_master_volume();
+        paula.tick_master_volume();
+        assert_eq!(paula.master_volume(), 3, "clamped at target, stops advancing");
+    }
+
+    #[test]
+    fn render_is_silent_at_zero_master_volume_even_with_a_voice_at_full_volume() {
+        let mut paula = Paula::new(100);
+        paula.set_master_volume(0);
+        let smpl = [100i8; 16];
+        paula.set_period(0, 100);
+        paula.set_volume(0, 64);
+        paula.set_sample_region(0, 0, 8);
+        paula.set_loop_region(0, 0, 8);
+        paula.set_dma(0, true);
+
+        let mut out = [1i16; 8];
+        paula.render(&smpl, 48_000, &mut out);
+
+        assert_eq!(out, [0i16; 8]);
+    }
+
+    #[test]
+    fn render_scales_linearly_with_master_volume() {
+        let smpl = [100i8; 16];
+        let make = |master: u8| {
+            let mut p = Paula::new(100);
+            p.set_master_volume(master);
+            p.set_period(0, 100);
+            p.set_volume(0, 64);
+            p.set_sample_region(0, 0, 8);
+            p.set_loop_region(0, 0, 8);
+            p.set_dma(0, true);
+            p
+        };
+
+        let mut half = make(32);
+        let mut out_half = [0i16; 8];
+        half.render(&smpl, 48_000, &mut out_half);
+
+        let mut full = make(64);
+        let mut out_full = [0i16; 8];
+        full.render(&smpl, 48_000, &mut out_full);
+
+        assert!(out_full[0] > 0, "full master volume must not be silent");
+        let ratio = out_half[0] as f64 / out_full[0] as f64;
+        assert!(
+            (ratio - 0.5).abs() < 0.02,
+            "half master volume should render at ~half amplitude, got ratio {ratio}"
+        );
     }
 
     #[test]
