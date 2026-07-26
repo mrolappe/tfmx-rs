@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>tfmx-web demo</title>
+    <link rel="stylesheet" href="demo.css" />
+  </head>
+  <body>
+    <h1>tfmx-web</h1>
+    <p>
+      Run <code>sh build-wasm.sh</code> first, then serve the <code>tfmx-web/</code> directory
+      (this page's parent, not <code>demo/</code> itself -- its scripts are fetched as
+      <code>/js/...</code>) over http(s), e.g. <code>python3 -m http.server</code> from
+      <code>tfmx-web/</code>. Module fetch and <code>audioWorklet.addModule</code> both refuse
+      <code>file://</code>.
+    </p>
+
+    <div id="drop-zone" tabindex="0">
+      Drop a <code>mdat.*</code> + <code>smpl.*</code> pair here, or click to choose files
+      <input id="file-input" type="file" multiple hidden />
+    </div>
+
+    <p id="status" role="status"></p>
+
+    <div id="controls" hidden>
+      <button id="play-pause" type="button">Play</button>
+      <label>
+        Song
+        <select id="song-select"></select>
+      </label>
+    </div>
+
+    <script src="../js/tfmx-bootstrap.js"></script>
+    <script type="module" src="demo.js"></script>
+  </body>
+</html>

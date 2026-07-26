@@ -3,9 +3,15 @@
 // then hand the compiled module plus the file bytes across the worklet's
 // port -- the worklet's `initSync` takes an already-compiled module instead
 // of re-fetching/re-compiling in its own scope.
-async function createTfmxWorkletNode(audioContext, { wasmUrl, processorUrl, mdat, smpl }) {
+async function createTfmxWorkletNode(
+  audioContext,
+  { wasmUrl, processorUrl, mdat, smpl, onStatus = () => {} },
+) {
+  onStatus('compiling wasm...');
   const module = await WebAssembly.compileStreaming(fetch(wasmUrl));
+  onStatus('adding worklet module...');
   await audioContext.audioWorklet.addModule(processorUrl);
+  onStatus('creating worklet node...');
 
   const node = new AudioWorkletNode(audioContext, 'tfmx-processor', {
     numberOfInputs: 0,
@@ -26,6 +32,7 @@ async function createTfmxWorkletNode(audioContext, { wasmUrl, processorUrl, mdat
   // gets silently dropped rather than queued (observed in Chrome). Wait for
   // the processor's own "ready" ping, sent once its constructor has run and
   // `port.onmessage` is actually attached, before sending init data.
+  onStatus('waiting for processor ready ping...');
   await withTimeout(
     new Promise((resolve) => {
       node.port.onmessage = (event) => {
@@ -35,6 +42,7 @@ async function createTfmxWorkletNode(audioContext, { wasmUrl, processorUrl, mdat
     'waiting for processor ready ping',
   );
 
+  onStatus('sending init, waiting for init-ok...');
   await withTimeout(
     new Promise((resolve, reject) => {
       node.port.onmessage = (event) => {

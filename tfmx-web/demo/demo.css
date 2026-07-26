@@ -1,0 +1,37 @@
+body {
+  font-family: system-ui, sans-serif;
+  max-width: 40rem;
+  margin: 2rem auto;
+  padding: 0 1rem;
+}
+
+#drop-zone {
+  border: 2px dashed #888;
+  border-radius: 8px;
+  padding: 2rem;
+  text-align: center;
+  cursor: pointer;
+}
+
+#drop-zone.drag-over {
+  border-color: #333;
+  background: #eee;
+}
+
+#status {
+  min-height: 1.5em;
+}
+
+#status.error {
+  color: #c00;
+}
+
+/* `#controls[hidden]` must win over the flex display below -- an ID
+   selector alone outranks the UA stylesheet's `[hidden] { display: none }`
+   (an attribute selector), which would otherwise keep the controls visible
+   and clickable before any pair is loaded, regardless of the attribute. */
+#controls:not([hidden]) {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+}
