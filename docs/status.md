@@ -1038,3 +1038,57 @@ windows), and all ten golden hashes are unaffected. Full workspace test suite an
 Not part of the M1-M4 step list -- a real gap found during the `turrican intro` investigation,
 implemented ad hoc like the earlier master-volume-slide addition, and unrelated to the still-open
 "different melody" complaint above.
+
+## Plan (2026-07-26, next session): pivoting from `turrican intro`'s own data to shared code
+
+The user reports (informal listening, this session) that the same symptom -- musical, in-time
+notes, but wrong melody/instrument -- shows up on **a handful of other corpus modules**, not just
+`turrican intro`. Every hypothesis ruled out so far above was tested against `turrican intro`'s
+*own* macro/pattern data (its transpose plumbing, its `note_period` spot values, its master-volume
+slide, its specific macros' retrigger timing). None of that says anything about code every module
+shares. A symptom repeating across different modules' data points at a **shared code path**, not
+one module's composition quirk. Next session pivots the search accordingly, per the project's
+`diagnosing-bugs` skill (tight feedback loop before hypothesising, then ranked falsifiable
+hypotheses, then instrument one at a time):
+
+**Step A -- corpus-wide onset-diff tool.** Promote the RMS-envelope onset-timing analysis
+hand-rolled from scratch at least three times in this file (the song-number cross-check, the
+785-trigger lag measurement, the t=1.28s/2.0s gap confirmation) into one small, committed
+script/subcommand: render N seconds with `tfmx-cli render` and with `uade123` (black box), extract
+onsets from both via the already-validated 20 ms RMS-derivative threshold method, report onset
+count/rate and an inter-onset-interval correlation. Run across all 10 non-7V corpus modules and
+record the resulting divergence table here. Must respect the two `uade123` invariants found the
+hard way in the shelved synthetic-module A/B above (don't touch pointer tables; don't let a
+subsong's declared range bleed into another's).
+
+**Step B -- rank hypotheses aimed at shared code**, in order of cheapest-to-check:
+1. `note_period()` (`tfmx/src/macro_interp.rs:21`) was only spot-checked (middle-C=424, octave
+   doubling, a couple of finetune values). A systematic error outside those points would make every
+   module sound "right rhythm, wrong pitch" -- read by ear as "wrong melody." *Prediction*: dumping
+   `note_period()` for every note 0-63 and diffing against `docs/playback-model.md`'s worked
+   table/formula finds a mismatch outside the already-checked octave points.
+2. `decode_pattern_entry`'s bit-field split (`tfmx/src/sequencer.rs:519`, `voice: cv & 0x0F` /
+   `volume: cv >> 4`) is flagged uncertain in its own comment ("[S1] names `v` but never explains
+   it"). *Prediction*: a synthetic single-note module with a distinctive voice/volume pairing shows
+   the wrong voice or volume in `tfmx-cli trace`'s own decode -- checkable from this crate's trace
+   alone, no `uade123` needed.
+3. Pattern/macro-number resolution off-by-one or track/voice mapping shared across the
+   trackstep -> pattern -> macro chain. *Prediction*: comparing `tfmx-cli trace`'s first `Trigger`
+   event per voice against `tfmx-cli disasm`'s decode of the same chain, for 2-3 newly-flagged
+   modules, finds a mismatch between what the bytecode says and what got triggered.
+
+Post this ranked list to the user before testing any of them -- they may have a hunch given which
+modules sounded wrong.
+
+**Step C -- instrument only the top surviving hypothesis**, one variable at a time, TDD (failing
+test first). Do not chase a second candidate in the same session if the first doesn't pan out --
+that decision goes back to the user. A fresh full-mix + stems A/B, confirmed by ear, is required
+before any fix is called done -- this investigation has repeatedly found fixes that were real but
+individually insufficient.
+
+**Delegation** (per `CLAUDE.md`/`ROADMAP.md`'s "Delegating a step" -- each gets only its own block,
+the hard rules, and its verification criterion): Step A is *(Sonnet 5 minimum)*, mechanical reuse
+of an already-validated method. Step B is *(Sonnet 5 minimum)*, a synthesis/review task, not
+coding. Step C is *(Opus 5 minimum)* -- this project's roadmap reserves Opus 5 for the macro
+interpreter/sequencer specifically because subtle misreadings there have repeatedly produced
+real-but-insufficient fixes, and this step is in the same code.
