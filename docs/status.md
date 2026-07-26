@@ -181,5 +181,31 @@ Reference renders of `apidya (title)` and `turrican intro` (song 0, 10 s each) w
 session to `scratchpad` for a first listen; not checked into the repo (ephemeral, regeneratable by
 the command above). The step 6.2 proxies already do this same full-mix comparison, just via
 signal-processing metrics instead of ears — this is the "actual `uade123` A/B" this document's
-"Remaining gap" section named as the most promising untried step, now finally done for real audio,
-still pending the user's own listen to the reference file.
+"Remaining gap" section named as the most promising untried step, now finally done for real audio.
+
+### `turrican intro` A/B result: confirmed real, and it is not a subtle bug
+
+The user's listen (song 0, first 10 s) found the two renders **meaningfully different**, not just
+off in timing or timbre:
+
+- `uade123` reference: higher pitch overall; a staccato ostinato; a pad playing shifting pitches;
+  **no percussion**.
+- This crate's render: starts on a different patch/instrument than the reference; **has percussion
+  (bass drum)** the reference doesn't; plays a different melody entirely.
+
+This rules out the two most likely "boring" explanations up front: it is not a mixing/pan/volume
+issue (the *musical content* differs, not just its balance), and it is not the `apidya`-style
+wrong-format explanation (`turrican intro` is confirmed plain TFMX, `uade123`'s own target format).
+A different melody, a different starting patch, and an extra percussion voice that shouldn't be
+there together point at **wrong pattern/macro/note data being dispatched** — the trackstep or
+pattern layer resolving to different content than the reference, not a Paula-level mixing defect.
+This is now the corpus's confirmed, still-uninvestigated Pro-2.0 playback bug; `apidya (title)`'s
+symptom is separately explained (wrong format, see above) and should not be conflated with this
+one when deciding what step 11.5's `lint` findings mean or what to repair at the Phase 11 gate.
+
+**Not yet checked**: whether `uade123`'s song 0 and this crate's song 0 are actually the same
+subsong (both were selected by index, not by name — the pointer tables could legitimately number
+them differently), and whether the percussion voice is on a different voice number in each render
+(the per-voice stems above were never directly played back against a per-voice reference, since
+`uade123` has no solo). Both are prerequisites before concluding *where* in the trackstep → pattern
+→ macro chain the divergence starts — exactly what step 11.3's trace seam is for.
