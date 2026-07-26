@@ -685,3 +685,73 @@ voice's own `$00`-pause-to-`$01` delay exactly as long as the spec says it shoul
 separate bug inflating it beyond what `5da3623`/this session's fix already account for; (c) the
 first-note 160ms timing gap (found two updates ago) is still completely unexplained and untested for
 recurrence -- still open, still not chased.
+
+## Update (2026-07-26, same session, continued): added `tfmx-cli disasm`; reference confirms the two remaining gaps are real bugs
+
+**Added a permanent `tfmx-cli disasm --macro N` / `--pattern N` subcommand** (separate commit,
+`5c0b35f`), replacing the throwaway dump-and-delete example script this investigation had
+hand-rolled twice (macro 41, then macro 24). Patterns reuse `sequencer::decode_pattern_entry`
+directly (bumped to `pub`, now exported from `lib.rs`) -- zero new decode logic, same
+`PatternEntry`/`PatternCommand` `Debug` output `tfmx-cli trace` already prints. Macros have no
+equivalent decoded enum (`MacroInterpreter::execute` goes straight from bytes to inline state
+mutation, no intermediate representation to reuse); rather than duplicate that ~30-arm match a
+second time, `macro_opcode_name` in `tfmx-cli/src/main.rs` is name-only (mnemonic + raw `aa bb cc`
+hex, no semantic decoding of operands) -- a deliberate, noted simplification. Both stop at their own
+terminator (`$07 STOP` for macros, `$F0 End`/`$F4 STOP` for patterns) or after 256 steps.
+
+Used it immediately to check whether the two gaps *not* fixed by the `instrument` fix share that
+same `$06 <Cont>` root cause: **they don't**. `disasm --macro 28` (voice 0, involved in both
+remaining gaps) and `--macro 48` (voice 2, involved in the t=2.0s gap) both go straight `$00` pause
+-> setup -> `$01 DMAon`, no `Cont`/`Splitkey` anywhere. Macro 48 even has a deliberate
+`$13 <DMAoff>`/`$01 <DMAon>` pulse built into its own internal loop (a tremolo-style hold), unrelated
+to pattern-level retriggering. Confirmed: the t=1.28s/t=2.00-2.08s gaps are a *different* mechanism
+than what this session already fixed.
+
+**User listened and reported: `uade123`'s reference is *not* quiet at t=1.28s or t=2.00-2.08s.** This
+rules out the "genuine musical breath, nothing to fix" possibility raised above -- our silence there
+is a real, confirmed-by-ear bug, not a coincidental overlap the composition intends.
+
+**Working hypothesis, not yet tested**: this may be the *same* root cause as the still-unexplained
+160ms first-note timing gap (`docs/status.md`'s "Update (2026-07-26, next session): first-note timing
+gap found..." section, several updates back), just never previously checked beyond the very first
+note of the song. Re-derived the jiffy math precisely: `MacroInterpreter::take_turn`
+(`tfmx/src/macro_interp.rs:461`) resolves `Wait::Jiffies(0)` (what `$00 aa=0` sets, line ~576) by
+immediately clearing to `Wait::Ready` and returning `true` -- so the jiffy *after* `$00` runs is free
+to execute again. For a macro shaped like `$00` -> setup opcodes -> `$08`/`$09 AddNote` (itself
+another one-jiffy suspend) -> `$01 DMAon`, this puts DMA-on **two full jiffies after the trigger
+jiffy** (trigger jiffy: only `$00` runs; next jiffy: setup + `AddNote`, suspends again; jiffy after
+that: `$01` finally runs) -- exactly matching the previously-measured 160ms (2-jiffy) first-note gap.
+If this 2-jiffy dead zone applies to *every* fresh `trigger()` throughout the piece (not just the
+opening note), it would explain far more than three isolated silence gaps: any time several voices
+restart within a jiffy or two of each other, their individual 160ms dead zones stack into exactly the
+kind of multi-voice "everything went quiet" symptom this whole investigation has been chasing. This
+would mean the three "gaps" found so far are symptoms of one systemic timing offset, not three
+separate bugs.
+
+**Explicitly not yet verified** -- this is a hypothesis from re-reading the code and the trace math,
+not a confirmed finding. Two live alternative explanations were already on record and not ruled out:
+either this crate's reading of `$00`/`$08`'s suspend semantics is subtly wrong (both opcodes are
+individually spec-documented as suspending, per `docs/opcodes.md` §3, so this would mean the *published
+spec itself* reads differently than assumed, or that two documented one-jiffy suspends don't actually
+compound this way on real hardware), or `uade123`'s measured onset in the original first-note test was
+a different note than the one assumed (unverified). Do not assume this hypothesis is correct without
+testing it.
+
+**Next thing to do, next session (recorded per user request, not yet started)**: pick several
+*isolated* single-note attacks later in `turrican intro` (away from the crowded passages already
+examined, so the DMA-on jiffy is unambiguous) and compare, for each: (1) this crate's trigger jiffy
+and its actual `$01 DMAon` jiffy (via `tfmx-cli trace`, same method as the original first-note
+check), against (2) `uade123`'s audible onset for that same note (via `-j <seconds>` to seek the
+reference close to it, then listening or an RMS-onset check, same method as the original 160ms
+finding). If the ~2-jiffy lag recurs consistently, that confirms the systemic-latency hypothesis and
+makes `$00`/`$08`'s suspend semantics (or the trigger-jiffy counting itself) the next thing to
+actually fix. If it's inconsistent (sometimes 0 jiffies, sometimes 2), the spec reading is probably
+fine for most cases and something else -- possibly per-voice, possibly data-dependent -- is going on;
+don't assume the hypothesis without this check. Use the new `tfmx-cli disasm` command (this update)
+to inspect whichever macros are involved once specific notes are picked.
+
+**Also still open, unchanged from before**: whether the `$FA`/master-volume/note-timing findings
+from earlier sessions interact with this; the `$FB <PlayPattern>` gap (confirmed real but not
+triggered by this module, per the "Session 2026-07-26 (later)" section above); and the original
+"different melody" phase-gate complaint, which predates all of these timing findings and may or may
+not be explained by them once the timing question is settled.
