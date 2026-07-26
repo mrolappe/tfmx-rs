@@ -4,10 +4,10 @@
 >
 > | | |
 > |---|---|
-> | **Next step** | 9.1 — Pure JS conversion function: interleaved `i16` → planar `f32`. |
+> | **Next step** | 9.2 — `tfmx-processor.js` AudioWorklet glue + main-thread bootstrap. |
 > | **Phase** | 9 of 10 (M3) — AudioWorklet integration — approved, in progress |
 > | **Gate** | M3 approved to start. Stop for explicit approval at the end of Phase 10 before any "Beyond" work. Known open issue carried over: `docs/status.md`'s "Open follow-up" section — a human listening pass found `apidya (title)` (and to a lesser extent a `turrican` module) still doesn't sound right even after the confirmed `frac`-reset fix in `Paula::set_dma`. Not blocking M2/M3, but not to be assumed fixed either — see that doc before touching playback correctness again. |
-> | **Last done** | 8.2 · Thin `#[wasm_bindgen]` wrapper `TfmxWeb::new`/`render`/`set_song` over 8.1's `Core`, target-gated to `wasm32` via `Cargo.toml` and `#[cfg(target_arch = "wasm32")]` — confirmed by `wasm-bindgen-test` (Node target, `wasm-bindgen-cli` 0.2.126) constructing from corpus bytes and rendering non-silent output, plus `cargo build -p tfmx-web --target wasm32-unknown-unknown --target-dir target/wasm` |
+> | **Last done** | 9.1 · `tfmx-web/js/pcm-convert.js`'s `interleavedI16ToPlanarF32`: interleaved `i16` → planar `f32` per channel, filled in place into existing `Float32Array`s (no allocation), scaled by 32768 to match `tfmx-play`'s 7.1 `i16_to_f32`. Dual-loadable (`module.exports` guarded for reuse via `importScripts` in 9.2) — confirmed by plain assert-based `node pcm-convert.test.js` (no framework), known interleaved input → expected per-channel output |
 >
 > Update this block in the same commit that ticks a checkbox.
 
@@ -321,7 +321,7 @@ the only build step.
 
 ### Phase 9 — AudioWorklet integration
 
-- [ ] **9.1** Pure JS conversion function: interleaved `i16` (what `render()` produces) → planar
+- [x] **9.1** Pure JS conversion function: interleaved `i16` (what `render()` produces) → planar
       `f32` per channel (what `AudioWorkletProcessor.process()`'s output array wants) — isolated
       exactly like `tfmx-play`'s 7.1 format-conversion function. — *check: plain `assert`-based
       Node script (`node test.js`, no framework), known input → expected per-channel output*
