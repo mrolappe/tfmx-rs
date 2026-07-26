@@ -511,7 +511,12 @@ fn decode_pattern_command(bytes: [u8; 4]) -> PatternCommand {
     }
 }
 
-fn decode_pattern_entry(bytes: [u8; 4]) -> PatternEntry {
+/// Decodes one pattern longword in isolation, with no execution-state
+/// context (loop counters, saved program counter, `$F1`/`$F2` flow control).
+/// [`PatternRunner`] is the stateful driver for actually running a pattern;
+/// this is the seam a linear disassembly listing (`tfmx-cli disasm`) hooks
+/// into instead.
+pub fn decode_pattern_entry(bytes: [u8; 4]) -> PatternEntry {
     let [aa, bb, cv, dd] = bytes;
     if aa >= 0xF0 {
         return PatternEntry::Command(decode_pattern_command(bytes));
