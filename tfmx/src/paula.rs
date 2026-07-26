@@ -100,6 +100,7 @@ fn pan_weights(separation: u8) -> (f64, f64) {
 pub struct Paula {
     voices: [Voice; VOICE_COUNT],
     separation: u8,
+    muted: [bool; VOICE_COUNT],
 }
 
 impl Paula {
@@ -108,6 +109,7 @@ impl Paula {
         Paula {
             voices: [Voice::default(); VOICE_COUNT],
             separation,
+            muted: [false; VOICE_COUNT],
         }
     }
 
@@ -158,11 +160,18 @@ impl Paula {
         self.voices[voice as usize].loop_completions = 0;
     }
 
-    /// A copy of `voice`'s register state -- test-only seam so callers in
-    /// other modules (the macro interpreter's tests) can assert on what the
-    /// register writes actually landed, without a production getter.
-    #[cfg(test)]
-    pub(crate) fn voice(&self, voice: u8) -> Voice {
+    /// Mutes `voice` at the mix: `render()` still runs its `next_sample`
+    /// unconditionally, so playback position, loop completions and the
+    /// attack→loop handoff evolve identically muted or not -- only the
+    /// contribution to the output buffer is dropped. This is what makes a
+    /// muted voice's stem subtract cleanly out of the full mix.
+    pub fn set_voice_muted(&mut self, voice: u8, muted: bool) {
+        self.muted[voice as usize] = muted;
+    }
+
+    /// A copy of `voice`'s register state, for diagnostics (the trace seam,
+    /// step 11.3) and tests.
+    pub fn voice(&self, voice: u8) -> Voice {
         self.voices[voice as usize]
     }
 
@@ -171,6 +180,7 @@ impl Paula {
     /// Register state is constant across the call. `docs/architecture.md` §3.
     pub fn render(&mut self, smpl: &[i8], sample_rate: u32, out: &mut [i16]) {
         let (own, bleed) = pan_weights(self.separation);
+        let muted = self.muted;
         for frame in out.chunks_exact_mut(2) {
             let mut left = 0.0_f64;
             let mut right = 0.0_f64;
@@ -181,6 +191,9 @@ impl Paula {
                 // 8-bit PCM volume-scaled and expanded into i16 range.
                 let amp =
                     voice.next_sample(smpl, sample_rate) * (voice.volume as f64 / 64.0) * 256.0;
+                if muted[i] {
+                    continue;
+                }
                 let (own_ch, other_ch) = if is_left_voice(i) {
                     (&mut left, &mut right)
                 } else {
@@ -483,6 +496,109 @@ mod tests {
         paula.reset_loop_completions(0);
         assert_eq!(paula.loop_completions(0), 0);
         assert_eq!(paula.loop_completions(1), 5);
+    }
+
+    #[test]
+    fn set_voice_muted_updates_only_target_voice() {
+        let mut paula = Paula::new(0);
+        paula.set_voice_muted(1, true);
+        assert!(paula.muted[1]);
+        assert!(!paula.muted[0]);
+    }
+
+    #[test]
+    fn render_with_voice_muted_is_silent() {
+        let sample_rate = 8_000u32;
+        let period = 443u16;
+        let source = vec![50i8; 50];
+
+        let mut paula = Paula::new(100);
+        paula.set_period(0, period);
+        paula.set_volume(0, 64);
+        paula.set_sample_region(0, 0, 25);
+        paula.set_loop_region(0, 0, 25);
+        paula.set_dma(0, true);
+        paula.set_voice_muted(0, true);
+
+        let mut out = vec![1i16; 20 * 2]; // pre-filled non-zero
+        paula.render(&source, sample_rate, &mut out);
+
+        assert!(
+            out.iter().all(|&s| s == 0),
+            "expected silence from a muted voice, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn muted_voice_playback_position_still_advances() {
+        let sample_rate = 8_000u32;
+        let period = (PAULA_CLOCK_HZ / sample_rate as f64).round() as u16;
+        let source = vec![50i8; 50];
+
+        let mut paula = Paula::new(100);
+        paula.set_period(0, period);
+        paula.set_volume(0, 64);
+        paula.set_sample_region(0, 0, 25);
+        paula.set_loop_region(0, 0, 25);
+        paula.set_dma(0, true);
+        paula.set_voice_muted(0, true);
+
+        assert_eq!(paula.voice(0).frac, 0);
+
+        let mut out = vec![0i16; 10 * 2];
+        paula.render(&source, sample_rate, &mut out);
+
+        assert_ne!(
+            paula.voice(0).frac,
+            0,
+            "a muted voice's playback position must still advance"
+        );
+    }
+
+    #[test]
+    fn solo_renders_of_all_four_voices_sum_to_the_full_mix() {
+        let sample_rate = 8_000u32;
+        let period = 443u16;
+        // Flat source: every interpolated sample reads back as the same
+        // value regardless of sub-sample position, so the test isn't
+        // sensitive to frac drift between the full render and the solos.
+        let source = vec![50i8; 50];
+        let frames = 20;
+
+        let configure = |paula: &mut Paula| {
+            for voice in 0..4u8 {
+                paula.set_period(voice, period);
+                paula.set_volume(voice, 16); // low enough that the sum of all four can't clip
+                paula.set_sample_region(voice, 0, 25);
+                paula.set_loop_region(voice, 0, 25);
+                paula.set_dma(voice, true);
+            }
+        };
+
+        let mut full = Paula::new(100);
+        configure(&mut full);
+        let mut full_out = vec![0i16; frames * 2];
+        full.render(&source, sample_rate, &mut full_out);
+
+        let mut summed = vec![0i32; frames * 2];
+        for solo in 0..4u8 {
+            let mut paula = Paula::new(100);
+            configure(&mut paula);
+            for voice in 0..4u8 {
+                paula.set_voice_muted(voice, voice != solo);
+            }
+            let mut out = vec![0i16; frames * 2];
+            paula.render(&source, sample_rate, &mut out);
+            for (acc, s) in summed.iter_mut().zip(out.iter()) {
+                *acc += *s as i32;
+            }
+        }
+
+        let full_i32: Vec<i32> = full_out.iter().map(|&s| s as i32).collect();
+        assert_eq!(
+            summed, full_i32,
+            "the four solo renders must sum sample-for-sample to the full mix"
+        );
     }
 
     #[test]

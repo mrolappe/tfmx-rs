@@ -65,6 +65,11 @@ impl<'a> Player<'a> {
         &self.unsupported
     }
 
+    /// Mutes `voice` (0-3) at the mix; forwards to `Paula::set_voice_muted`.
+    pub fn set_voice_muted(&mut self, voice: u8, muted: bool) {
+        self.paula.set_voice_muted(voice, muted);
+    }
+
     /// Fills `out` (interleaved stereo `i16`) with `out.len() / 2` frames,
     /// running the tick clock, the trackstep/pattern/macro state machines
     /// and the mixer together. `docs/architecture.md` §3.
