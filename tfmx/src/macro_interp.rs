@@ -682,8 +682,10 @@ impl MacroInterpreter {
                 true
             }
             0x12 => {
-                // <AddLen>
-                self.sample_len = self.sample_len.wrapping_add(word23 as u32);
+                // <AddLen>. Paula's length register is 16-bit hardware
+                // (`docs/format.md` §8) -- mask to that width so an overflow
+                // wraps mod 65536 like the real chip, not mod 2^32.
+                self.sample_len = self.sample_len.wrapping_add(word23 as u32) & 0xFFFF;
                 true
             }
             0x13 => {
@@ -719,10 +721,15 @@ impl MacroInterpreter {
                 false
             }
             0x18 => {
-                // <Sampleloop>
+                // <Sampleloop>. `loop_len` mirrors Paula's 16-bit length
+                // register (`docs/format.md` §8) -- when `delta` exceeds the
+                // current loop_len, mask to that width so the subtraction
+                // wraps mod 65536 like the real chip, not mod 2^32 (which
+                // would produce a length that reads far past the sample
+                // buffer and goes silent for the rest of the note).
                 let delta = sext24(b1, b2, b3);
                 self.loop_start = self.loop_start.wrapping_add_signed(delta);
-                self.loop_len = self.loop_len.wrapping_sub_signed(delta);
+                self.loop_len = self.loop_len.wrapping_sub_signed(delta) & 0xFFFF;
                 true
             }
             0x19 => {
@@ -1263,6 +1270,32 @@ mod tests {
         assert_eq!(v.len, 10);
         assert_eq!(v.loop_start, 110); // two +5 calls
         assert_eq!(v.loop_len, 0); // two -5 calls
+    }
+
+    #[test]
+    fn sampleloop_underflow_wraps_at_16_bits_like_real_paula_hardware() {
+        // `turrican intro`'s macro 28 does exactly this: `$03 SetLen 1024`
+        // then `$18 Sampleloop +1792` -- the delta exceeds the current
+        // loop_len. Paula's length register is 16-bit hardware (`docs/
+        // format.md` §8); a real chip wraps this subtraction mod 65536, not
+        // mod 2^32. Wrapping in 32-bit space instead produces a length near
+        // `u32::MAX`, which makes `Voice::next_sample` read far past the
+        // sample buffer forever -- silently returning 0 (silence) for the
+        // rest of the note instead of the wrapped-but-audible waveform real
+        // hardware would produce.
+        let mdat = macro_module(&[&[
+            [0x02, 0x00, 0x00, 0x64], // SetBegin +100
+            [0x03, 0x00, 0x00, 0x0A], // SetLen 10 -- loop_len starts at 10
+            [0x18, 0x00, 0x00, 0x0F], // Sampleloop +15/-15: underflows
+            [0x07, 0, 0, 0],
+        ]]);
+        let module = Module::parse(&mdat, &[]).expect("valid header parses");
+        let mut mac = MacroInterpreter::new();
+        mac.trigger(0, 0, 0, 0);
+        let mut paula = Paula::new(100);
+        run(&mut mac, &module, &mut paula, 1);
+        let v = paula.voice(0);
+        assert_eq!(v.loop_len, 65531); // (10i32 - 15) as u16 -- not ~u32::MAX
     }
 
     #[test]

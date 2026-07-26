@@ -545,3 +545,73 @@ session's change.
 **Next untried item, still open, next session**: step 5's own fallback -- compare the very first
 `TRIGGER`/`PATTERN` trace events against the reference's audible attack timbre at t=0. Master
 volume as a mechanism is done; it is no longer the lead suspect for this symptom.
+
+## Update (2026-07-26, next session): first-note timing gap found, real bug fixed, still insufficient
+
+Did the t=0 attack-timbre comparison the previous update deferred. `uade123`'s `turrican intro`
+render is audible at t≈80ms (1 jiffy after song start); this crate's render stays silent until
+t≈240ms (2 jiffies later) -- confirmed both by ear (`afplay` A/B) and by RMS-envelope onset
+detection on both renders. Traced this precisely: voice 2's first note uses macro 48, whose
+bytecode is `$00 aa=0` (mandatory 1-jiffy pause) → `$02/$03/$0D` setup → `$08 AddNote` (asterisked
+"ends macro processing for this jiffy") → `$01 DMAon`. Given trigger at jiffy 1 (trackstep line
+76), this crate's macro interpreter cannot reach `$01` before jiffy 3 (240ms) under a literal
+reading of `docs/opcodes.md`'s `$00`/`$08` semantics -- confirmed by dumping the raw bytecode via a
+throwaway example (not committed) and hand-tracing `MacroInterpreter::tick`/`take_turn` jiffy by
+jiffy. **Root cause of the 160ms gap itself is still open** -- our decode matches the spec text, so
+either that reading is subtly wrong, `uade123`'s 80ms onset is a different note than we assume, or
+the trackstep line-advance timing (`docs/playback-model.md` §7's open question on what actually
+triggers a line advance) is off by a jiffy at song start. Not chased further this session because
+a 10-second full-mix spectrogram comparison (below) turned up a bigger, more concrete lead.
+
+**User's ear confirms the bigger problem is not the timing gap.** Asked directly after an A/B
+listen: the instrument timbre/melody being wrong is "the latter" -- i.e. the dominant issue, not
+the 160ms late start. This matches the phase-gate text's still-open "different melody" complaint.
+
+**Spectrogram comparison (10s, `NFFT=2048`, generated via a throwaway numpy/matplotlib venv, not
+committed) found a striking structural difference**: `uade123`'s render is continuously dense --
+some voice is always sounding across the full 10s. This crate's render has multiple clear total-
+silence gaps (visible as blank vertical bands) around t≈1.3s, 2.2-2.6s, 3.6-3.7s, 6.3-6.7s, none of
+which align with the song's own trackstep loop-back point (line 129→77, confirmed via `tfmx-cli
+trace`'s `JIFFY` events at frame 194040 ≈ 4.4s and 381024 ≈ 8.64s) -- these gaps happen *within* a
+single pass through the repeating section, not at the loop seam.
+
+**Found and fixed one genuine bug while chasing the gaps, but it does NOT explain them.** Dumped
+macro 28's bytecode (voice 0's instrument, active right around the 2.2-2.6s gap): `$03 SetLen 1024`
+followed later by `$18 Sampleloop` with a 24-bit delta of `+1792`. `$18` ("Adds `aaaaaa` to the
+sample start address, and subtracts the same value from the sample length", `docs/opcodes.md` §3)
+subtracts 1792 from a `loop_len` of only 1024 -- a genuine underflow the composer's own data
+triggers unconditionally (this `$18` runs exactly once per note, not inside a loop, so it's not a
+"compounds until it eventually goes negative" case; it's designed to go negative on this one call).
+`MacroInterpreter`'s `0x18` handler did `self.loop_len.wrapping_sub_signed(delta)` on a bare `u32`,
+which wraps mod 2^32 (1024 - 1792 → 4294966528), not mod 2^16 like Paula's actual 16-bit length
+register (`docs/format.md` §8). A length that large makes `Voice::next_sample`
+(`tfmx/src/paula.rs:70-77`) never reach the wrap-back-to-loop-start condition; it just reads
+forward past the real sample buffer forever, and `smpl.get(...).unwrap_or(0)` (paula.rs:62-63)
+silently returns 0 from that point on -- permanent silence for that voice until its next full
+`trigger()`. Confirmed by cross-referencing the exact wrapped value (4294966528 = 2^32 - 768,
+matching 1024 - 1792 = -768) against the live `tfmx-cli trace` output for that voice at that
+timestamp -- not a guess. Fixed (TDD: failing test first) by masking both `0x12 <AddLen>`'s and
+`0x18 <Sampleloop>`'s results to `& 0xFFFF`, matching the real 16-bit register width; new test
+`sampleloop_underflow_wraps_at_16_bits_like_real_paula_hardware` in `tfmx/src/macro_interp.rs`.
+Full workspace test suite (including the golden-hash regression) passes unchanged.
+
+**But: byte-for-byte identical rendered output before and after the fix, for `turrican intro`'s
+first 10 seconds** (`cmp` on the two WAVs). The corrupted `loop_len` value is set correctly per
+the (buggy) old code, but this specific note's attack region (the `sample_len`/`sample_start` set
+by the *second* `$02`/`$03` pair, not the pre-`$18` one) never finishes playing out before the
+voice gets retriggered by the next note -- so `next_sample`'s attack-vs-loop switch (paula.rs:72)
+never actually reads the broken `loop_len` within this 10-second window. The fix is real, correct,
+and worth keeping (it will matter for any note whose attack region *does* play out fully before a
+retrigger, and is simply more faithful to real hardware), but it is **not** the explanation for the
+observed silence gaps. Matches this investigation's established pattern: every fix found so far has
+been real but insufficient on its own.
+
+**Next steps, still open, next session**: the silence gaps' actual cause is still unknown. Good
+next moves, not yet tried: (a) pick one gap (e.g. 2.2-2.6s, the longest) and trace every voice's
+`dma_on`/`StopChannel`/`StopVoice` state jiffy-by-jiffy through it, since patterns dispatch
+`StopChannel` liberally in this corpus and a bug causing *all four* voices to receive one
+simultaneously (when the composition likely only intended one or two) would produce exactly this
+symptom; (b) revisit whether `MAX_MACRO_OPS_PER_JIFFY` or the per-jiffy dispatch order ever silently
+truncates a track's events. The first-note 160ms timing gap (this update's opening finding) remains
+unexplained too and may or may not be related -- not yet tested whether it recurs at every
+subsequent note attack or was a one-off song-start artifact.
