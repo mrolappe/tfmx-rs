@@ -132,6 +132,34 @@ field, deliberately: `Paula` then carries no lifetime, stays a plain
 sample buffer — a generated sine — without constructing a `Module` at all. `Player`
 holds the `&'a [i8]` obtained from `Module` once and passes it down on every chunk.
 
+### The trace seam (step 11.3)
+
+`Player` was, until M4, unobservable from outside — `unsupported_ops()` was its only
+public getter. `TraceEvent` (`tfmx/src/trace.rs`) is a second seam alongside the
+register seam above, for the same reason that one exists: it lets a caller watch state
+transitions cross a boundary without either side reaching into the other's internals.
+Where the register seam is a *value* (`Voice`, read every sample), the trace seam is an
+*event stream* (`TraceEvent`, emitted once per transition) — `Jiffy` (the tick
+boundary), `Trackstep` (the decoded line), `Pattern` (one longword executed, tagged
+with which track/pattern/step it came from), `Trigger` (a macro (re)started on a
+voice — emitted from the dispatch site rather than re-derived, because `voice_of()`'s
+nibble masking is a documented uncertainty and a masking bug has to be visible in the
+trace, not silently reinterpreted by whatever reads it) and `Voice` (a snapshot of that
+same `Voice` register-seam value, four per jiffy, one per hardware voice).
+
+The generic-sibling shape keeps this free when unused: `Player::render_inner<F: FnMut(TraceEvent)>` does the actual work, `render()` calls it with `|_| {}` (monomorphizing away
+to exactly the pre-11.3 code — the golden hashes are the load-bearing proof of that),
+and `render_traced()` calls it with a real closure. `run_jiffy` and
+`dispatch_pattern_entry` both take `trace: &mut impl FnMut(TraceEvent)` and call it
+inline at the point each event is known, mirroring the crate's existing idiom
+(`PatternRunner::advance` and `MacroInterpreter::tick` already take an `emit` closure)
+rather than introducing a new event-bus abstraction.
+
+All formatting, folding, de-duplication and analysis of the event stream is a consumer
+concern (`tfmx-cli`, steps 11.4–11.5) — `TraceEvent` itself stays a plain enum with no
+dependency, no allocation and no I/O, so it builds for `wasm32-unknown-unknown`
+unchanged like the rest of the core.
+
 ---
 
 ## 3. The `render()` contract

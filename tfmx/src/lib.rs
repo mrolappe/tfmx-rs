@@ -9,6 +9,7 @@ mod module;
 mod paula;
 mod player;
 mod sequencer;
+mod trace;
 pub use macro_interp::{MacroEvent, MacroInterpreter, UnsupportedOps};
 pub use module::{AccessError, Module, ParseError};
 pub use paula::{Paula, Voice};
@@ -17,3 +18,4 @@ pub use sequencer::{
     LineCommand, NoteTiming, PatternCommand, PatternEntry, PatternRunner, Sequencer, TickClock,
     TrackSlot, TrackstepLine, tick_fraction,
 };
+pub use trace::TraceEvent;

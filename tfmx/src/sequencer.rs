@@ -598,7 +598,14 @@ impl<'a> PatternRunner<'a> {
     /// Advances one jiffy, calling `emit` for every entry executed during
     /// it -- none while a wait runs down, one for `$F3`, and as many as the
     /// data chains for immediate-fetch notes and flow-control commands.
-    pub fn advance(&mut self, mut emit: impl FnMut(PatternEntry)) -> Result<(), AccessError> {
+    /// `emit`'s `(pattern, step)` are where the entry was actually fetched
+    /// from, before `$F1`/`$F2`/`$F8` can change either mid-jiffy -- reading
+    /// [`PatternRunner::pattern`]/[`PatternRunner::step`] after the call only
+    /// gives the *last* entry's position, not each one's.
+    pub fn advance(
+        &mut self,
+        mut emit: impl FnMut(u8, u16, PatternEntry),
+    ) -> Result<(), AccessError> {
         if self.halted.is_some() {
             return Ok(());
         }
@@ -610,8 +617,10 @@ impl<'a> PatternRunner<'a> {
         // loops without ever waiting cannot hang the player. The program
         // counter is left where it is; the next jiffy resumes from there.
         for _ in 0..MAX_PATTERN_ENTRIES_PER_JIFFY {
+            let pattern = self.pattern;
+            let step = self.step;
             let entry = decode_pattern_entry(self.fetch()?);
-            emit(entry);
+            emit(pattern, step, entry);
             if !self.apply(entry) {
                 break;
             }
@@ -1467,7 +1476,7 @@ mod tests {
         let mut log = Vec::new();
         for jiffy in 0..jiffies {
             runner
-                .advance(|entry| log.push((jiffy, entry)))
+                .advance(|_pattern, _step, entry| log.push((jiffy, entry)))
                 .expect("pattern stays in range");
         }
         log
@@ -1557,7 +1566,7 @@ mod tests {
         assert_eq!(log.len(), 1 + 99 * 2);
         let mut runner = PatternRunner::new(&module, 0).expect("pattern 0 in range");
         for _ in 0..100 {
-            runner.advance(|_| {}).expect("in range");
+            runner.advance(|_, _, _| {}).expect("in range");
         }
         assert_eq!(runner.halted(), None);
     }
@@ -1589,7 +1598,7 @@ mod tests {
         let mut runner = PatternRunner::new(&module, 0).expect("pattern 0 in range");
         let mut log = Vec::new();
         for _ in 0..4 {
-            runner.advance(|e| log.push(e)).expect("in range");
+            runner.advance(|_, _, e| log.push(e)).expect("in range");
         }
         assert_eq!(
             log,
@@ -1616,7 +1625,7 @@ mod tests {
         ]);
         let module = Module::parse(&mdat, &[]).expect("valid header parses");
         let mut runner = PatternRunner::new(&module, 0).expect("pattern 0 in range");
-        runner.advance(|_| {}).expect("in range");
+        runner.advance(|_, _, _| {}).expect("in range");
         assert_eq!(runner.pattern(), 1);
         // Target 1 is a longword step index, not a byte offset: it lands on
         // the `$F0`, not inside the `$F4`.
@@ -1635,7 +1644,7 @@ mod tests {
             let mut runner = PatternRunner::new(&module, 0).expect("pattern 0 in range");
             let mut count = 0;
             for _ in 0..5 {
-                runner.advance(|_| count += 1).expect("in range");
+                runner.advance(|_, _, _| count += 1).expect("in range");
             }
             assert_eq!(runner.halted(), Some(expected));
             // Halting is final: the entry after it never runs.
@@ -1649,7 +1658,7 @@ mod tests {
         let mdat = pattern_module(&[&[[0xFF, 0x00, 0x00, 0x00]]]);
         let module = Module::parse(&mdat, &[]).expect("valid header parses");
         let mut runner = PatternRunner::new(&module, 0).expect("pattern 0 in range");
-        assert_eq!(runner.advance(|_| {}), Err(AccessError::OutOfRange));
+        assert_eq!(runner.advance(|_, _, _| {}), Err(AccessError::OutOfRange));
     }
 
     // -- The step's own check: a real pattern dump is self-consistent --
@@ -1783,9 +1792,8 @@ mod tests {
         // Jiffy at which each entry ran, plus the entry itself.
         let mut log: Vec<(u32, u16, PatternEntry)> = Vec::new();
         for jiffy in 0..200 {
-            let step = runner.step();
             runner
-                .advance(|entry| log.push((jiffy, step, entry)))
+                .advance(|_pattern, step, entry| log.push((jiffy, step, entry)))
                 .expect("pattern stays in range");
         }
 

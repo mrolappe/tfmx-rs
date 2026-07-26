@@ -8,6 +8,7 @@ use crate::paula::Paula;
 use crate::sequencer::{
     PatternCommand, PatternEntry, PatternRunner, Sequencer, TickClock, TrackSlot,
 };
+use crate::trace::TraceEvent;
 
 /// Paula has four hardware voices; a pattern note's `voice` nibble is
 /// masked down to that range. **Uncertain**: [S1] never states that the
@@ -32,6 +33,11 @@ pub struct Player<'a> {
     unsupported: UnsupportedOps,
     clock: TickClock,
     sample_rate: u32,
+    /// Total frames rendered across every `render`/`render_traced` call on
+    /// this player -- gives [`TraceEvent::Jiffy`]'s `frame` a continuous,
+    /// session-wide timeline even when a caller renders in chunks (as
+    /// `tfmx-cli` does).
+    frames_rendered: u64,
 }
 
 impl<'a> Player<'a> {
@@ -56,6 +62,7 @@ impl<'a> Player<'a> {
             unsupported: UnsupportedOps::default(),
             clock,
             sample_rate,
+            frames_rendered: 0,
         })
     }
 
@@ -74,6 +81,27 @@ impl<'a> Player<'a> {
     /// running the tick clock, the trackstep/pattern/macro state machines
     /// and the mixer together. `docs/architecture.md` §3.
     pub fn render(&mut self, out: &mut [i16]) -> Result<(), AccessError> {
+        self.render_inner(out, |_| {})
+    }
+
+    /// As [`Player::render`], but also calls `trace` for every state-machine
+    /// transition each jiffy produces -- the observation seam
+    /// `docs/architecture.md` §2 documents alongside the register seam.
+    /// `render()` is exactly this call with `|_| {}`, which the golden-hash
+    /// regression tests prove monomorphizes away to identical output.
+    pub fn render_traced(
+        &mut self,
+        out: &mut [i16],
+        trace: impl FnMut(TraceEvent),
+    ) -> Result<(), AccessError> {
+        self.render_inner(out, trace)
+    }
+
+    fn render_inner(
+        &mut self,
+        out: &mut [i16],
+        mut trace: impl FnMut(TraceEvent),
+    ) -> Result<(), AccessError> {
         let frames = (out.len() / 2) as u32;
         let Player {
             module,
@@ -85,13 +113,23 @@ impl<'a> Player<'a> {
             unsupported,
             clock,
             sample_rate,
+            frames_rendered,
         } = self;
         let mut pos = 0usize;
         let mut error = None;
         clock.advance(*sample_rate, frames, |tick_due, chunk_frames| {
             if tick_due
                 && error.is_none()
-                && let Err(e) = run_jiffy(module, sequencer, patterns, macros, paula, unsupported)
+                && let Err(e) = run_jiffy(
+                    module,
+                    sequencer,
+                    patterns,
+                    macros,
+                    paula,
+                    unsupported,
+                    *frames_rendered + pos as u64,
+                    &mut trace,
+                )
             {
                 error = Some(e);
             }
@@ -100,6 +138,7 @@ impl<'a> Player<'a> {
             paula.render(smpl, *sample_rate, &mut out[start..end]);
             pos += chunk_frames as usize;
         });
+        *frames_rendered += frames as u64;
         match error {
             Some(e) => Err(e),
             None => Ok(()),
@@ -112,6 +151,10 @@ impl<'a> Player<'a> {
 /// on any pattern reaching `$F0 <End>`), then each track's pattern one
 /// step, then each voice's macro program, in the signal-chain order
 /// `docs/playback-model.md` §1 lists.
+// Each parameter is one of `Player`'s own fields, already destructured by
+// `render_inner`'s only caller -- bundling them into a struct here would
+// just re-wrap what the caller already unwrapped.
+#[allow(clippy::too_many_arguments)]
 fn run_jiffy<'a>(
     module: &'a Module<'a>,
     sequencer: &mut Sequencer<'a>,
@@ -119,7 +162,16 @@ fn run_jiffy<'a>(
     macros: &mut [MacroInterpreter; 4],
     paula: &mut Paula,
     unsupported: &mut UnsupportedOps,
+    frame: u64,
+    trace: &mut impl FnMut(TraceEvent),
 ) -> Result<(), AccessError> {
+    trace(TraceEvent::Jiffy {
+        frame,
+        line: sequencer.current_line(),
+        tempo: sequencer.tempo(),
+        stopped: sequencer.is_stopped(),
+    });
+
     // Resolves a previously-open question (`docs/playback-model.md` §7):
     // whether the shared trackstep line pointer advances once every active
     // track's pattern reaches `$F0 <End>`, or unconditionally every jiffy.
@@ -133,7 +185,8 @@ fn run_jiffy<'a>(
     // 4.2 acceptance test's own framing ("trace the first 200 ticks") as
     // one `Sequencer::advance()` call per jiffy.
     if !sequencer.is_stopped() {
-        sequencer.advance()?;
+        let line = sequencer.advance()?;
+        trace(TraceEvent::Trackstep(line));
     }
 
     for i in 0..8u8 {
@@ -158,7 +211,15 @@ fn run_jiffy<'a>(
             _ => 0,
         };
         if let Some(runner) = &mut patterns[i as usize] {
-            runner.advance(|entry| dispatch_pattern_entry(entry, transpose, macros))?;
+            runner.advance(|pattern, step, entry| {
+                trace(TraceEvent::Pattern {
+                    track: i,
+                    pattern,
+                    step,
+                    entry,
+                });
+                dispatch_pattern_entry(entry, transpose, macros, trace);
+            })?;
         }
     }
 
@@ -177,12 +238,24 @@ fn run_jiffy<'a>(
         macros[voice_of(channel)].play_macro(macro_number, detune);
     }
 
+    for voice in 0..4u8 {
+        trace(TraceEvent::Voice {
+            voice,
+            state: paula.voice(voice),
+        });
+    }
+
     Ok(())
 }
 
 /// Routes one decoded pattern longword to the voice it names.
 /// `docs/opcodes.md` §2-§3.
-fn dispatch_pattern_entry(entry: PatternEntry, transpose: i8, macros: &mut [MacroInterpreter; 4]) {
+fn dispatch_pattern_entry(
+    entry: PatternEntry,
+    transpose: i8,
+    macros: &mut [MacroInterpreter; 4],
+    trace: &mut impl FnMut(TraceEvent),
+) {
     match entry {
         PatternEntry::Note {
             note,
@@ -191,7 +264,15 @@ fn dispatch_pattern_entry(entry: PatternEntry, transpose: i8, macros: &mut [Macr
             voice,
             ..
         } => {
-            macros[voice_of(voice)].trigger(macro_number, note, volume, transpose);
+            let voice = voice_of(voice) as u8;
+            macros[voice as usize].trigger(macro_number, note, volume, transpose);
+            trace(TraceEvent::Trigger {
+                voice,
+                macro_number,
+                note,
+                volume,
+                transpose,
+            });
         }
         PatternEntry::Command(command) => match command {
             PatternCommand::KeyUp { voice } => macros[voice_of(voice)].signal_key_up(),
@@ -292,6 +373,114 @@ mod tests {
         assert_eq!(
             one_call, chunked,
             "one 30s render call must be bit-identical to many small chunks"
+        );
+    }
+
+    /// Step 11.3's load-bearing proof that the trace seam is inert:
+    /// `render()` is literally `render_traced(.., |_| {})`, so a no-op trace
+    /// closure must produce byte-identical output to `render()`.
+    #[test]
+    fn render_traced_with_a_no_op_trace_matches_render() {
+        let Some(mdat) = read_corpus("mdat.turrican intro") else {
+            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+            return;
+        };
+        let smpl = read_corpus("smpl.turrican intro").expect("smpl present alongside mdat");
+        let module = Module::parse(&mdat, &smpl).expect("valid header parses");
+
+        const SAMPLE_RATE: u32 = 44100;
+        const SECONDS: usize = 5;
+        let total_frames = SAMPLE_RATE as usize * SECONDS;
+
+        let mut plain = vec![0i16; total_frames * 2];
+        let mut player = Player::new(&module, 0, SAMPLE_RATE, 100).expect("song 0 in range");
+        player.render(&mut plain).expect("stays in range");
+
+        let mut traced = vec![0i16; total_frames * 2];
+        let mut player = Player::new(&module, 0, SAMPLE_RATE, 100).expect("song 0 in range");
+        player
+            .render_traced(&mut traced, |_| {})
+            .expect("stays in range");
+
+        assert_eq!(
+            plain, traced,
+            "render_traced with a no-op trace must be bit-identical to render()"
+        );
+    }
+
+    /// Step 11.3's own check: a 1s traced render emits roughly one `Jiffy`
+    /// event per 50 Hz tick, with `frame` never going backwards. Song 1 of
+    /// `turrican intro` runs at tempo 120 (the CIA/BPM path, `docs/
+    /// playback-model.md` §3.2: `tick_rate_hz = 120 * 24 / 60` = 48 Hz) --
+    /// song 0's tempo 3 is the slow 50 Hz-divider path (12.5 Hz) and would
+    /// not land in the "~50" range this check names.
+    #[test]
+    fn traced_render_emits_jiffy_events_with_monotonic_frame() {
+        let Some(mdat) = read_corpus("mdat.turrican intro") else {
+            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+            return;
+        };
+        let smpl = read_corpus("smpl.turrican intro").expect("smpl present alongside mdat");
+        let module = Module::parse(&mdat, &smpl).expect("valid header parses");
+
+        const SAMPLE_RATE: u32 = 44100;
+        let mut out = vec![0i16; SAMPLE_RATE as usize * 2];
+        let mut player = Player::new(&module, 1, SAMPLE_RATE, 100).expect("song 1 in range");
+
+        let mut jiffy_frames = Vec::new();
+        player
+            .render_traced(&mut out, |event| {
+                if let TraceEvent::Jiffy { frame, .. } = event {
+                    jiffy_frames.push(frame);
+                }
+            })
+            .expect("stays in range");
+
+        assert!(
+            (40..=60).contains(&jiffy_frames.len()),
+            "expected ~50 Jiffy events in 1s, got {}",
+            jiffy_frames.len()
+        );
+        assert!(
+            jiffy_frames.windows(2).all(|w| w[0] <= w[1]),
+            "Jiffy frame must never go backwards: {jiffy_frames:?}"
+        );
+    }
+
+    /// `frames_rendered` must keep advancing across separate `render_traced`
+    /// calls, not reset to 0 -- otherwise a chunked trace (as `tfmx-cli`
+    /// renders) would report the same frame range over and over.
+    #[test]
+    fn jiffy_frame_keeps_advancing_across_separate_render_calls() {
+        let Some(mdat) = read_corpus("mdat.turrican intro") else {
+            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+            return;
+        };
+        let smpl = read_corpus("smpl.turrican intro").expect("smpl present alongside mdat");
+        let module = Module::parse(&mdat, &smpl).expect("valid header parses");
+
+        const SAMPLE_RATE: u32 = 44100;
+        let mut player = Player::new(&module, 0, SAMPLE_RATE, 100).expect("song 0 in range");
+
+        let mut last_frame = None;
+        for _ in 0..10 {
+            let mut out = vec![0i16; 4096 * 2];
+            player
+                .render_traced(&mut out, |event| {
+                    if let TraceEvent::Jiffy { frame, .. } = event {
+                        last_frame = Some(frame);
+                    }
+                })
+                .expect("stays in range");
+        }
+
+        // 10 chunks of 4096 frames = 40960 frames total, so a correctly
+        // accumulating counter must land well past a single chunk's worth
+        // (4096) -- if `frames_rendered` reset every call instead, the last
+        // observed frame could never exceed one chunk's size.
+        assert!(
+            last_frame.unwrap() > 4096 * 9,
+            "frame should keep advancing across chunked calls, not reset each call, got {last_frame:?}"
         );
     }
 }
