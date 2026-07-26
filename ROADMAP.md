@@ -4,10 +4,10 @@
 >
 > | | |
 > |---|---|
-> | **Next step** | 8.1 — `tfmx-web` plain-Rust core (parse + `Player` ownership, host-testable). |
+> | **Next step** | 8.2 — Thin `#[wasm_bindgen]` wrapper around 8.1's core. |
 > | **Phase** | 8 of 10 (M3) — `tfmx-web` core + wasm boundary — approved, in progress |
 > | **Gate** | M3 approved to start. Stop for explicit approval at the end of Phase 10 before any "Beyond" work. Known open issue carried over: `docs/status.md`'s "Open follow-up" section — a human listening pass found `apidya (title)` (and to a lesser extent a `turrican` module) still doesn't sound right even after the confirmed `frac`-reset fix in `Paula::set_dma`. Not blocking M2/M3, but not to be assumed fixed either — see that doc before touching playback correctness again. |
-> | **Last done** | 7.2 · Transport controls (space=pause/resume, n/p=song, q=quit) via raw-mode terminal keys — confirmed by manual run: status line updates correctly in place, pause/resume gapless, song-switch audible |
+> | **Last done** | 8.1 · `tfmx-web` plain-Rust core (`Core::new`/`render`/`set_song`, leak-to-`'static` mirroring `tfmx-play`'s 7.2 approach) — confirmed by `cargo test -p tfmx-web`: constructs from a corpus module, renders non-silent output, `set_song` changes what renders |
 >
 > Update this block in the same commit that ticks a checkbox.
 
@@ -306,7 +306,7 @@ the only build step.
 
 ### Phase 8 — `tfmx-web` core + wasm boundary
 
-- [ ] **8.1** Plain-Rust core (no `wasm_bindgen` attributes): parses `mdat`/`smpl` byte slices via
+- [x] **8.1** Plain-Rust core (no `wasm_bindgen` attributes): parses `mdat`/`smpl` byte slices via
       `Module::parse`, owns a `Player`, exposes `render(&mut self, out: &mut [i16])` and
       `set_song(&mut self, song: u32)` (rebuilds `Player` from the already-parsed `Module`,
       mirroring `tfmx-play`'s 7.2 approach). — *check: `cargo test -p tfmx-web` on the host target
