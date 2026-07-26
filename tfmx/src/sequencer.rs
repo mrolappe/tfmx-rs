@@ -278,7 +278,16 @@ impl<'a> Sequencer<'a> {
     /// next one (or wherever the line's command redirects to), returning
     /// the line as decoded. A no-op once [`Sequencer::is_stopped`].
     pub fn advance(&mut self) -> Result<TrackstepLine, AccessError> {
-        let decoded = decode_line(self.module.trackstep_line(self.line)?);
+        // The header's 32-slot song table doesn't guarantee every slot is
+        // actually used by the module -- an unused/placeholder slot's
+        // start/end can point past the real trackstep table. That is the
+        // same situation an authored `$EFFE 0000 Stop` line describes
+        // (nothing further to play), not a data-integrity error.
+        let Ok(bytes) = self.module.trackstep_line(self.line) else {
+            self.stopped = true;
+            return Ok(TrackstepLine::Command(LineCommand::Stop));
+        };
+        let decoded = decode_line(bytes);
         if self.stopped {
             return Ok(decoded);
         }
@@ -1020,6 +1029,24 @@ mod tests {
         line[4..6].copy_from_slice(&param_a.to_be_bytes());
         line[6..8].copy_from_slice(&param_b.to_be_bytes());
         line
+    }
+
+    #[test]
+    fn advance_treats_an_unreadable_line_as_an_implicit_stop() {
+        // The header's 32-slot song table doesn't guarantee every slot is
+        // actually used -- an unused/placeholder slot can point past the
+        // module's real trackstep table (observed in a real corpus file:
+        // `apidya (title)` song 31 has song_start = song_end = 511, one
+        // line past its 511-line table). That must behave like an
+        // `$EFFE 0000 Stop` line, not surface `AccessError`.
+        let mut mdat = fixed_layout_module(5, 0, &[STOP_LINE]);
+        mdat[0x100..0x102].copy_from_slice(&5u16.to_be_bytes()); // song_start = 5: no such line
+        let module = Module::parse(&mdat, &[]).expect("valid header parses");
+        let mut seq = Sequencer::new(&module, 0).expect("song 0 in range");
+
+        let line = seq.advance().expect("unreadable line must not error");
+        assert_eq!(line, TrackstepLine::Command(LineCommand::Stop));
+        assert!(seq.is_stopped());
     }
 
     #[test]
