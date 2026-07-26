@@ -6,8 +6,8 @@ use crate::macro_interp::{MacroEvent, MacroInterpreter, UnsupportedOps};
 use crate::module::{AccessError, Module};
 use crate::paula::Paula;
 use crate::sequencer::{
-    LineCommand, PatternCommand, PatternEntry, PatternRunner, Sequencer, TickClock, TrackSlot,
-    TrackstepLine,
+    LineCommand, NoteTiming, PatternCommand, PatternEntry, PatternRunner, Sequencer, TickClock,
+    TrackSlot, TrackstepLine,
 };
 use crate::trace::TraceEvent;
 
@@ -344,7 +344,7 @@ fn dispatch_pattern_entry(
             macro_number,
             volume,
             voice,
-            ..
+            timing,
         } => {
             let voice = voice_of(voice) as u8;
             // `$FD <Lock>`: "locks channel against other notes" -- a note
@@ -352,7 +352,14 @@ fn dispatch_pattern_entry(
             if lock[voice as usize] > 0 {
                 return None;
             }
-            macros[voice as usize].note_on(macro_number, note, volume, transpose);
+            // Only a note byte below `$80` carries a finetune in `dd`; the
+            // `Wait`/`Portamento` forms spend that byte on timing instead.
+            // `docs/playback-model.md` §4.
+            let detune = match timing {
+                NoteTiming::Detune(detune) => detune,
+                NoteTiming::Wait(_) | NoteTiming::Portamento(_) => 0,
+            };
+            macros[voice as usize].note_on(macro_number, note, volume, transpose, detune);
             trace(TraceEvent::Trigger {
                 voice,
                 macro_number,
@@ -715,6 +722,46 @@ mod tests {
             macros[2].macro_number(),
             0,
             "a Note for a locked voice must never reach note_on"
+        );
+    }
+
+    /// The pattern note record's `dd` byte is a finetune when the note byte
+    /// is below `$80` (`docs/playback-model.md` §4) -- `dispatch_pattern_
+    /// entry` must hand it to the macro interpreter, not drop it.
+    #[test]
+    fn pattern_record_detune_reaches_the_voices_period() {
+        // Macro 0: `$09 <SetNote> $1E` with its own finetune 0, then `$07`.
+        let mut mdat = vec![0u8; 0x900];
+        mdat[0..10].copy_from_slice(b"TFMX-SONG ");
+        mdat[0x600..0x604].copy_from_slice(&0x900u32.to_be_bytes());
+        mdat.extend_from_slice(&[0x09, 0x1E, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00]);
+        let module = Module::parse(&mdat, &[]).expect("valid header parses");
+
+        let mut macros = core::array::from_fn(|_| MacroInterpreter::new());
+        let mut paula = Paula::new(100);
+        dispatch_pattern_entry(
+            PatternEntry::Note {
+                note: 0x1E,
+                macro_number: 0,
+                volume: 15,
+                voice: 0,
+                timing: NoteTiming::Detune(0x40),
+            },
+            0,
+            &mut macros,
+            &mut paula,
+            &mut [0; 4],
+            &mut |_| {},
+        );
+        let mut unsupported = UnsupportedOps::default();
+        macros[0]
+            .tick(&module, &mut paula, 0, &mut unsupported, |_| {})
+            .expect("stays in range");
+
+        assert_eq!(
+            paula.voice(0).period,
+            crate::macro_interp::note_period(0x1E, 0x40),
+            "the pattern record's detune must reach the period"
         );
     }
 

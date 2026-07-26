@@ -17,7 +17,9 @@ const MIDDLE_C_HZ: f64 = 8363.0;
 /// `$3F`, the formula extrapolates) with a Q8.8-style finetune applied to
 /// frequency: `multiplier = 1 + finetune/256`. Shared by the pattern
 /// record's 8-bit detune and the macro opcodes' 16-bit finetune -- both are
-/// the same convention at two widths. `docs/playback-model.md` §4, §4.2.
+/// the same convention at two widths, so the two are summed (saturating: the
+/// 16-bit operand is raw module data) before reaching here.
+/// `docs/playback-model.md` §4, §4.2.
 pub(crate) fn note_period(note: i32, finetune: i16) -> u16 {
     let freq = MIDDLE_C_HZ * 2f64.powf((note - MIDDLE_C_NOTE) as f64 / 12.0);
     let multiplier = 1.0 + (finetune as f64 / 256.0);
@@ -373,7 +375,11 @@ impl MacroInterpreter {
     /// `$01 DMAon`. **Uncertain**: no [S1] citation states this; grounded
     /// empirically by an A/B against `uade123` on `turrican intro`'s voice 1
     /// (`docs/status.md`), not by the published spec.
-    pub fn note_on(&mut self, macro_number: u8, note: u8, volume: u8, transpose: i8) {
+    ///
+    /// `detune` is the pattern note record's `dd` byte (`NoteTiming::Detune`,
+    /// only present when the note byte is below `$80`); like `$21`'s detune it
+    /// is folded into the next `$08`/`$09`/`$1E`/`$1F`'s finetune.
+    pub fn note_on(&mut self, macro_number: u8, note: u8, volume: u8, transpose: i8, detune: i8) {
         if macro_number == self.instrument && !self.is_stopped() {
             self.last_note = self.note;
             self.note = note as i32;
@@ -382,6 +388,9 @@ impl MacroInterpreter {
         } else {
             self.trigger(macro_number, note, volume, transpose);
         }
+        // After `trigger`, which clears it: this note's own finetune replaces
+        // whatever a previous `$21` left behind. `docs/playback-model.md` §4.
+        self.detune = detune as i16;
     }
 
     /// `$21 <Play macro>`: starts `macro_number` at step 0 with `detune`
@@ -638,14 +647,14 @@ impl MacroInterpreter {
             0x08 => {
                 // <AddNote>*
                 let note = self.note + b1 as i8 as i32 + self.transpose as i32;
-                self.period = note_period(note, word23 as i16 + self.detune);
+                self.period = note_period(note, (word23 as i16).saturating_add(self.detune));
                 self.wait = Wait::Jiffies(0);
                 false
             }
             0x09 => {
                 // <SetNote>*
                 let note = b1 as i32 + self.transpose as i32;
-                self.period = note_period(note, word23 as i16 + self.detune);
+                self.period = note_period(note, (word23 as i16).saturating_add(self.detune));
                 self.wait = Wait::Jiffies(0);
                 false
             }
@@ -784,7 +793,7 @@ impl MacroInterpreter {
             0x1F => {
                 // <SetPrevNote>*
                 let note = self.last_note + b1 as i8 as i32 + self.transpose as i32;
-                self.period = note_period(note, word23 as i16 + self.detune);
+                self.period = note_period(note, (word23 as i16).saturating_add(self.detune));
                 self.wait = Wait::Jiffies(0);
                 false
             }
@@ -880,6 +889,72 @@ mod tests {
     #[test]
     fn transpose_is_note_index_addition_before_lookup() {
         assert_eq!(note_period(0x1E + 12, 0), note_period(0x2A, 0));
+    }
+
+    /// Sweeps the whole `$00`-`$3F` note range against an *independently
+    /// derived* expectation: instead of the implementation's closed-form
+    /// `powf`, walk the equal-temperament semitone ratio 2^(1/12) up or down
+    /// from the one anchor [S1] states (`$1E` = 8363 Hz). A systematic error
+    /// in the closed form would not reproduce itself here. Tolerance +/-1 is
+    /// exactly the rounding freedom `docs/playback-model.md` §4 leaves open
+    /// (round-half-to-even vs. truncate, "pick one and keep it consistent").
+    #[test]
+    fn note_period_matches_an_independently_walked_semitone_ratio() {
+        /// 2^(1/12), the equal-temperament semitone ratio, as a literal --
+        /// deliberately not computed with `powf`.
+        const SEMITONE: f64 = 1.059_463_094_359_295_3;
+
+        for note in 0..64i32 {
+            let steps = note - MIDDLE_C_NOTE;
+            let mut freq = MIDDLE_C_HZ;
+            for _ in 0..steps.abs() {
+                if steps > 0 {
+                    freq *= SEMITONE;
+                } else {
+                    freq /= SEMITONE;
+                }
+            }
+            let expected = (PAULA_CLOCK_HZ / freq).round() as i32;
+            let actual = note_period(note, 0) as i32;
+            assert!(
+                (actual - expected).abs() <= 1,
+                "note {note:#04X}: period {actual}, independently derived {expected}"
+            );
+        }
+    }
+
+    /// The structural invariant [S1] states outright for one pair (`$2A` is
+    /// "exactly half of the `$1E` period"), checked across the whole range
+    /// rather than at that single documented point.
+    #[test]
+    fn note_period_halves_every_octave_across_the_whole_range() {
+        for note in 0..52i32 {
+            let low = note_period(note, 0) as i32;
+            let high = note_period(note + 12, 0) as i32;
+            assert!(
+                (low - 2 * high).abs() <= 1,
+                "note {note:#04X}: period {low}, an octave up {high} (expected ~{})",
+                low / 2
+            );
+        }
+    }
+
+    /// The pattern record's 8-bit `dd` and the macro opcodes' 16-bit `bbbb`
+    /// are one convention at two widths (`docs/playback-model.md` §4): a
+    /// sign-extended 8-bit detune must land on the same multiplier as the
+    /// numerically equal 16-bit finetune, including at both extremes.
+    #[test]
+    fn eight_bit_detune_sign_extends_onto_the_sixteen_bit_scale() {
+        assert_eq!(
+            note_period(0x1E, i8::MIN as i16),
+            note_period(0x1E, 0xFF80_u16 as i16),
+            "8-bit -128 must be the 16-bit $FF80 worked point (50%)"
+        );
+        assert_eq!(
+            note_period(0x1E, i8::MAX as i16),
+            note_period(0x1E, 0x007F_u16 as i16),
+            "8-bit +127 must be the 16-bit $007F (~+49.6%)"
+        );
     }
 
     // -- $00-$03: DMA, sample region --
@@ -1081,7 +1156,7 @@ mod tests {
         // A same-macro retrigger while the program is still alive (parked
         // in `$14`'s indefinite wait, not yet `$07`-stopped) must not wipe
         // out what `$01` already latched.
-        mac.note_on(0, 23, 8, 0);
+        mac.note_on(0, 23, 8, 0, 0);
         run(&mut mac, &module, &mut paula, 1);
         assert!(
             paula.voice(0).dma_on,
@@ -1123,7 +1198,7 @@ mod tests {
         // A fast note run: the pattern retriggers instrument 0 every single
         // jiffy, never giving the target macro two clear jiffies in a row.
         for _ in 0..5 {
-            mac.note_on(0, 21, 8, 0);
+            mac.note_on(0, 21, 8, 0, 0);
             run(&mut mac, &module, &mut paula, 1);
         }
         assert!(
@@ -1153,7 +1228,7 @@ mod tests {
         run(&mut mac, &module, &mut paula, 1);
         assert!(paula.voice(0).dma_on);
 
-        mac.note_on(1, 21, 8, 0);
+        mac.note_on(1, 21, 8, 0, 0);
         run(&mut mac, &module, &mut paula, 1);
         assert!(
             !paula.voice(0).dma_on,
@@ -1180,7 +1255,7 @@ mod tests {
 
         // Retriggering macro 0 again after it stopped must restart at step
         // 0, not resume from where $07 parked it.
-        mac.note_on(0, 21, 8, 0);
+        mac.note_on(0, 21, 8, 0, 0);
         run(&mut mac, &module, &mut paula, 1);
         assert!(mac.is_stopped(), "step 0's own $07 should stop it again");
     }
@@ -1214,6 +1289,53 @@ mod tests {
         let mut paula = Paula::new(100);
         tick(&mut mac, &module, &mut paula);
         assert_eq!(paula.voice(0).period, 424);
+    }
+
+    /// The pattern note record's `dd` detune (`NoteTiming::Detune`, decoded
+    /// in `sequencer.rs`) must reach the note's period through the same
+    /// finetune channel `$21`'s detune uses -- `docs/playback-model.md` §4
+    /// states `dd` is a finetune whenever the note byte is below `$80`.
+    #[test]
+    fn note_on_detune_reaches_the_notes_period() {
+        let mdat = macro_module(&[&[[0x09, 0x1E, 0x00, 0x00]]]);
+        let module = Module::parse(&mdat, &[]).expect("valid header parses");
+        let mut mac = MacroInterpreter::new();
+        mac.note_on(0, 0x1E, 0, 0, 0x40);
+        let mut paula = Paula::new(100);
+        tick(&mut mac, &module, &mut paula);
+        assert_eq!(paula.voice(0).period, note_period(0x1E, 0x40));
+        assert_ne!(paula.voice(0).period, 424, "the detune must not be dropped");
+    }
+
+    /// ...and a fresh note replaces a leftover `$21` detune rather than
+    /// inheriting it.
+    #[test]
+    fn note_on_replaces_a_stale_play_macro_detune() {
+        let mdat = macro_module(&[&[[0x09, 0x1E, 0x00, 0x00]]]);
+        let module = Module::parse(&mdat, &[]).expect("valid header parses");
+        let mut mac = MacroInterpreter::new();
+        mac.trigger(0, 0x1E, 0, 0);
+        mac.play_macro(0, 0x40);
+        mac.note_on(0, 0x1E, 0, 0, 0);
+        let mut paula = Paula::new(100);
+        tick(&mut mac, &module, &mut paula);
+        assert_eq!(paula.voice(0).period, 424);
+    }
+
+    /// `word23 + self.detune` combines a 16-bit macro finetune with an 8-bit
+    /// `$21` detune. The sum must saturate, not overflow: debug builds panic
+    /// on `i16` overflow and `tfmx/tests/mutation_robustness.rs` requires
+    /// corrupted module data never to panic.
+    #[test]
+    fn macro_finetune_plus_detune_saturates_instead_of_overflowing() {
+        let mdat = macro_module(&[&[[0x09, 0x1E, 0x7F, 0xFF], [0x07, 0, 0, 0]]]);
+        let module = Module::parse(&mdat, &[]).expect("valid header parses");
+        let mut mac = MacroInterpreter::new();
+        mac.trigger(0, 0x1E, 0, 0);
+        mac.play_macro(0, i8::MAX);
+        let mut paula = Paula::new(100);
+        tick(&mut mac, &module, &mut paula);
+        assert_eq!(paula.voice(0).period, note_period(0x1E, i16::MAX));
     }
 
     #[test]

@@ -1220,3 +1220,118 @@ other two candidates from Step B (`note_period()`'s systematic behaviour; the `c
 under a synthetic module) are **not** investigated -- that call belongs to the user. Nothing about
 this result explains, or is expected to explain, the "different melody" complaint; it only removes
 one suspect.
+
+## Update (2026-07-26): Step C round 2 -- `note_period()` pitch mapping -- **formula falsified, two caller bugs found and fixed (awaiting audio confirmation)**
+
+Round 2 of Step C tested the second-ranked hypothesis from Step B: that `note_period()`
+(`tfmx/src/macro_interp.rs`) carries a *systematic* error, which would give right rhythm and wrong
+pitch on every module -- exactly what is heard as "different melody". Split into the pure formula
+and its callers, because the two fail in different ways and only one of them had any test coverage
+at all.
+
+**The hypothesis, sharpened to something falsifiable.** Two separate claims:
+
+1. **The formula.** `note_period(note, 0)` diverges from `docs/playback-model.md` §4's
+   `3_546_895 / (8363 * 2^((note - 0x1E) / 12))` somewhere in the reachable note range `$00`-`$3F`,
+   by more than the ±1 the doc itself leaves open (it declines to fix a rounding convention:
+   "round-half-to-even or truncate both defensible").
+2. **The callers.** The 8-bit pattern-record detune (`dd`) and the 16-bit macro-opcode finetune
+   (`bbbb`) are one Q8.8-style convention at two widths (§4). A width/scaling bug where the two are
+   combined would be just as systematic as a formula bug, and just as invisible to point tests.
+
+**Prior test coverage, checked first.** `note_period` had exactly five tests
+(`tfmx/src/macro_interp.rs`): `$1E`->424, `$2A`->212, `$1E`+`$0080`->283, `$1E`+`-128`->848, and
+transpose-is-index-addition. **All five are the doc's own worked examples** -- i.e. the tests and the
+implementation were derived from the same four points, so they could not detect a formula that fits
+those points and drifts elsewhere. 59 of the 64 reachable notes were untested. No test anywhere
+exercised the 8-bit/16-bit detune combination, and nothing tested the pattern record's `dd` path at
+all.
+
+**Claim 1: the sweep. Falsified.** Two new tests in `tfmx/src/macro_interp.rs`:
+
+- `note_period_matches_an_independently_walked_semitone_ratio` -- for all 64 notes, builds the
+  expected frequency by *iterating* the literal constant 2^(1/12) = `1.059_463_094_359_295_3` up or
+  down from the 8363 Hz anchor, deliberately **not** calling `powf`, then compares periods with a
+  ±1 tolerance. A different code path, so a mistake in the closed form does not reproduce itself in
+  the expectation.
+- `note_period_halves_every_octave_across_the_whole_range` -- the one structural invariant [S1]
+  states outright ("`$2A` is exactly half of `$1E`"), asserted for all 52 note/note+12 pairs
+  instead of that single documented pair.
+
+**Max deviation across all 64 notes: 0.** The implementation reproduces the spec formula exactly;
+periods run 2399 (`$00`) down to 63 (`$3F`), with `$1E` = 424 and `$2A` = 212 as documented. The
+tests were mutation-checked to prove they have teeth: perturbing the exponent divisor from 12.0 to
+12.02 (a 0.17% error, far smaller than anything that could be *heard* as a wrong melody) makes both
+fail immediately. **`note_period()`'s note->period mapping is not the bug.**
+
+Also checked and found sound: `i8`-widened detune sign-extends onto the 16-bit scale correctly
+(`eight_bit_detune_sign_extends_onto_the_sixteen_bit_scale`: 8-bit `-128` lands on the 16-bit
+`$FF80` worked point, 8-bit `+127` on `$007F`); the extremes are all clamp-safe (`finetune == -256`
+-> divide-by-zero -> `+inf` -> clamps to 65535; `finetune < -256` -> negative period -> clamps to 0;
+`note` down to `-128` after transpose -> clamps to 65535).
+
+**Claim 2: two real caller bugs, both fixed.**
+
+- **The pattern note record's `dd` detune was decoded and then silently dropped.**
+  `decode_pattern_entry` produced `NoteTiming::Detune(dd as i8)` faithfully, but
+  `dispatch_pattern_entry` (`tfmx/src/player.rs`) destructured the `Note` arm with `..` over the
+  `timing` field and called `note_on(macro_number, note, volume, transpose)` -- so a field
+  `docs/playback-model.md` §4 documents as a ±50% finetune never reached a period. Fixed: `note_on`
+  takes the detune and stores it in the same `self.detune` slot `$21 <Play macro>` already used, so
+  the next `$08`/`$09`/`$1E`/`$1F` folds it in. This also fixes a leak found in passing -- `note_on`
+  never touched `self.detune`, so a `$21` detune outlived the note that caused it and bled into
+  later notes on that voice; a note now always sets its own finetune.
+- **The 16-bit + 8-bit finetune sum could overflow.** `note_period(note, word23 as i16 +
+  self.detune)` at the three `$08`/`$09`/`$1F` sites is an unguarded `i16` add whose left operand is
+  *raw module data*: `word23 >= $7F81` plus a positive `$21` detune panics in a debug build. That
+  violates `tfmx/tests/mutation_robustness.rs`'s standing contract ("corrupted input may `Err`, it
+  may never panic"). Fixed with `saturating_add`, matching `note_period`'s own clamping style.
+
+**How much this changes what you hear: almost nothing, and here is the measurement.** Traced every
+plausible song slot of all ten corpus modules (`tfmx-cli trace --song 0..31 --seconds 90`) and
+counted the detune of every *executed* `Note`:
+
+| module | executed notes | notes with non-zero `dd` | values seen | voice-state lines changed by the fix |
+|---|---|---|---|---|
+| turrican intro | 23080 | 22 | `1` | 0 |
+| turrican 2 level 1-desert | 5897 | 94 | `2` | 470 |
+| turrican 2 title (st) | 19191 | 294 | `2` | 1176 |
+| turrican 3 level 1 | 33015 | 12 | `7`, `11` | 9000 |
+| apidya (level 1), apidya (title), r-type, x-out (title), turrican 2 level 3-flight, turrican outside | 68771 | 0 | -- | 0 |
+
+Every non-zero detune in the whole corpus is between `+1` and `+11`, i.e. `+0.4%` to `+4.3%`
+(≈7 to ≈73 cents) -- micro-detuning, at most three quarters of a semitone, and only on 422 of
+150 000 executed notes. **All ten song-0 golden hashes are unchanged** (the affected notes are all
+in non-default song slots, or, in `turrican intro`'s case, on a voice that gets retriggered before
+its macro's `$08` ever runs -- the detune is overwritten by the next note in the following jiffy).
+So no golden regeneration was needed. `turrican intro`, the module the user flagged, renders
+**byte-identical** before and after.
+
+**Verdict: hypothesis falsified for the formula; two real but audibly negligible caller bugs fixed.**
+Nothing here can account for "different melody" -- a wrong-melody-scale pitch error would need tens
+of percent, and the largest correction this whole change makes anywhere in the corpus is 4.3% on 12
+notes of one non-default subsong. Per the project's standing rule the fix is not "done" until the
+user has listened: it needs a fresh full-mix **and** per-voice-stem A/B against `uade123`. **The
+"different melody" investigation stays open.**
+
+**Two things worth keeping:**
+
+- **`docs/playback-model.md` §4's "NOT confirmed: whether finetune values outside the two documented
+  example points are meant to be usable at all" can now be answered for the 8-bit field: yes, real
+  modules use it, but only for micro-detuning** (`+1`, `+2`, `+7`, `+11` -- never anything near the
+  documented `±50%` extremes). That is weak but real support for the Q8.8 reading: if `dd` meant
+  something coarser, corpus values would not cluster in the bottom 4% of the range.
+- **The static-disassembly trap from Step C round 1 caught this session too, and the warning was
+  right.** `disasm --pattern 0..127` shows `dd` bytes of `-128`, `127`, `64` in five modules, and
+  `disasm --macro 0..127` shows `$08`/`$09` operands like `$0500`, `$0A00`, `$C600` -- which under
+  the §4 formula would mean multipliers of 6x, 11x and *negative* (a negative period clamps to 0,
+  i.e. silence). All of it sits in slots past the last one any song references: decoded garbage, the
+  exact trap round 1 documented. The executed side agrees from the other direction -- the played
+  pattern detunes tabulated above are all `+1`..`+11`, and the before/after voice-state diff is zero
+  on seven of the ten modules -- so nothing in the corpus's *reachable* data exercises the §4 formula
+  anywhere near those magnitudes. If a future session sees those operands and reads them as evidence
+  that the §4 finetune convention is wrong, it is looking at the same garbage. (Deliberately *not*
+  claimed: that no executed macro operand is ever non-zero. There is no trace event for macro steps,
+  so proving that needs new instrumentation; the outputs were checked instead -- min executed
+  non-zero period across all song slots of all ten modules is 37, on a non-default `turrican intro`
+  subsong, which transpose/portamento/`$17 <Set period>` explain without any large finetune.)
