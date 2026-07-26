@@ -1142,3 +1142,81 @@ reference to compare a per-voice render to.
 or demote any of the three ranked hypotheses below. Posting the ranked list as originally planned,
 unweighted by this table, and flagging the metric's ceiling so the user's own hunch (if any) isn't
 crowded out by a number that looks more authoritative than it is.
+
+## Update (2026-07-26): Step C -- pattern/macro-number and track/voice mapping -- **hypothesis falsified**
+
+The user picked hypothesis 3 (pattern/macro-number resolution and track/voice mapping) for Step C.
+Instrumented it; it comes back clean. **No code changed.** Recorded here so no future session
+re-runs it.
+
+**What the hypothesis was, sharpened to something falsifiable.** Tracks (0-7) and voices (0-3) are
+separate namespaces: `Sequencer::track` (`tfmx/src/sequencer.rs:263`) only indexes eight sequencer
+lanes, and nothing anywhere converts a track index into a voice index -- the voice is chosen per
+pattern entry, by the low nibble of the `cv` byte (`decode_pattern_entry`,
+`tfmx/src/sequencer.rs:519-535`: `volume: cv >> 4`, `voice: cv & 0x0F`). That nibble is then masked
+to `0`-`3` by `voice_of` (`tfmx/src/player.rs:20-22`, `(nibble & 0x03) as usize`) before it indexes
+`macros[voice]` in `dispatch_pattern_entry` (`tfmx/src/player.rs:333-364`). Both the split and the
+mask are flagged **Uncertain** in their own doc comments, because [S1] names `v` but never explains
+it (`docs/format.md` §6, `docs/opcodes.md` §2's operand-notation key: "`v` -- a voice/channel
+number, 0-F"). The concrete, testable failure mode: **if real compositions use `v` values `4`-`15`,
+`& 0x03` silently wraps them (4 -> voice 0, 5 -> voice 1, ...), which is exactly the shape of bug
+that yields right rhythm on the wrong instrument, on every module, without any silence or crash.**
+
+**Prior test coverage, checked first (cheapest step).** `decodes_note_with_wait`,
+`decodes_note_with_detune` and `decodes_portamento_note` (`tfmx/src/sequencer.rs:1255-1345`) pin the
+`cv` split against `docs/format.md` §6's two worked examples plus hand-decodes of `turrican intro`
+patterns `$00`/`$08`/`$14`; `dumps_a_real_pattern_consistently` (`tfmx/src/sequencer.rs:1774-1848`)
+adds a whole-pattern check ("one pattern drives one voice, so a mis-split `cv` byte would show up
+here immediately"). **But every `v` value appearing in all of them is already `0`-`3`, so none of
+them exercises the masking question at all, and `voice_of` has no test of its own anywhere.** The
+split itself is well pinned; the out-of-range behaviour was pure untested guesswork.
+
+**The sweep.** `TraceEvent::Pattern` carries the raw, unmasked nibble while `TraceEvent::Trigger`
+carries the post-`voice_of` value, so `tfmx-cli trace` alone answers the question. Ran
+`tfmx-cli trace` over **every song slot with a plausible trackstep range** (not just song 0) of all
+ten corpus modules, `--seconds 90`, and counted the raw `voice` field of every executed `Note`:
+
+| module | songs traced | executed `Note` entries | raw `voice` nibble values seen | any > 3 |
+|---|---|---|---|---|
+| turrican intro | 31 | 22818 | 0,1,2,3 | no |
+| turrican outside | 31 | 6376 | 0,1,2,3 | no |
+| turrican 2 level 1-desert | 8 | 5465 | 0,1,2,3 | no |
+| turrican 2 level 3-flight | 9 | 13907 | 0,1,2,3 | no |
+| turrican 2 title (st) | 4 | 16926 | 0,1,2,3 | no |
+| turrican 3 level 1 | 7 | 33015 | 0,1,2,3 | no |
+| r-type | 2 | 2140 | 0,1,2,3 | no |
+| x-out (title) | 2 | 193 | 0,1,2,3 | no |
+| apidya (level 1) | 7 | 11006 | 0,1,2,3 | no |
+| **apidya (title)** (TFMX 7V, out of scope) | 4 | 34516 | 0,1,2,**4,5,6,7** (never 3) | **yes** |
+
+**111 846 executed `Note` entries across the nine four-voice modules, not one with a `v` nibble
+outside `0`-`3`.** `voice_of`'s `& 0x03` is therefore a no-op on every module the user flagged, and
+cannot be the cause of the "different melody" symptom. **Hypothesis falsified.** (A shorter
+`--song 0 --seconds 10` pass, the originally-planned sweep, gives the same answer.)
+
+**Two things worth keeping from the negative result:**
+
+- **`v` really is a channel selector -- the confidence on the field's *meaning* goes up.**
+  `apidya (title)` is the corpus's only TFMX 7V module, and it is the only one using nibbles above
+  `3`: it uses exactly seven distinct values, `0,1,2,4,5,6,7`, and never `3`. A seven-channel module
+  using seven `v` values (with the gap exactly at the channel 7V reserves for its DMA-timed mixing)
+  is independent evidence for the reading `docs/format.md` §6 currently records as a guess. Not
+  enough to promote it out of **Uncertain** on its own, but it is the first real-data support the
+  field has had. It also means `voice_of`'s mask actively corrupts that module (4->0, 5->1, 6->2,
+  7->3) -- irrelevant for now, since TFMX 7V is separately documented as unsupported
+  (`docs/architecture.md` §9), but it is where the mask would have to be revisited if 7V is ever
+  implemented.
+- **A trap for the next session: do not read `tfmx-cli disasm --pattern N` for all N as corpus
+  evidence.** A static scan of pattern slots `0`-`127` *does* show `v` nibbles up to `15` in five
+  modules -- and it is all garbage. `disasm` decodes any slot number handed to it, and the first
+  slot showing an out-of-range nibble is in each case just past the last pattern any song actually
+  references: `turrican 2 level 3-flight` references at most pattern 83, junk appears at 84;
+  `turrican 3 level 1` at most 74, junk at 75; `apidya (level 1)` at most 43, junk at 44;
+  `turrican 2 level 1-desert` at most 79, junk at 89. Those slots are bytes past the end of the real
+  pattern-pointer table, never reachable from a trackstep. Only the trace (executed entries) counts.
+
+**Scope discipline**: per the plan, this session tested exactly one hypothesis and stops here. The
+other two candidates from Step B (`note_period()`'s systematic behaviour; the `cv` split itself
+under a synthetic module) are **not** investigated -- that call belongs to the user. Nothing about
+this result explains, or is expected to explain, the "different melody" complaint; it only removes
+one suspect.
