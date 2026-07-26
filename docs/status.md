@@ -813,3 +813,43 @@ and worth a sanity check independent of the silence-gap investigation: is a "not
 `$01` before being superseded audible at all (e.g. via portamento/vibrato applied to the *previous*
 still-sounding note), or is `dispatch_pattern_entry`/`note_on` silently dropping notes the composition
 intended to be heard, which would be a different, new bug class entirely.
+
+## Next session's concrete plan (recorded 2026-07-26, not yet started): synthetic modules as a controlled A/B
+
+Rather than continuing to infer the overlap mechanism from `turrican intro`'s own dense, hard-to-
+isolate trackstep data, build **synthetic `.mdat`/`.smpl` file pairs** that isolate the hypothesis
+directly, then feed them to `uade123` (and possibly the real TFMX editor) as independent black-box
+references -- a much more controlled experiment than archaeology on the real corpus file.
+
+**How**: the crate's own unit tests already hand-build raw `mdat` byte buffers by poking fields at
+known offsets per `docs/format.md` -- see `tfmx/src/player.rs`'s
+`trackstep_master_vol_slide_moves_on_the_first_jiffy` (constructs a one-line `$EFFE` trackstep plus a
+stop line directly into a `Vec<u8>`, no serializer needed). The only new part is writing that same
+kind of buffer to an actual file pair on disk (plus a real, audible `smpl` -- a short one-shot or
+looped tone/click, since a silent sample would make `uade123`'s output untestable) instead of an
+in-memory fixture used only inside a `#[test]`.
+
+**What to build**: a minimal module with 2-4 voices, each voice's macro shaped exactly like `macro
+10`'s confirmed-linear sequence (`$00` pause -> setup -> `$08 <AddNote>` suspend -> `$01 <DMAon>`),
+triggered at controlled jiffy offsets across voices -- same jiffy, 1 jiffy apart, 2 jiffies apart,
+3+ apart. Render each variant with this crate and separately play it through `uade123`, capturing the
+reference to a WAV (`uade123 -f out.wav -e wav -j <seconds> -t <secs>`, per the existing `-f`/`-e`
+options) for objective RMS/onset comparison rather than live-listening-only. This directly answers:
+does `uade123` also show a ~2-jiffy per-note dead zone on *every* attack (confirming it's
+hardware-faithful, not a bug), and does stacking several voices' attacks produce an audible full-mix
+gap there too (confirming the overlap itself is real/expected, not this crate's own dispatch-timing
+artifact)?
+
+**Bonus avenue**: the original TFMX editor (via `fs-uae`, used once already this investigation)
+refused to load `turrican intro` itself -- likely some layout/version detail it's picky about. A
+small hand-built synthetic module may load there without issue, giving a third, more-authoritative
+reference than any GPL replayer for exactly this question.
+
+**Also still worth doing, lower priority**: re-run `tfmx-cli render --stems`/`--solo`/`--mute` and
+`lint` at t=1.28s/t=2.00-2.08s specifically -- a fresh stems A/B hasn't been done since the two
+retrigger fixes (`c919266`, `5c0b35f`) landed, and might narrow things further even before the
+synthetic-module experiment is built.
+
+**Final correctness sign-off still needs the user's ear**, per the project's standing rule -- the WAV
+capture/RMS comparison speeds up iteration but does not replace a listen before any fix is claimed
+done.
