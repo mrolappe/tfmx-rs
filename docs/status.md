@@ -418,3 +418,91 @@ Not yet tried, in likely order of leverage:
    note ... rather than played directly", `docs/opcodes.md` §2) is decoded but never specially
    handled -- `dispatch_pattern_entry` calls `note_on` the same way regardless of `timing`. This is
    a second, independently plausible dispatch bug, not yet confirmed against the corpus.
+
+## Update (2026-07-26, later): four candidates ruled out, master-volume slide found as the likely real cause -- NOT YET FIXED
+
+Continuing the `turrican intro` full-mix discrepancy with a fresh A/B: rendered `--stems` (per
+voice, 15s) plus a 15s trim of a fresh `uade123` reference render. **User's listen: still very
+different -- `crate-v3.wav` starts more or less immediately with bass-drum-like kicks, while the
+`uade123` reference only has audible percussion near the end.** This is a stronger, more
+structural symptom than the earlier pitch/melody complaints, and narrowed the search.
+
+**Ruled out by code inspection against the spec** (none of these are the cause for this module):
+
+- **Transpose plumbing** (`$08`/`$09`/`$1F` in `tfmx/src/macro_interp.rs`, trackstep/`$FB PPat`
+  transpose in `tfmx/src/sequencer.rs` and `tfmx/src/player.rs::dispatch_pattern_entry`): every
+  formula matches `docs/opcodes.md`'s wording exactly (`$08` = `self.note + aa + track_transpose`,
+  `$09` = `aa + track_transpose`, `$1F` = `self.last_note + aa + track_transpose`).
+- **`note_period`** (`tfmx/src/macro_interp.rs`): formula and the detune/finetune multiplier
+  (`1 + signed_value/256`) match `docs/playback-model.md` §4's two worked examples exactly.
+- **`$FB <PlayPattern>` (PPat)**: still a real gap (dispatched as a no-op in
+  `tfmx/src/player.rs`, same bucket as `Fade`/`Lock`) -- but a 120s trace of `turrican intro` song
+  0 (`tfmx-cli trace --seconds 120`) contains zero `PlayPattern`/`Fade`/`Lock` commands. Real
+  missing feature, not this module's bug.
+- **`NoteTiming::Portamento`-timed notes**: same 120s trace shows only `Detune`/`Wait` timing,
+  never `Portamento` -- this module never encodes that case.
+- **`$1C <Splitkey>` dispatch on voice 3's drum-like hit**: traced macro 24's raw bytecode
+  (dumped via a scratch `Module::macro_` reader, same technique as the earlier macro-41 dump) --
+  it's a keysplit: `Splitkey(aa=$20, target=step 2)`, i.e. "if note < 32, jump to step 2 (Cont
+  macro 23), else fall through to step 1 (Cont macro 22)". Every voice-3 trigger in the trace
+  carries `note=32` (not `<32`), so it correctly falls through to macro 22 -- `self.note` is set
+  before the macro program runs (`MacroInterpreter::trigger`/`note_on`), so this is not a stale-note
+  bug. Macro 22's own bytecode is a rapid one-`$08 AddNote`-per-jiffy transpose sequence
+  (0, +5, 0, -2, -3, -4, -5) -- a classic descending pitch-sweep, a very plausible deliberate
+  percussion/kick-style instrument, not an accidental wrong-instrument bug.
+- **Pitch cross-check via autocorrelation (abandoned as unreliable, do not reuse as-is)**: tried
+  extracting monophonic per-voice runs from `tfmx-cli trace`'s `VOICE` period field and comparing
+  the expected frequency (`3546895/period`) against autocorrelation on (a) the `uade123` reference
+  and (b) this crate's own `--stems` render. (a) found zero usable monophonic windows in the
+  reference (polyphonic throughout). (b) found every stem's estimated pitch a clean power-of-two
+  fraction of expected (~1/16, ~1/32) -- traced to short `loop_len` wavetable-style instrument
+  samples (e.g. `loop_len: 8` words = 16 bytes) fooling naive autocorrelation into locking onto a
+  short-lag harmonic instead of the true fundamental. A flaw in the analysis script, not evidence
+  of an engine bug.
+
+**Likely real cause, found but NOT YET IMPLEMENTED**: `turrican intro`'s trackstep line 75 (the
+song's very first line) decodes to `LineCommand::MasterVolSlideB { divisor: 0, target: 64 }`
+(confirmed via `tfmx-cli trace`). `tfmx/src/sequencer.rs:347-353` already has a standing comment
+admitting this is a known no-op: *"Nothing in this crate yet consumes a master-volume slide (there
+is no master-volume concept on `Paula`)"*. Consequence: every note plays at its own per-voice
+volume with zero overall attenuation from jiffy 0, including voice 3's drum-like hit at trackstep
+line 77 (just 2 lines into the song). A composer opening a song with "slide master volume to 64"
+as literally the first command is the classic fade-in idiom -- it only makes sense if the volume
+starts below 64 and ramps up, which would make early hits (like that drum) much quieter or
+inaudible in a spec-correct player while this crate blasts them at full volume immediately. This
+lines up with the user's exact symptom.
+
+**Open uncertainty**: `[S1]` states the master-volume-slide mechanics (`docs/playback-model.md`
+§5.1: "every `divisor` jiffies, master volume moves by 1 towards `target`") but never states the
+*default* master volume before any slide runs. If it already defaults to 64 (max), this slide
+would be a no-op and the whole theory is wrong. Tried to check this against the original TFMX
+editor (v1.5, via UAE) as an independent ground-truth source (distinct from `uade123`, which is
+just another replayer implementation) -- **the editor would not play `turrican intro` at all**
+(likely a version/format mismatch on the editor's own side, not informative either way). No
+one-file-vs-two-file mdat/smpl variant was available to test that unrelated tangent either;
+`docs/format.md` and this crate are scoped to the two-file layout only, and nothing here suggests
+that matters for `turrican intro` (which is itself two-file).
+
+### Next task, next session: implement master volume, default 0
+
+Plan agreed with the user, explicitly deferred to a fresh session (not started this session):
+
+1. Add master-volume state (consumed by `$EFFE 0003`/`0004` line commands and pattern `$FA <Fade>`,
+   which share the identical "every N jiffies, move by 1 towards target" mechanic per
+   `docs/playback-model.md` §5.1) -- most natural home is `Sequencer` (the line commands are
+   sequencer/trackstep-level) or a small new struct threaded into the final mix in `player.rs`;
+   `Paula` itself has no master-volume concept today and this doesn't obviously belong on a
+   per-voice `Paula::Voice`.
+2. Default the master volume to **0** at song start (the only default consistent with the
+   fade-in-to-64 read above) unless/until better evidence surfaces.
+3. TDD per the project's hard rule: a unit test driving `$EFFE 0003/0004` and `$FA` slide-by-1
+   behavior and clamping, plus wiring the resulting value into whatever combines per-voice Paula
+   output into the final sample stream.
+4. Render a fresh full-mix + stems A/B for `turrican intro` song 0 and get the user's ear
+   confirmation -- per `[[feedback_verify_audio_before_claiming_done]]`, do not claim this fixes
+   the discrepancy without a fresh listen. If default-0 is wrong, it should be obvious immediately
+   (either no change, or overcorrects to near-silent).
+5. If master volume turns out insufficient on its own (following the pattern of every previous
+   "real but not sufficient" fix in this investigation), the next untried item is comparing the
+   very first `TRIGGER`/`PATTERN` trace events against the reference's audible attack timbre at
+   t=0 (never attempted this session).
