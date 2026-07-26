@@ -4,10 +4,10 @@
 >
 > | | |
 > |---|---|
-> | **Next step** | none — Phase 6 and M1 are both complete. Awaiting approval to start M2 (desktop realtime, `cpal` output). |
-> | **Phase** | 6 of 6 — Verification and tuning — approved, complete |
-> | **Gate** | M1 is done — stop for explicit approval before any M2 work |
-> | **Last done** | 6.2 · A/B listening pass against `uade123` via signal-processing proxies (tempo/pitch/attack/timbre) — tempo clean on all 10 corpus modules, pitch not conclusively checkable this way (rests on existing unit tests + 6.1 golden-hash instead), timbre broadly similar with two modules lower and unverified. Findings in `docs/status.md` |
+> | **Next step** | 7.2 · Transport controls (space/n/p/q via raw-mode terminal keys) |
+> | **Phase** | 7 of 7 (M2) — Desktop realtime player — approved, in progress |
+> | **Gate** | M2 approved 2026-07-26. Known open issue: `docs/status.md`'s "Open follow-up" section — a human listening pass found `apidya (title)` (and to a lesser extent a `turrican` module) still doesn't sound right even after the confirmed `frac`-reset fix in `Paula::set_dma`. Not blocking M2, but not to be assumed fixed either. |
+> | **Last done** | 7.1 · `tfmx-play` scaffold and realtime `cpal` output (no controls yet) — new binary crate, plays through the default output device at its own sample rate, confirmed by manual run: audible playback, clean exit on Ctrl+C |
 >
 > Update this block in the same commit that ticks a checkbox.
 
@@ -243,10 +243,37 @@ Every step in this phase draws on [S1] and [S2] from [Sources](#sources), and on
 
 ---
 
+## M2 — Desktop realtime player
+
+New binary crate `tfmx-play`, terminal-based (plain raw-mode keys, no TUI framework). Reuses
+`Player::render()` unchanged, per `docs/architecture.md` §7/§9 — realtime is a new *consumer* of
+the core, not a change to it.
+
+### Phase 7 — `tfmx-play`
+
+- [x] **7.1** `tfmx-play <mdat> <smpl> [--song N]`: new binary crate, opens the default `cpal`
+      output device, drives `Player::render()` from its audio callback, runs until Ctrl+C. No
+      pause/stop/song-switch yet — just sound out. No resampling: `Player` already handles an
+      arbitrary sample rate exactly (step 4.1), so it is simply constructed at the output
+      device's own reported rate. The one piece worth isolating and testing is the sample-format
+      conversion (core `i16` → whatever format `cpal`'s default output config actually is, e.g.
+      `f32` on most backends) as a pure function; the `cpal` device/stream plumbing itself is
+      thin, untested glue, same boundary `tfmx-cli`'s `main()`/`hound` I/O already draws. —
+      *check: unit tests cover CLI arg parsing and the `i16`→device-format conversion function; a
+      manual run audibly plays a corpus module through the default output device and exits
+      cleanly on Ctrl+C* *(Opus 5)*
+- [ ] **7.2** Transport controls: raw-mode terminal keys — space = pause/resume, `n`/`p` = next/
+      previous song (rebuilds `Player` for the new song from the already-parsed `Module`), `q` =
+      quit. Key events reach the audio callback via a channel; paused output is silence, not a
+      stopped stream (avoids device reopen latency). — *check: unit tests cover the
+      command-channel state machine (pause/resume/song-switch/quit) independent of any real
+      device or terminal; a manual run confirms pause is silent and gapless, resume continues
+      without a glitch, and song-switch changes what's audible* *(Opus 5)*
+
+---
+
 ## Later milestones
 
-- **M2 — Desktop realtime:** `cpal` output, play/pause/stop, song selection. The core does not
-  change.
 - **M3 — Web:** `tfmx-web` wasm-bindgen wrapper, AudioWorklet processor, minimal demo page with
   drag-and-drop for mdat/smpl.
 - **Beyond:** TFMX 7V support (a separate parser path — the format is substantially different,

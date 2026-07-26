@@ -192,7 +192,11 @@ mod tests {
     }
 
     fn corpus_path(name: &str) -> Option<PathBuf> {
-        let path = PathBuf::from(format!("{}/../testdata/{}", env!("CARGO_MANIFEST_DIR"), name));
+        let path = PathBuf::from(format!(
+            "{}/../testdata/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            name
+        ));
         path.exists().then_some(path)
     }
 

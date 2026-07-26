@@ -1,0 +1,15 @@
+[package]
+name = "tfmx-play"
+description = "Desktop realtime player for TFMX modules"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+tfmx = { path = "../tfmx" }
+clap = { version = "4", features = ["derive"] }
+cpal = "0.15"
+ctrlc = "3"
