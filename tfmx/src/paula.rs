@@ -131,8 +131,20 @@ impl Paula {
         v.loop_len = loop_len;
     }
 
+    /// Turning DMA on latches a fresh fetch at the currently-set start
+    /// (`docs/playback-model.md` §2.3: "`$01 DMAon` starts it"): an off→on
+    /// transition resets the sub-sample position so a retrigger begins at
+    /// the new region's first sample instead of resuming wherever the
+    /// previous region's playback happened to leave off. An on→on call (or
+    /// a `$18 Sampleloop` rewrite while DMA stays continuously on) must NOT
+    /// reset it -- that's the timed attack→loop handoff `Voice::next_sample`
+    /// already performs on its own.
     pub fn set_dma(&mut self, voice: u8, on: bool) {
-        self.voices[voice as usize].dma_on = on;
+        let v = &mut self.voices[voice as usize];
+        if on && !v.dma_on {
+            v.frac = 0;
+        }
+        v.dma_on = on;
     }
 
     /// Times `voice`'s active sample region has completed a play-through
@@ -334,6 +346,49 @@ mod tests {
             left[150] < 0,
             "expected loop-region output after transition, got {}",
             left[150]
+        );
+    }
+
+    #[test]
+    fn dma_retrigger_resets_sub_sample_position() {
+        let sample_rate = 8_000u32;
+        // ~one source sample consumed per output frame.
+        let period = (PAULA_CLOCK_HZ / sample_rate as f64).round() as u16;
+
+        // Region B [100,150): an index-coded ramp so byte k there reads back
+        // as -100 + k -- a leftover mid-region position carried over from
+        // region A would surface as a too-high value instead of the correct
+        // first sample, -100.
+        let mut source = vec![50i8; 200];
+        for k in 0..50i32 {
+            source[100 + k as usize] = (-100 + k) as i8;
+        }
+
+        let mut paula = Paula::new(100);
+        paula.set_period(0, period);
+        paula.set_volume(0, 64);
+        paula.set_sample_region(0, 0, 50); // region A: 50 words = 100 samples
+        paula.set_loop_region(0, 0, 50);
+        paula.set_dma(0, true);
+
+        // Consume a non-multiple of the region length, so playback position
+        // sits mid-region (~37 samples in) rather than conveniently at 0.
+        let mut out = vec![0i16; 137 * 2];
+        paula.render(&source, sample_rate, &mut out);
+
+        // A retrigger, exactly as `$00 DMAoff` + `$02/$03 SetBegin/SetLen` +
+        // `$01 DMAon` produce: DMA off, a brand-new region, DMA on.
+        paula.set_dma(0, false);
+        paula.set_sample_region(0, 100, 25); // region B: 25 words = 50 samples
+        paula.set_loop_region(0, 100, 25);
+        paula.set_dma(0, true);
+
+        let mut out2 = vec![0i16; 2];
+        paula.render(&source, sample_rate, &mut out2);
+        let amp = out2[0] as f64 / 256.0; // undo the volume=64 (x1.0) * 256 scaling
+        assert!(
+            (amp - -100.0).abs() < 1.0,
+            "expected playback to restart at region B's first sample (~-100), got {amp}"
         );
     }
 

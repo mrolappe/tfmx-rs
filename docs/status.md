@@ -91,3 +91,25 @@ that limitation is the deliverable of this section, not a swept-under-the-rug de
 or timbre bug is ever suspected in `turrican outside`, `turrican 2 level 3-flight`, or any other
 module, an actual human listening comparison against the `uade123` render is the next step, not
 more automated signal analysis.
+
+## Open follow-up (2026-07-26, post-6.2): human listening found a real problem this pass missed
+
+An informal human listening pass (not the `uade123` A/B above) on `apidya (title)` and one
+`turrican` corpus module found the render does not sound like the source material at all --
+`apidya (title)` in particular sounded like one sample fragment looping continuously rather than
+music. Investigation (see conversation record, not reproduced here) found and fixed a real bug:
+`Paula::Voice`'s sub-sample playback position (`frac`) was never reset on a DMA off-to-on
+retrigger, so every note-on resumed mid-sample at a leftover offset instead of starting the new
+region's attack from its beginning -- confirmed with a targeted unit test
+(`dma_retrigger_resets_sub_sample_position` in `tfmx/src/paula.rs`) and fixed in `Paula::set_dma`.
+All ten golden hashes (step 6.1) changed as expected and were regenerated.
+
+**This fix did not produce an audible improvement on a second listen.** The `frac`-reset bug was
+real and is correctly fixed, but it is evidently not the (or not the only) cause of what was
+heard. Deferred rather than chased further in the same session; the next person picking this up
+should not assume the `frac` fix already solved it. Concrete next steps, in the order this
+document's own "Remaining gap" section already recommends: an actual `uade123` A/B on `apidya
+(title)` specifically (not just the automated proxies above, which only ever covered pitch/timbre
+correlation, not "does this sound like a coherent song at all"), and re-running the trackstep/
+pattern trace diagnostic from the conversation (distinct patterns per track, notes triggered,
+command histogram) against `uade123`'s own known-correct behavior if that becomes observable.
