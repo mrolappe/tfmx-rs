@@ -33,6 +33,16 @@ pub struct Player<'a> {
     paula: Paula,
     unsupported: UnsupportedOps,
     clock: TickClock,
+    /// Per-voice `$FD <Lock>` countdown, in jiffies remaining. `docs/
+    /// opcodes.md` §2: while non-zero, `Note` entries targeting that voice
+    /// are dropped rather than dispatched.
+    lock: [u32; 4],
+    /// The pattern number the *trackstep* table last assigned each track
+    /// (`None` before any assignment or after a `StopChannel`) -- distinct
+    /// from `patterns[i]`'s own live pattern number, which a `$FB <PPat>`
+    /// jump can move independently. See the reload loop's comment in
+    /// `run_jiffy` for why the two must not be conflated.
+    track_pattern: [Option<u8>; 8],
     sample_rate: u32,
     /// Total frames rendered across every `render`/`render_traced` call on
     /// this player -- gives [`TraceEvent::Jiffy`]'s `frame` a continuous,
@@ -71,6 +81,8 @@ impl<'a> Player<'a> {
             paula: Paula::new(separation),
             unsupported: UnsupportedOps::default(),
             clock,
+            lock: [0; 4],
+            track_pattern: [None; 8],
             sample_rate,
             frames_rendered: 0,
         })
@@ -122,6 +134,8 @@ impl<'a> Player<'a> {
             paula,
             unsupported,
             clock,
+            lock,
+            track_pattern,
             sample_rate,
             frames_rendered,
         } = self;
@@ -137,6 +151,8 @@ impl<'a> Player<'a> {
                     macros,
                     paula,
                     unsupported,
+                    lock,
+                    track_pattern,
                     *frames_rendered + pos as u64,
                     &mut trace,
                 )
@@ -172,6 +188,8 @@ fn run_jiffy<'a>(
     macros: &mut [MacroInterpreter; 4],
     paula: &mut Paula,
     unsupported: &mut UnsupportedOps,
+    lock: &mut [u32; 4],
+    track_pattern: &mut [Option<u8>; 8],
     frame: u64,
     trace: &mut impl FnMut(TraceEvent),
 ) -> Result<(), AccessError> {
@@ -209,19 +227,34 @@ fn run_jiffy<'a>(
     for i in 0..8u8 {
         match sequencer.track(i) {
             TrackSlot::Pattern { number, .. } => {
-                let reload = patterns[i as usize]
-                    .as_ref()
-                    .is_none_or(|r| r.pattern() != number);
+                // Compared against `track_pattern`, not `patterns[i].pattern()`:
+                // `Sequencer::track` resolves a `$80 <Hold>` word into
+                // `Pattern{number: <its own remembered number>, ..}` every
+                // jiffy (`sequencer.rs::advance`), independent of a `$FB
+                // <PPat>` jump this track may have taken since -- comparing
+                // against the live `PatternRunner` would see that jump as a
+                // "reload" and silently undo it the very next Hold.
+                let reload = track_pattern[i as usize] != Some(number);
+                track_pattern[i as usize] = Some(number);
                 if reload {
                     patterns[i as usize] = Some(PatternRunner::new(module, number)?);
                 }
             }
             TrackSlot::Hold { .. } => {}
-            TrackSlot::StopChannel => patterns[i as usize] = None,
+            TrackSlot::StopChannel => {
+                patterns[i as usize] = None;
+                track_pattern[i as usize] = None;
+            }
             TrackSlot::StopVoice { voice } => macros[voice_of(voice)].stop_voice(),
         }
     }
 
+    // `$FB <PPat>` jumps to a track that may be earlier or later than the
+    // one issuing it in this same 0..7 pass -- collected here and applied
+    // only after every track has run this jiffy (see `dispatch_pattern_
+    // entry`'s doc comment for why that single ordering covers both of
+    // `docs/opcodes.md` §2's "immediate"/"next entry" cases for free).
+    let mut pattern_jumps: [Option<u8>; 8] = [None; 8];
     for i in 0..8u8 {
         let transpose = match sequencer.track(i) {
             TrackSlot::Pattern { transpose, .. } | TrackSlot::Hold { transpose } => transpose,
@@ -235,10 +268,24 @@ fn run_jiffy<'a>(
                     step,
                     entry,
                 });
-                dispatch_pattern_entry(entry, transpose, macros, paula, trace);
+                if let Some((target_track, target_pattern)) =
+                    dispatch_pattern_entry(entry, transpose, macros, paula, lock, trace)
+                {
+                    pattern_jumps[target_track as usize] = Some(target_pattern);
+                }
             })?;
         }
     }
+    for (track, pattern) in pattern_jumps.into_iter().enumerate() {
+        if let Some(pattern) = pattern {
+            // `track_pattern` deliberately untouched: it tracks what the
+            // *sequencer* last assigned, so a later Hold that resolves back
+            // to that same remembered number still leaves this jump alone
+            // (see the reload loop's own comment).
+            patterns[track] = Some(PatternRunner::new(module, pattern)?);
+        }
+    }
+    tick_locks(lock);
 
     let mut play_macro_events = [None; 4];
     for (voice, mac) in macros.iter_mut().enumerate() {
@@ -267,15 +314,30 @@ fn run_jiffy<'a>(
     Ok(())
 }
 
-/// Routes one decoded pattern longword to the voice it names.
-/// `docs/opcodes.md` §2-§3.
+/// Decrements every voice's `$FD <Lock>` countdown by one jiffy, floored at
+/// 0 -- called once per jiffy, after that jiffy's own pattern dispatch (so
+/// the jiffy a `Lock` command runs on still fully blocks other notes on
+/// that voice).
+fn tick_locks(lock: &mut [u32; 4]) {
+    for remaining in lock {
+        *remaining = remaining.saturating_sub(1);
+    }
+}
+
+/// Routes one decoded pattern longword to the voice it names. Returns the
+/// `(track, pattern)` of a `$FB <PPat>` cross-track jump, if this entry was
+/// one -- the caller applies it after every track has had its turn this
+/// jiffy (see `run_jiffy`'s own comment on why that single-pass order is
+/// exactly what `docs/opcodes.md` §2's "own track lower than target track"
+/// timing rule needs, with no extra bookkeeping). `docs/opcodes.md` §2-§3.
 fn dispatch_pattern_entry(
     entry: PatternEntry,
     transpose: i8,
     macros: &mut [MacroInterpreter; 4],
     paula: &mut Paula,
+    lock: &mut [u32; 4],
     trace: &mut impl FnMut(TraceEvent),
-) {
+) -> Option<(u8, u8)> {
     match entry {
         PatternEntry::Note {
             note,
@@ -285,6 +347,11 @@ fn dispatch_pattern_entry(
             ..
         } => {
             let voice = voice_of(voice) as u8;
+            // `$FD <Lock>`: "locks channel against other notes" -- a note
+            // for a still-locked voice is dropped, not deferred or queued.
+            if lock[voice as usize] > 0 {
+                return None;
+            }
             macros[voice as usize].note_on(macro_number, note, volume, transpose);
             trace(TraceEvent::Trigger {
                 voice,
@@ -293,14 +360,21 @@ fn dispatch_pattern_entry(
                 volume,
                 transpose,
             });
+            None
         }
         PatternEntry::Command(command) => match command {
-            PatternCommand::KeyUp { voice } => macros[voice_of(voice)].signal_key_up(),
+            PatternCommand::KeyUp { voice } => {
+                macros[voice_of(voice)].signal_key_up();
+                None
+            }
             PatternCommand::Vibrato {
                 speed,
                 voice,
                 depth,
-            } => macros[voice_of(voice)].start_vibrato(speed, depth as i8),
+            } => {
+                macros[voice_of(voice)].start_vibrato(speed, depth as i8);
+                None
+            }
             PatternCommand::Envelope {
                 amount,
                 speed,
@@ -309,19 +383,32 @@ fn dispatch_pattern_entry(
             } => {
                 // "$F7 <Enve>: every b+1 jiffies" -- `docs/opcodes.md` §2,
                 // unlike macro $0F's own "every bb jiffies" with no +1.
-                macros[voice_of(voice)].start_envelope(amount, speed + 1, target)
+                macros[voice_of(voice)].start_envelope(amount, speed + 1, target);
+                None
             }
             PatternCommand::Portamento { speed, voice, rate } => {
-                macros[voice_of(voice)].start_portamento(speed, rate as i8 as i16)
+                macros[voice_of(voice)].start_portamento(speed, rate as i8 as i16);
+                None
             }
             PatternCommand::Fade { speed, target } => {
-                paula.start_master_volume_slide(speed, target)
+                paula.start_master_volume_slide(speed, target);
+                None
             }
-            // Recognized, timed by `PatternRunner`, and left unconsumed --
-            // nothing in this crate owns a cross-track pattern jump yet.
-            PatternCommand::PlayPattern { .. }
-            | PatternCommand::Lock { .. }
-            | PatternCommand::End
+            PatternCommand::Lock { channel, ticks } => {
+                lock[voice_of(channel)] = ticks as u32;
+                None
+            }
+            // `transpose` is decoded (`sequencer.rs`) but not applied here:
+            // [S1] gives PPat's jumped-to track the same (pattern, transpose)
+            // shape as a trackstep `Pattern` slot, but that slot's transpose
+            // is re-supplied fresh from the trackstep table every jiffy
+            // (`run_jiffy`'s `transpose` local) independent of any pattern-
+            // level command, and [S1] never states which one wins on a live
+            // track. Recorded as a known partial gap rather than guessed.
+            PatternCommand::PlayPattern {
+                pattern, track, ..
+            } => Some((track & 0x07, pattern)),
+            PatternCommand::End
             | PatternCommand::Loop { .. }
             | PatternCommand::Jump { .. }
             | PatternCommand::Wait { .. }
@@ -329,7 +416,7 @@ fn dispatch_pattern_entry(
             | PatternCommand::GoSub { .. }
             | PatternCommand::Return
             | PatternCommand::StopCustom
-            | PatternCommand::Nop => {}
+            | PatternCommand::Nop => None,
         },
     }
 }
@@ -337,6 +424,7 @@ fn dispatch_pattern_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sequencer::NoteTiming;
 
     fn read_corpus(name: &str) -> Option<Vec<u8>> {
         let path = format!("{}/../testdata/{}", env!("CARGO_MANIFEST_DIR"), name);
@@ -576,11 +664,154 @@ mod tests {
             0,
             &mut macros,
             &mut paula,
+            &mut [0; 4],
             &mut |_| {},
         );
         paula.tick_master_volume();
         paula.tick_master_volume();
 
         assert_eq!(paula.master_volume(), 2);
+    }
+
+    /// `$FD <Lock>`: "locks channel `aa`&3 against other notes for `bbbb`
+    /// ticks" (`docs/opcodes.md` §2). A `Note` entry for the locked voice
+    /// dispatched while the lock is in effect must not reach the macro
+    /// interpreter at all.
+    #[test]
+    fn lock_pattern_command_blocks_a_same_voice_note_dispatched_after_it() {
+        let mut macros = core::array::from_fn(|_| MacroInterpreter::new());
+        let mut paula = Paula::new(100);
+        let mut lock = [0u32; 4];
+
+        dispatch_pattern_entry(
+            PatternEntry::Command(PatternCommand::Lock {
+                channel: 2,
+                ticks: 3,
+            }),
+            0,
+            &mut macros,
+            &mut paula,
+            &mut lock,
+            &mut |_| {},
+        );
+        assert_eq!(lock[2], 3, "Lock must arm the counter for its own channel");
+
+        dispatch_pattern_entry(
+            PatternEntry::Note {
+                note: 30,
+                macro_number: 7,
+                volume: 15,
+                voice: 2,
+                timing: NoteTiming::Detune(0),
+            },
+            0,
+            &mut macros,
+            &mut paula,
+            &mut lock,
+            &mut |_| {},
+        );
+
+        assert_eq!(
+            macros[2].macro_number(),
+            0,
+            "a Note for a locked voice must never reach note_on"
+        );
+    }
+
+    /// A locked voice must accept notes again once the counter reaches 0,
+    /// and a lock on one voice must never block a different voice.
+    #[test]
+    fn tick_locks_counts_down_and_stops_blocking_at_zero() {
+        let mut lock = [0u32, 2, 0, 0];
+        tick_locks(&mut lock);
+        assert_eq!(lock, [0, 1, 0, 0]);
+        tick_locks(&mut lock);
+        assert_eq!(lock, [0, 0, 0, 0], "must not underflow past 0");
+        tick_locks(&mut lock);
+        assert_eq!(lock, [0, 0, 0, 0]);
+    }
+
+    /// End-to-end proof of `docs/opcodes.md` §2's `$FB <PPat>` timing rule
+    /// via a synthetic two-track module: track 0's pattern issues
+    /// `PlayPattern(pattern: 2, track: 1)` then stops for the rest of the
+    /// jiffy; track 1 (index 1, greater than track 0's own index 0) starts
+    /// on pattern 1. "own track number lower than target track: takes
+    /// effect on the next entry into the play routine" means track 1's
+    /// dispatch *this same jiffy* must still run its old pattern 1 (macro
+    /// 5); only the *following* jiffy must show pattern 2 (macro 9).
+    #[test]
+    fn play_pattern_command_redirects_the_named_track_on_the_next_jiffy() {
+        let pattern0: [u8; 8] = [
+            0xFB, 0x02, 0x01, 0x00, // PlayPattern(pattern=2, track=1, transpose=0)
+            0xF3, 0x00, 0x00, 0x00, // Wait(0): stop for the rest of this jiffy
+        ];
+        let pattern1: [u8; 4] = [0x80, 0x05, 0xF1, 0x00]; // Note(macro=5, voice=1, Wait(0))
+        let pattern2: [u8; 4] = [0x80, 0x09, 0xF1, 0x00]; // Note(macro=9, voice=1, Wait(0))
+        let macro_program: [u8; 4] = [0x00, 0x00, 0x00, 0x00]; // $00 aa=0: pause, suspend
+
+        let mut mdat = vec![0u8; 0x900];
+        mdat[0..10].copy_from_slice(b"TFMX-SONG ");
+        mdat[0x140..0x142].copy_from_slice(&1u16.to_be_bytes()); // song_end = line 1
+        mdat[0x180..0x182].copy_from_slice(&1u16.to_be_bytes()); // tempo
+
+        const PATTERN_TABLE: usize = 0x400;
+        const MACRO_TABLE: usize = 0x600;
+        let mut offset = 0x900u32;
+        for (slot, len) in [(0usize, 8u32), (1, 4), (2, 4)] {
+            mdat[PATTERN_TABLE + slot * 4..PATTERN_TABLE + slot * 4 + 4]
+                .copy_from_slice(&offset.to_be_bytes());
+            offset += len;
+        }
+        mdat.extend_from_slice(&pattern0);
+        mdat.extend_from_slice(&pattern1);
+        mdat.extend_from_slice(&pattern2);
+
+        let macro_offset = offset;
+        for slot in [5usize, 9] {
+            mdat[MACRO_TABLE + slot * 4..MACRO_TABLE + slot * 4 + 4]
+                .copy_from_slice(&macro_offset.to_be_bytes());
+        }
+        mdat.extend_from_slice(&macro_program);
+
+        // Line 0: track 0 -> pattern 0, track 1 -> pattern 1, rest stopped.
+        let mut line0 = [0u8; 16];
+        line0[0..2].copy_from_slice(&0x0000u16.to_be_bytes());
+        line0[2..4].copy_from_slice(&0x0100u16.to_be_bytes());
+        for w in 2..8 {
+            line0[w * 2..w * 2 + 2].copy_from_slice(&0xFF00u16.to_be_bytes());
+        }
+        // Line 1: hold both tracks -- a fresh `Pattern{number: 1, ..}` here
+        // would make `run_jiffy`'s reload check stomp the jump's redirect
+        // right back to pattern 1 before track 1 ever got to use it.
+        let mut line1 = [0u8; 16];
+        line1[0..2].copy_from_slice(&0x8000u16.to_be_bytes());
+        line1[2..4].copy_from_slice(&0x8000u16.to_be_bytes());
+        for w in 2..8 {
+            line1[w * 2..w * 2 + 2].copy_from_slice(&0xFF00u16.to_be_bytes());
+        }
+        mdat[0x800..0x810].copy_from_slice(&line0);
+        mdat[0x810..0x820].copy_from_slice(&line1);
+
+        let module = Module::parse(&mdat, &[]).expect("valid header parses");
+        let mut player = Player::new(&module, 0, 44100, 100).expect("song 0 in range");
+
+        let mut out = vec![0i16; 2]; // one frame is enough: the first tick is due immediately
+        player.render(&mut out).expect("jiffy 0 stays in range");
+        assert_eq!(
+            player.macros[1].macro_number(),
+            5,
+            "track 1 must still run its old pattern's note the same jiffy the jump was issued"
+        );
+
+        // Tempo 1 -> 25 Hz -> 1764 samples/jiffy (`tick_fraction`); one
+        // frame already consumed the first tick, so 1764 more crosses
+        // exactly into the second without reaching a third.
+        let mut out2 = vec![0i16; 1764 * 2];
+        player.render(&mut out2).expect("jiffy 1 stays in range");
+        assert_eq!(
+            player.macros[1].macro_number(),
+            9,
+            "track 1 must run the jumped-to pattern's note starting the next jiffy"
+        );
     }
 }

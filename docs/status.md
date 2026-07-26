@@ -978,3 +978,63 @@ from this investigation (the retrigger bug, now fixed; and these two silence gap
 exhausted without resolving it, the remaining discrepancy is most likely in note/pitch/instrument
 dispatch rather than in timing or silence gaps -- no concrete next lead identified yet. Final
 correctness sign-off still needs the user's ear on the full render.
+
+## Update (2026-07-26, next session): `$FD <Lock>` and `$FB <PPat>` implemented
+
+Separate from the "different melody" investigation: earlier sessions found three pattern
+commands (`$FA <Fade>`, `$FB <PPat>`, `$FD <Lock>`) recognized-and-timed by `PatternRunner` but
+never consumed by `dispatch_pattern_entry` (`tfmx/src/player.rs`). `Fade` was already fixed in an
+earlier session (starts the shared master-volume slide). This session did the other two, TDD
+throughout.
+
+**`$FD <Lock>`**: "locks channel `aa`&3 against other notes for `bbbb` ticks" (`docs/opcodes.md`
+§2). `Player` gained a `lock: [u32; 4]` per-voice jiffy countdown; `Lock` arms it, a new
+`tick_locks` helper decrements it once per jiffy (floored at 0), and `dispatch_pattern_entry`
+drops (does not queue or defer) any `Note` for a still-locked voice. Two new tests: a direct
+`dispatch_pattern_entry`-level test (same style as the existing `Fade` test) proving a locked
+voice's note never reaches `note_on`, and a pure-function test for `tick_locks`' countdown/floor
+behavior.
+
+**`$FB <PPat>`**: "jumps track `a` to pattern `bb` with transpose `cc`, and continues. If this
+command's own track number is lower than track `a`, the jump takes effect on the next entry into
+the play routine; otherwise it is immediate." `dispatch_pattern_entry` now returns
+`Option<(track, pattern)>` for this one command; `run_jiffy`'s per-track dispatch loop (already a
+single 0..7 pass per jiffy) collects these into a small fixed array and applies them in one pass
+*after* every track has run that jiffy. This ordering alone reproduces the doc's "own track lower:
+next entry, otherwise: immediate" rule with no extra bookkeeping: a target track later in the same
+pass hasn't been dispatched yet when the jump is collected, so it still runs its old assignment
+this jiffy (the redirect isn't applied until after the loop) -- exactly "next entry"; a target
+track earlier in the pass already ran on its old assignment regardless, so applying post-loop is
+already the earliest the redirect could take effect -- exactly "immediate". No branching on track
+order needed to get both cases right.
+
+**A real, unrelated bug found by the `PlayPattern` integration test, not by inspection**:
+`Sequencer::track` (`tfmx/src/sequencer.rs::advance`) resolves a `$80 <Hold>` word into
+`TrackSlot::Pattern { number: <the pattern number this track was last genuinely assigned>, .. }`
+every jiffy -- Hold has no memory of its own, so the sequencer supplies the last real pattern
+number so callers don't have to track continuity themselves. But `run_jiffy`'s pre-existing reload
+check compared this against `patterns[i].pattern()` (the *live* `PatternRunner`'s current pattern)
+-- so a `PlayPattern` jump moved `patterns[i]` to a new number, and the very next Hold-resolved-to-
+Pattern jiffy saw a "mismatch" against its own old number and reloaded right back, silently undoing
+the jump one jiffy after it landed. Fixed with a new `Player::track_pattern: [Option<u8>; 8]` field
+that separately tracks what the *sequencer* last assigned each track; the reload check now compares
+against that instead, and `StopChannel` clears it (so a later re-assignment of the same number
+still reloads fresh, matching the pre-existing behavior). The jump-apply step deliberately does
+*not* update `track_pattern` -- doing so would make the very next Hold see a mismatch against the
+*sequencer's* unchanged memory and immediately reload back, undoing the jump one jiffy later than
+before instead of not undoing it at all.
+
+**Known partial gap, left honestly unresolved rather than guessed**: `PlayPattern`'s own
+`transpose` operand is decoded but not applied. [S1] gives the jumped-to track the same
+`(pattern, transpose)` shape as a trackstep `Pattern` slot, but that slot's transpose is
+re-supplied fresh from the trackstep table every single jiffy (`run_jiffy`'s `transpose` local),
+independent of any pattern-level command -- and nothing in the spec states which one wins on a
+live track. Left unmodeled and documented in a comment rather than silently picking one.
+
+**Real-world impact checked**: neither opcode appears in any of the 10 corpus modules' `lint`
+output except `apidya (title)` (75 `Lock` calls, already out-of-scope TFMX 7V) -- its render is
+byte-identical before and after this change (no competing note ever lands inside one of its lock
+windows), and all ten golden hashes are unaffected. Full workspace test suite and clippy clean.
+Not part of the M1-M4 step list -- a real gap found during the `turrican intro` investigation,
+implemented ad hoc like the earlier master-volume-slide addition, and unrelated to the still-open
+"different melody" complaint above.
