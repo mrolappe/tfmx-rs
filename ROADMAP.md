@@ -4,9 +4,9 @@
 >
 > | | |
 > |---|---|
-> | **Next step** | none — Phase 7 and M2 are both complete. Awaiting approval to start M3 (`tfmx-web`, wasm-bindgen). |
-> | **Phase** | 7 of 7 (M2) — Desktop realtime player — approved, complete |
-> | **Gate** | M2 is done — stop for explicit approval before any M3 work. Known open issue carried over: `docs/status.md`'s "Open follow-up" section — a human listening pass found `apidya (title)` (and to a lesser extent a `turrican` module) still doesn't sound right even after the confirmed `frac`-reset fix in `Paula::set_dma`. Not blocking M2/M3, but not to be assumed fixed either — see that doc before touching playback correctness again. |
+> | **Next step** | 8.1 — `tfmx-web` plain-Rust core (parse + `Player` ownership, host-testable). |
+> | **Phase** | 8 of 10 (M3) — `tfmx-web` core + wasm boundary — approved, in progress |
+> | **Gate** | M3 approved to start. Stop for explicit approval at the end of Phase 10 before any "Beyond" work. Known open issue carried over: `docs/status.md`'s "Open follow-up" section — a human listening pass found `apidya (title)` (and to a lesser extent a `turrican` module) still doesn't sound right even after the confirmed `frac`-reset fix in `Paula::set_dma`. Not blocking M2/M3, but not to be assumed fixed either — see that doc before touching playback correctness again. |
 > | **Last done** | 7.2 · Transport controls (space=pause/resume, n/p=song, q=quit) via raw-mode terminal keys — confirmed by manual run: status line updates correctly in place, pause/resume gapless, song-switch audible |
 >
 > Update this block in the same commit that ticks a checkbox.
@@ -284,10 +284,71 @@ one-line scope — no further phases planned for it right now.
 
 ---
 
+## M3 — Web
+
+New crate `tfmx-web`, wasm-bindgen wrapper around the existing `tfmx` core (`docs/architecture.md`
+§7/§9 already scopes this: no core change required), driven from an `AudioWorklet`. Plain
+HTML/CSS/JS demo page, no bundler — `tfmx-web`'s own `wasm-bindgen --target no-modules` output is
+the only build step.
+
+**Design decisions carried into these steps:**
+- `AudioWorkletGlobalScope` does not reliably support ES-module `import` across browsers, so the
+  wasm glue is built with `wasm-bindgen --target no-modules` (classic-script output) and loaded
+  inside the worklet via `importScripts()`. The main thread fetches and compiles the `.wasm` once
+  and transfers the resulting `WebAssembly.Module` to the worklet, which instantiates it
+  synchronously with `initSync()` (no top-level `await` inside a worklet).
+- `#[wasm_bindgen]`-attributed types (`JsValue`/`JsError`) only compile and run under `wasm32`
+  with the JS glue present, so they cannot be exercised by plain `cargo test`. `tfmx-web` is
+  therefore split into a plain-Rust core (parses `Module`, owns a `Player`, fully host-testable)
+  and a thin `#[wasm_bindgen]` shell that only marshals `&[u8]`/`Uint8Array` and maps errors —
+  the same "push glue to the boundary, keep the core plain" pattern already used at the CLI and
+  `cpal` boundaries.
+
+### Phase 8 — `tfmx-web` core + wasm boundary
+
+- [ ] **8.1** Plain-Rust core (no `wasm_bindgen` attributes): parses `mdat`/`smpl` byte slices via
+      `Module::parse`, owns a `Player`, exposes `render(&mut self, out: &mut [i16])` and
+      `set_song(&mut self, song: u32)` (rebuilds `Player` from the already-parsed `Module`,
+      mirroring `tfmx-play`'s 7.2 approach). — *check: `cargo test -p tfmx-web` on the host target
+      covers construction from a corpus module, `render()` producing non-silent/non-`NaN` output,
+      and `set_song` switching songs* *(Sonnet 5)*
+- [ ] **8.2** Thin `#[wasm_bindgen]` wrapper: `TfmxWeb::new(mdat: &[u8], smpl: &[u8], sample_rate:
+      u32) -> Result<TfmxWeb, JsError>`, `render`, `set_song`, delegating straight to 8.1's core. —
+      *check: `wasm-bindgen-test` (Node target) constructs a `TfmxWeb` from a corpus module's
+      bytes, renders a block, asserts non-empty/non-panicking output; `cargo build -p tfmx-web
+      --target wasm32-unknown-unknown --target-dir target/wasm` (a non-default invocation — not
+      part of `cargo build --workspace`) succeeds* *(Sonnet 5)*
+
+### Phase 9 — AudioWorklet integration
+
+- [ ] **9.1** Pure JS conversion function: interleaved `i16` (what `render()` produces) → planar
+      `f32` per channel (what `AudioWorkletProcessor.process()`'s output array wants) — isolated
+      exactly like `tfmx-play`'s 7.1 format-conversion function. — *check: plain `assert`-based
+      Node script (`node test.js`, no framework), known input → expected per-channel output*
+      *(Sonnet 5)*
+- [ ] **9.2** `tfmx-processor.js` (`--target no-modules` glue loaded via `importScripts`,
+      `initSync` from a transferred `WebAssembly.Module`, calls the 8.2 wrapper's
+      `render`/`set_song` from `process()`, applies 9.1's conversion) + main-thread bootstrap
+      (fetch+compile the `.wasm` once, `audioContext.audioWorklet.addModule(...)`, post the
+      compiled module and file bytes to the worklet node). — *check: manual run — constructing the
+      node and starting the context produces audible output from a corpus module* *(Opus 5)*
+
+### Phase 10 — Demo page
+
+- [ ] **10.1** Static HTML/CSS/JS page, no bundler: a drop zone accepting two files, paired by the
+      existing `mdat.*`/`smpl.*` filename convention (`testdata/`, `docs/format.md`) — a visible
+      error if the pair doesn't resolve unambiguously; play/pause, song-select, wired to the
+      worklet node's message port. — *check: manual run in a real browser — drag a corpus
+      mdat/smpl pair in, hear it play; pause/resume is silent and gapless; song-switch changes
+      what's audible (same bar as 7.2)* *(Sonnet 5)*
+
+M3 is complete when Phase 10 is checked off. Stop there for explicit approval before any "Beyond"
+work.
+
+---
+
 ## Later milestones
 
-- **M3 — Web:** `tfmx-web` wasm-bindgen wrapper, AudioWorklet processor, minimal demo page with
-  drag-and-drop for mdat/smpl.
 - **Beyond:** TFMX 7V support (a separate parser path — the format is substantially different,
   not a flag), GemX macro opcodes, tools (pattern dump, sample export).
 
