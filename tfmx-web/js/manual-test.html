@@ -1,0 +1,52 @@
+<!doctype html>
+<title>tfmx-web AudioWorklet manual test (step 9.2)</title>
+<p>
+  Run <code>sh ../build-wasm.sh</code> first, then serve this directory over http(s) --
+  <code>python3 -m http.server</code> from <code>tfmx-web/js</code> -- module fetch and
+  <code>audioWorklet.addModule</code> both refuse <code>file://</code>. Pick a corpus
+  <code>mdat.*</code>/<code>smpl.*</code> pair from <code>testdata/</code>, then Play.
+</p>
+<p>
+  <label>mdat <input id="mdat" type="file" /></label><br />
+  <label>smpl <input id="smpl" type="file" /></label><br />
+  <button id="play">Play</button>
+</p>
+<pre id="log"></pre>
+<script src="tfmx-bootstrap.js"></script>
+<script>
+  const log = (msg) => {
+    document.getElementById('log').textContent += msg + '\n';
+  };
+
+  document.getElementById('play').addEventListener('click', async () => {
+    try {
+      const mdatFile = document.getElementById('mdat').files[0];
+      const smplFile = document.getElementById('smpl').files[0];
+      if (!mdatFile || !smplFile) {
+        log('pick both files first');
+        return;
+      }
+
+      const [mdat, smpl] = await Promise.all([
+        mdatFile.arrayBuffer().then((b) => new Uint8Array(b)),
+        smplFile.arrayBuffer().then((b) => new Uint8Array(b)),
+      ]);
+
+      const audioContext = new AudioContext();
+      log(`audioContext.state after construction: ${audioContext.state}`);
+      await audioContext.resume();
+      log(`audioContext.state after resume(): ${audioContext.state}`);
+
+      const node = await createTfmxWorkletNode(audioContext, {
+        wasmUrl: 'generated/tfmx_web_bg.wasm',
+        processorUrl: 'tfmx-processor.js',
+        mdat,
+        smpl,
+      });
+      log('playing');
+    } catch (e) {
+      log(`ERROR: ${e}`);
+      throw e;
+    }
+  });
+</script>

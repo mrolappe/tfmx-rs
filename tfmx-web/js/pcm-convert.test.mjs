@@ -1,8 +1,6 @@
-// Plain assert-based check, no framework -- run with `node pcm-convert.test.js`.
-'use strict';
-
-const assert = require('node:assert/strict');
-const { interleavedI16ToPlanarF32 } = require('./pcm-convert.js');
+// Plain assert-based check, no framework -- run with `node pcm-convert.test.mjs`.
+import assert from 'node:assert/strict';
+import { interleavedI16ToPlanarF32 } from './pcm-convert.mjs';
 
 // 3 stereo frames: L/R pairs picked to hit zero and both extremes.
 const interleaved = new Int16Array([0, 0, 32767, -32768, 100, -100]);

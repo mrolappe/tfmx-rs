@@ -4,10 +4,10 @@
 >
 > | | |
 > |---|---|
-> | **Next step** | 9.2 — `tfmx-processor.js` AudioWorklet glue + main-thread bootstrap. |
-> | **Phase** | 9 of 10 (M3) — AudioWorklet integration — approved, in progress |
+> | **Next step** | 10.1 — Static HTML/CSS/JS demo page (drop zone, play/pause, song-select), no bundler, wired to 9.2's worklet node. |
+> | **Phase** | 9 of 10 (M3) — AudioWorklet integration — approved, complete |
 > | **Gate** | M3 approved to start. Stop for explicit approval at the end of Phase 10 before any "Beyond" work. Known open issue carried over: `docs/status.md`'s "Open follow-up" section — a human listening pass found `apidya (title)` (and to a lesser extent a `turrican` module) still doesn't sound right even after the confirmed `frac`-reset fix in `Paula::set_dma`. Not blocking M2/M3, but not to be assumed fixed either — see that doc before touching playback correctness again. |
-> | **Last done** | 9.1 · `tfmx-web/js/pcm-convert.js`'s `interleavedI16ToPlanarF32`: interleaved `i16` → planar `f32` per channel, filled in place into existing `Float32Array`s (no allocation), scaled by 32768 to match `tfmx-play`'s 7.1 `i16_to_f32`. Dual-loadable (`module.exports` guarded for reuse via `importScripts` in 9.2) — confirmed by plain assert-based `node pcm-convert.test.js` (no framework), known interleaved input → expected per-channel output |
+> | **Last done** | 9.2 · `tfmx-web/js/tfmx-processor.js` (AudioWorklet processor) + `tfmx-web/js/tfmx-bootstrap.js` (main-thread setup). Corrects a wrong assumption baked into this phase's original planning: AudioWorklet processor modules are always ES modules per the Worklet spec (no `importScripts`, confirmed against real browsers), so the wasm glue is built with wasm-bindgen `--target web`, not `--target no-modules` (`tfmx-web/build-wasm.sh`, needs `[lib] crate-type = ["cdylib", "rlib"]` added to `Cargo.toml`). `tfmx-web/js/text-decoder-polyfill.mjs` fills a real platform gap: `AudioWorkletGlobalScope` has no `TextDecoder`, which the generated glue needs for Rust error strings. The bootstrap connects the node to `audioContext.destination` *before* the init handshake, not after — a worklet's incoming message queue is only pumped while its `process()` is running, which itself requires a live graph connection, so sending `init` to an unconnected node deadlocks. — confirmed manually (`tfmx-web/js/manual-test.html`, served over http, corpus mdat/smpl pair): audible playback in Safari and Firefox. Does not work in Brave specifically (main→worklet `postMessage` never delivered, worklet→main is fine, reproduces with extensions off) — not pursued further since Safari/Firefox both confirm the implementation itself is correct. |
 >
 > Update this block in the same commit that ticks a checkbox.
 
@@ -326,12 +326,22 @@ the only build step.
       exactly like `tfmx-play`'s 7.1 format-conversion function. — *check: plain `assert`-based
       Node script (`node test.js`, no framework), known input → expected per-channel output*
       *(Sonnet 5)*
-- [ ] **9.2** `tfmx-processor.js` (`--target no-modules` glue loaded via `importScripts`,
+- [x] **9.2** `tfmx-processor.js` (`--target no-modules` glue loaded via `importScripts`,
       `initSync` from a transferred `WebAssembly.Module`, calls the 8.2 wrapper's
       `render`/`set_song` from `process()`, applies 9.1's conversion) + main-thread bootstrap
       (fetch+compile the `.wasm` once, `audioContext.audioWorklet.addModule(...)`, post the
       compiled module and file bytes to the worklet node). — *check: manual run — constructing the
       node and starting the context produces audible output from a corpus module* *(Opus 5)*
+
+> Finding from 9.2: the plan's `--target no-modules` + `importScripts` design was wrong.
+> AudioWorklet processor modules are always ES modules per the Worklet spec, in every browser --
+> there is no `importScripts` in `AudioWorkletGlobalScope`, unlike dedicated/shared workers. Built
+> with `wasm-bindgen --target web` instead, loaded via ordinary static `import`. Two further
+> platform gaps, both real, not code bugs: `AudioWorkletGlobalScope` has no `TextDecoder` (needed
+> by the generated glue for Rust error strings, worked around with a small polyfill), and a
+> worklet's incoming message queue is only pumped while its `process()` is running, which itself
+> needs a live connection to the destination -- so the main thread must `connect()` the node
+> *before* handshaking init data over its port, not after.
 
 ### Phase 10 — Demo page
 

@@ -8,6 +8,11 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[lib]
+# cdylib: build-wasm.sh needs a linked `.wasm` for wasm-bindgen to process
+# (step 9.2). rlib: keeps plain host `cargo test -p tfmx-web` working.
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 tfmx = { path = "../tfmx" }
 
