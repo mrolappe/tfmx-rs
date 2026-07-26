@@ -286,3 +286,29 @@ block at the end of `lint` plus one test; a new output format is a new `write_re
 
 `tfmx-cli info` is static as of this step: header text, layout and the song/tempo table, no
 playback. Everything that needed a render moved here.
+
+## Update (2026-07-26, step 11.6): mutation robustness test, and the `0x7F` mask is no longer the panic guard
+
+`tfmx/tests/mutation_robustness.rs` is a new integration test: a hand-rolled 64-bit LCG (no
+dependency) flips one random byte in a clone of each corpus `mdat` or `smpl` buffer, 300 times per
+module across all 10 modules (3,000 mutations total), and asserts that `Module::parse` followed by
+a 1 s `Player::render` never panics — `Err` from either call is accepted, only a panic fails the
+test. It passes clean against the current corpus and current code (~13 s in debug).
+
+**The step's own suggested negative control does not reproduce.** Reverting the `number & 0x7F`
+mask in `sequencer.rs::decode_track_word` (letting an unstated `$81`-`$FD` trackstep byte reach
+`PatternRunner::new` unmasked) does **not** make the test fail: `Module::pattern` /
+`pointer_table_entry` already reject any out-of-range pattern number with `Err(AccessError::OutOfRange)`
+via checked arithmetic and `slice::get`, so the value flows through as a normal error return, not a
+panic. Tracing it further, every pointer-table and trackstep-line accessor in `module.rs`
+(`trackstep_line`, `sample`, `pointer_table_entry`) is already `checked_add` + `.get()` all the way
+down, and every corpus-derived array index elsewhere (`voice_of`'s `& 0x03`, `UnsupportedOps`'
+256-entry table, `Sequencer::new`'s `song >= 32` guard) is independently bounds-checked. The mask is
+now a *value-tolerance* decision (whether `$81`-`$FD` is accepted as a masked pattern number or
+rejected outright), not a safety-critical guard — that guard already lives in `pointer_table_entry`
+and was evidently hardened after the step 6.1/10.1 incidents the roadmap cites. This is a good sign
+for the codebase, not a gap in the test: to confirm the harness itself still catches real
+regressions, `Module::trackstep_line`'s `.get(start..end)` was temporarily swapped for direct
+`&self.mdat[start..end]` indexing (reintroducing exactly the step-10.1 bug class) and the mutation
+test failed immediately, reporting the panicking module, mutation index, byte offset and flip byte;
+the change was then reverted. No source outside the new test file is different from before this step.
