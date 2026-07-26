@@ -4,10 +4,10 @@
 >
 > | | |
 > |---|---|
-> | **Next step** | 8.2 — Thin `#[wasm_bindgen]` wrapper around 8.1's core. |
-> | **Phase** | 8 of 10 (M3) — `tfmx-web` core + wasm boundary — approved, in progress |
+> | **Next step** | 9.1 — Pure JS conversion function: interleaved `i16` → planar `f32`. |
+> | **Phase** | 9 of 10 (M3) — AudioWorklet integration — approved, in progress |
 > | **Gate** | M3 approved to start. Stop for explicit approval at the end of Phase 10 before any "Beyond" work. Known open issue carried over: `docs/status.md`'s "Open follow-up" section — a human listening pass found `apidya (title)` (and to a lesser extent a `turrican` module) still doesn't sound right even after the confirmed `frac`-reset fix in `Paula::set_dma`. Not blocking M2/M3, but not to be assumed fixed either — see that doc before touching playback correctness again. |
-> | **Last done** | 8.1 · `tfmx-web` plain-Rust core (`Core::new`/`render`/`set_song`, leak-to-`'static` mirroring `tfmx-play`'s 7.2 approach) — confirmed by `cargo test -p tfmx-web`: constructs from a corpus module, renders non-silent output, `set_song` changes what renders |
+> | **Last done** | 8.2 · Thin `#[wasm_bindgen]` wrapper `TfmxWeb::new`/`render`/`set_song` over 8.1's `Core`, target-gated to `wasm32` via `Cargo.toml` and `#[cfg(target_arch = "wasm32")]` — confirmed by `wasm-bindgen-test` (Node target, `wasm-bindgen-cli` 0.2.126) constructing from corpus bytes and rendering non-silent output, plus `cargo build -p tfmx-web --target wasm32-unknown-unknown --target-dir target/wasm` |
 >
 > Update this block in the same commit that ticks a checkbox.
 
@@ -312,7 +312,7 @@ the only build step.
       mirroring `tfmx-play`'s 7.2 approach). — *check: `cargo test -p tfmx-web` on the host target
       covers construction from a corpus module, `render()` producing non-silent/non-`NaN` output,
       and `set_song` switching songs* *(Sonnet 5)*
-- [ ] **8.2** Thin `#[wasm_bindgen]` wrapper: `TfmxWeb::new(mdat: &[u8], smpl: &[u8], sample_rate:
+- [x] **8.2** Thin `#[wasm_bindgen]` wrapper: `TfmxWeb::new(mdat: &[u8], smpl: &[u8], sample_rate:
       u32) -> Result<TfmxWeb, JsError>`, `render`, `set_song`, delegating straight to 8.1's core. —
       *check: `wasm-bindgen-test` (Node target) constructs a `TfmxWeb` from a corpus module's
       bytes, renders a block, asserts non-empty/non-panicking output; `cargo build -p tfmx-web

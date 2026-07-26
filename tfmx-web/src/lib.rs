@@ -4,6 +4,11 @@
 //! with the JS glue present). Step 8.2 adds a thin `#[wasm_bindgen]` shell
 //! around `Core` that only marshals `&[u8]`/`Uint8Array` and maps errors.
 
+#[cfg(target_arch = "wasm32")]
+mod wasm;
+#[cfg(target_arch = "wasm32")]
+pub use wasm::TfmxWeb;
+
 /// A parsed module and its current `Player`. `mdat`/`smpl` and the parsed
 /// `Module` are leaked to `'static` on construction, mirroring `tfmx-play`'s
 /// realtime state (step 7.2): a `Core`'s lifetime is already the whole
