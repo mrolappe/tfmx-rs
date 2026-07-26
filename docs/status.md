@@ -113,3 +113,73 @@ document's own "Remaining gap" section already recommends: an actual `uade123` A
 correlation, not "does this sound like a coherent song at all"), and re-running the trackstep/
 pattern trace diagnostic from the conversation (distinct patterns per track, notes triggered,
 command histogram) against `uade123`'s own known-correct behavior if that becomes observable.
+
+## Update (2026-07-26, step 11.2): `apidya (title)` is TFMX 7V — the wrong format entirely
+
+Before the stems listening pass, `uade123 -g` (info-only, no playback — the file-format probe
+this player exposes for free) was run against every corpus module to read back which eagleplayer
+it auto-detects:
+
+| module | `uade123` playername |
+|---|---|
+| apidya (title) | **TFMX 7V** |
+| apidya (level 1) | TFMX Pro |
+| turrican 2 level 1-desert | TFMX Pro |
+| turrican 2 level 3-flight | TFMX Pro |
+| turrican 2 title (st) | TFMX Pro |
+| turrican 3 level 1 | TFMX Pro |
+| r-type | TFMX |
+| turrican intro | TFMX |
+| turrican outside | TFMX |
+| x-out (title) | TFMX |
+
+**`apidya (title)` is the only corpus file `uade123` identifies as TFMX 7V** — the variant
+`docs/architecture.md` §9 and `docs/playback-model.md` already document this crate as explicitly
+*not* supporting (7V multiplexes four virtual voices per hardware channel; this crate targets
+TFMX Professional 2.0 only, per [S1]/[S2]). This is a strong, likely-sufficient explanation for why
+`apidya (title)` alone renders as "one sample fragment looping continuously": the parser is reading
+7V-encoded data as if it were Pro-2.0, i.e. genuinely out-of-scope input rather than a bug in the
+Pro-2.0 implementation. `apidya (level 1)` and both `turrican 2`/`turrican 3` files are "TFMX Pro"
+(not plainly "TFMX") in `uade123`'s own naming — unclear yet whether that label tracks a real
+sub-format difference within Pro-2.0 or is just `uade123`'s internal player-module naming; not
+investigated further this pass.
+
+**Implication for corpus-wide diagnosis (step 11.5's `lint`)**: `apidya (title)`'s result should
+be interpreted as "wrong format," not folded into the same bucket as a genuine Pro-2.0 playback
+bug. Whether `turrican intro`'s issue (the one other module named in the original informal
+listening pass) is a real Pro-2.0 bug remains open — it *is* plain "TFMX" per the table above, so
+this format explanation does not apply to it.
+
+### Stems listening (step 11.2), user's own ears, `tfmx-cli render --stems`
+
+`apidya (title)`, song 0, first 5 s:
+- v0, v1, v2: each sounds like the same one sample fragment looping continuously.
+- v3: completely silent.
+
+Consistent with the TFMX 7V finding above — this is what feeding 7V data through a Pro-2.0 parser
+would plausibly produce (voices reading garbage or a stuck-region interpretation of misinterpreted
+control data; one voice reading a region that never gets DMA'd on at all).
+
+`turrican intro`, song 0, first 5 s (plain TFMX — the format this crate targets):
+- v0: two low/bass notes, then two higher notes, then another low note.
+- v1: a single note, after a several-second delay.
+- v2: a recognizable melodic line.
+- v3: several bass-drum-like hits.
+
+Nothing here reads as obviously broken by ear alone (a sparse intro voice, a melody, a drum voice,
+a bass line are all plausible parts of a game-intro arrangement) — this listen alone can't confirm
+or rule out a bug; it needs the `uade123` reference below.
+
+### `uade123` full-mix reference now available for direct A/B
+
+`uade123` has no per-voice solo/mute flag (checked `uade123 -h` in full; nothing in `--ep-option`
+is documented for it either, and per the provenance policy its source is never read to look for an
+undocumented one). But a full-mix reference render is trivial and was not on hand before this
+session: `uade123 -s <song> -t <seconds> -f out.wav "mdat.<name>"` (auto-locates the matching
+`smpl.<name>`), executed as a black box exactly like the existing step 6.2 A/B pass already does.
+Reference renders of `apidya (title)` and `turrican intro` (song 0, 10 s each) were produced this
+session to `scratchpad` for a first listen; not checked into the repo (ephemeral, regeneratable by
+the command above). The step 6.2 proxies already do this same full-mix comparison, just via
+signal-processing metrics instead of ears — this is the "actual `uade123` A/B" this document's
+"Remaining gap" section named as the most promising untried step, now finally done for real audio,
+still pending the user's own listen to the reference file.

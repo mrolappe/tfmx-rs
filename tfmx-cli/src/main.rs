@@ -31,6 +31,47 @@ struct RenderArgs {
     rate: u32,
     #[arg(long, default_value_t = 100)]
     separation: u8,
+    /// Mute every voice except this one (0-3).
+    #[arg(long)]
+    solo: Option<u8>,
+    /// Mute these voices (0-3), comma-separated. Ignored if `--solo` is set.
+    #[arg(long, value_delimiter = ',')]
+    mute: Vec<u8>,
+    /// Also render four per-voice stems (soloing each voice in turn),
+    /// filenames derived from `-o` (`out.wav` -> `out-v0.wav` .. `out-v3.wav`).
+    #[arg(long)]
+    stems: bool,
+}
+
+/// `--solo`/`--mute` -> a per-voice mute mask. `--solo` wins if both are given.
+/// Voice numbers outside 0-3 wrap, matching `Player`'s own `voice_of` masking.
+fn resolve_mute_mask(solo: Option<u8>, mute: &[u8]) -> [bool; 4] {
+    if let Some(solo) = solo {
+        let solo = (solo & 0x03) as usize;
+        return core::array::from_fn(|i| i != solo);
+    }
+    let mut mask = [false; 4];
+    for &voice in mute {
+        mask[(voice & 0x03) as usize] = true;
+    }
+    mask
+}
+
+/// `out.wav` -> `out-v0.wav` .. `out-v3.wav`, preserving directory and
+/// extension (or its absence).
+fn derive_stem_paths(output: &std::path::Path) -> [PathBuf; 4] {
+    let stem = output
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("out");
+    let ext = output.extension().and_then(|s| s.to_str());
+    core::array::from_fn(|voice| {
+        let file_name = match ext {
+            Some(ext) => format!("{stem}-v{voice}.{ext}"),
+            None => format!("{stem}-v{voice}"),
+        };
+        output.with_file_name(file_name)
+    })
 }
 
 #[derive(clap::Args)]
@@ -89,11 +130,16 @@ impl std::fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
-fn run_render(args: &RenderArgs) -> Result<(), CliError> {
-    let mdat = std::fs::read(&args.mdat)?;
-    let smpl = std::fs::read(&args.smpl)?;
-    let module = tfmx::Module::parse(&mdat, &smpl)?;
-    let mut player = tfmx::Player::new(&module, args.song, args.rate, args.separation)?;
+fn render_to_wav(
+    module: &tfmx::Module,
+    args: &RenderArgs,
+    mute: [bool; 4],
+    output: &std::path::Path,
+) -> Result<(), CliError> {
+    let mut player = tfmx::Player::new(module, args.song, args.rate, args.separation)?;
+    for voice in 0..4u8 {
+        player.set_voice_muted(voice, mute[voice as usize]);
+    }
 
     let spec = hound::WavSpec {
         channels: 2,
@@ -101,7 +147,7 @@ fn run_render(args: &RenderArgs) -> Result<(), CliError> {
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
-    let mut writer = hound::WavWriter::create(&args.output, spec)?;
+    let mut writer = hound::WavWriter::create(output, spec)?;
 
     let total_frames = args.rate as usize * args.seconds as usize;
     let mut buf = vec![0i16; 4096 * 2];
@@ -117,6 +163,23 @@ fn run_render(args: &RenderArgs) -> Result<(), CliError> {
     }
     writer.finalize()?;
     Ok(())
+}
+
+fn run_render(args: &RenderArgs) -> Result<(), CliError> {
+    let mdat = std::fs::read(&args.mdat)?;
+    let smpl = std::fs::read(&args.smpl)?;
+    let module = tfmx::Module::parse(&mdat, &smpl)?;
+
+    if args.stems {
+        for (voice, path) in derive_stem_paths(&args.output).into_iter().enumerate() {
+            let mask = resolve_mute_mask(Some(voice as u8), &[]);
+            render_to_wav(&module, args, mask, &path)?;
+        }
+        return Ok(());
+    }
+
+    let mask = resolve_mute_mask(args.solo, &args.mute);
+    render_to_wav(&module, args, mask, &args.output)
 }
 
 fn run_info(args: &InfoArgs, out: &mut impl std::io::Write) -> Result<(), CliError> {
@@ -285,6 +348,9 @@ mod tests {
             seconds: 1,
             rate: 44_100,
             separation: 100,
+            solo: None,
+            mute: Vec::new(),
+            stems: false,
         };
         run_render(&args).expect("render succeeds on a valid corpus file");
 
@@ -296,5 +362,58 @@ mod tests {
         assert_eq!(reader.duration(), 44_100, "WAV must hold exactly 1 second");
 
         std::fs::remove_file(&output).ok();
+    }
+
+    #[test]
+    fn resolve_mute_mask_with_neither_flag_mutes_nothing() {
+        assert_eq!(resolve_mute_mask(None, &[]), [false; 4]);
+    }
+
+    #[test]
+    fn resolve_mute_mask_mutes_the_listed_voices() {
+        assert_eq!(
+            resolve_mute_mask(None, &[1, 3]),
+            [false, true, false, true]
+        );
+    }
+
+    #[test]
+    fn resolve_mute_mask_solo_mutes_every_other_voice() {
+        assert_eq!(resolve_mute_mask(Some(2), &[]), [true, true, false, true]);
+    }
+
+    #[test]
+    fn resolve_mute_mask_solo_overrides_mute_list() {
+        assert_eq!(
+            resolve_mute_mask(Some(0), &[1, 2, 3]),
+            [false, true, true, true]
+        );
+    }
+
+    #[test]
+    fn derive_stem_paths_appends_voice_suffix_before_extension() {
+        let paths = derive_stem_paths(std::path::Path::new("out.wav"));
+        assert_eq!(
+            paths,
+            [
+                PathBuf::from("out-v0.wav"),
+                PathBuf::from("out-v1.wav"),
+                PathBuf::from("out-v2.wav"),
+                PathBuf::from("out-v3.wav"),
+            ]
+        );
+    }
+
+    #[test]
+    fn derive_stem_paths_preserves_directory() {
+        let paths = derive_stem_paths(std::path::Path::new("/tmp/foo/out.wav"));
+        assert_eq!(paths[0], PathBuf::from("/tmp/foo/out-v0.wav"));
+        assert_eq!(paths[3], PathBuf::from("/tmp/foo/out-v3.wav"));
+    }
+
+    #[test]
+    fn derive_stem_paths_without_extension_has_no_dot() {
+        let paths = derive_stem_paths(std::path::Path::new("out"));
+        assert_eq!(paths[0], PathBuf::from("out-v0"));
     }
 }
