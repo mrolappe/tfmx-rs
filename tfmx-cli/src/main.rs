@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -15,10 +16,12 @@ struct Cli {
 enum Command {
     /// Render a song to a WAV file.
     Render(RenderArgs),
-    /// Print header text, songs, tempos, layout and unsupported opcodes seen.
+    /// Print header text, songs, tempos and layout -- static, no playback.
     Info(InfoArgs),
     /// Print the state-machine trace of a render: one line per event.
     Trace(TraceArgs),
+    /// Run a song and report what the trace and the PCM say about it.
+    Lint(LintArgs),
 }
 
 #[derive(clap::Args)]
@@ -82,9 +85,14 @@ fn derive_stem_paths(output: &std::path::Path) -> [PathBuf; 4] {
 struct InfoArgs {
     mdat: PathBuf,
     smpl: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct LintArgs {
+    mdat: PathBuf,
+    smpl: PathBuf,
     #[arg(long, default_value_t = 0)]
     song: u8,
-    /// How long to run the song for while collecting the unsupported-opcode histogram.
     #[arg(long, default_value_t = 30)]
     seconds: u32,
 }
@@ -232,31 +240,6 @@ fn run_info(args: &InfoArgs, out: &mut impl std::io::Write) -> Result<(), CliErr
         )?;
     }
 
-    const SAMPLE_RATE: u32 = 44_100;
-    const SEPARATION: u8 = 100;
-    let mut player = tfmx::Player::new(&module, args.song, SAMPLE_RATE, SEPARATION)?;
-    let total_frames = SAMPLE_RATE as usize * args.seconds as usize;
-    let mut buf = vec![0i16; 4096 * 2];
-    let mut frames_left = total_frames;
-    while frames_left > 0 {
-        let chunk_frames = frames_left.min(4096);
-        player.render(&mut buf[..chunk_frames * 2])?;
-        frames_left -= chunk_frames;
-    }
-
-    writeln!(out, "Unsupported ops:")?;
-    let mut any = false;
-    for opcode in 0..=255u8 {
-        let count = player.unsupported_ops().get(opcode);
-        if count > 0 {
-            writeln!(out, "  ${opcode:02X}: {count}")?;
-            any = true;
-        }
-    }
-    if !any {
-        writeln!(out, "  (none)")?;
-    }
-
     Ok(())
 }
 
@@ -358,12 +341,319 @@ fn run_trace(args: &TraceArgs, out: &mut impl Write) -> Result<(), CliError> {
     Ok(())
 }
 
+/// One thing worth looking at, named so a test (and a grep over a corpus
+/// run) can key on it. `detail` says which voice/opcode/second it is about.
+#[derive(Debug)]
+struct Finding {
+    name: &'static str,
+    detail: String,
+}
+
+/// Everything `lint` has to say about one render: the summary the roadmap
+/// lists, plus the findings derived from it.
+#[derive(Debug, Default)]
+struct Report {
+    jiffies: u64,
+    frames: u64,
+    tempos: BTreeSet<u16>,
+    /// Distinct trackstep line indices visited.
+    lines: BTreeSet<u16>,
+    /// A line index was revisited after some other line ran in between.
+    looped: bool,
+    /// Frame of the first jiffy that saw the player already halted.
+    stopped_at: Option<u64>,
+    /// Distinct pattern numbers executed, per track.
+    patterns: [BTreeSet<u8>; 8],
+    /// Distinct macro numbers triggered, per voice.
+    macros: [BTreeSet<u8>; 4],
+    note_ons: [u32; 4],
+    /// Pattern commands by variant name (`Wait`, `Loop`, ...).
+    commands: BTreeMap<String, u32>,
+    unsupported: Vec<(u8, u32)>,
+    peak: i32,
+    clipped: usize,
+    samples: usize,
+    findings: Vec<Finding>,
+}
+
+/// Same period, volume and sample region with DMA on for longer than this
+/// means the voice is stuck, not sustaining.
+const FROZEN_SECONDS: f64 = 2.0;
+/// Peak amplitude below this (of 32767) is silence for reporting purposes.
+const SILENCE_PEAK: i32 = 32;
+/// Fraction of full-scale samples above which the mix is judged to clip.
+const CLIP_FRACTION: f64 = 0.001;
+
+/// The whole of `lint`'s analysis, as a pure function: `events` is the trace
+/// of a render, `unsupported` its `(opcode, count)` pairs and `pcm` the
+/// interleaved stereo samples it produced. Nothing here touches a `Player`
+/// or the filesystem, so every finding is drivable from a hand-built vector.
+///
+/// The unsupported-opcode counts and the PCM cannot come out of the event
+/// stream (they live on `Player::unsupported_ops` and in the output buffer),
+/// so they are passed in alongside it rather than being smuggled into
+/// `TraceEvent` -- keeping the trace seam what `docs/architecture.md` §2
+/// says it is, a record of state-machine transitions only.
+fn lint(events: &[TraceEvent], unsupported: &[(u8, u32)], pcm: &[i16], rate: u32) -> Report {
+    let mut r = Report {
+        unsupported: unsupported.iter().copied().filter(|&(_, n)| n > 0).collect(),
+        ..Default::default()
+    };
+
+    // Per-voice state carried across the fold.
+    let mut alive = [false; 4];
+    /// (period, volume, start, len) -- what "unchanged" means for a voice.
+    type VoiceKey = (u16, u8, u32, u32);
+    let mut held: [Option<(VoiceKey, u64)>; 4] = [None; 4];
+    let mut frozen_max = [0u64; 4];
+    let mut regions: [BTreeSet<(u32, u32)>; 4] = Default::default();
+
+    let mut frame = 0u64;
+    let mut last_line: Option<u16> = None;
+
+    for e in events {
+        match e {
+            TraceEvent::Jiffy {
+                frame: f,
+                line,
+                tempo,
+                stopped,
+            } => {
+                frame = *f;
+                r.frames = r.frames.max(*f);
+                r.jiffies += 1;
+                r.tempos.insert(*tempo);
+                if last_line != Some(*line) {
+                    if r.lines.contains(line) {
+                        r.looped = true;
+                    }
+                    last_line = Some(*line);
+                }
+                r.lines.insert(*line);
+                if *stopped && r.stopped_at.is_none() {
+                    r.stopped_at = Some(*f);
+                }
+            }
+            TraceEvent::Trackstep(_) => {}
+            TraceEvent::Pattern {
+                track,
+                pattern,
+                entry,
+                ..
+            } => {
+                r.patterns[(*track as usize) & 7].insert(*pattern);
+                if let tfmx::PatternEntry::Command(c) = entry {
+                    // Variant name off `Debug` -- one histogram key per
+                    // command without a 16-arm match to keep in sync.
+                    let name = format!("{c:?}");
+                    let name = name.split([' ', '(']).next().unwrap_or(&name).to_string();
+                    *r.commands.entry(name).or_default() += 1;
+                }
+            }
+            TraceEvent::Trigger {
+                voice,
+                macro_number,
+                ..
+            } => {
+                let v = (*voice as usize) & 3;
+                r.macros[v].insert(*macro_number);
+                r.note_ons[v] += 1;
+            }
+            TraceEvent::Voice { voice, state } => {
+                let v = (*voice as usize) & 3;
+                if !state.dma_on {
+                    held[v] = None;
+                    continue;
+                }
+                alive[v] = true;
+                regions[v].insert((state.start, state.len));
+                let key = (state.period, state.volume, state.start, state.len);
+                match held[v] {
+                    Some((k, since)) if k == key => {
+                        frozen_max[v] = frozen_max[v].max(frame.saturating_sub(since));
+                    }
+                    _ => held[v] = Some((key, frame)),
+                }
+            }
+        }
+    }
+
+    r.samples = pcm.len();
+    r.peak = pcm.iter().map(|&s| (s as i32).abs()).max().unwrap_or(0);
+    r.clipped = pcm
+        .iter()
+        .filter(|&&s| s == i16::MIN || s == i16::MAX)
+        .count();
+
+    let seconds = |frames: u64| frames as f64 / rate.max(1) as f64;
+    let frozen_frames = (FROZEN_SECONDS * rate as f64) as u64;
+
+    let dead: Vec<String> = (0..4)
+        .filter(|&v| !alive[v])
+        .map(|v| v.to_string())
+        .collect();
+    if !dead.is_empty() {
+        r.findings.push(Finding {
+            name: "dead-voice",
+            detail: format!("DMA never on for voice(s) {}", dead.join(", ")),
+        });
+    }
+
+    for v in 0..4 {
+        if frozen_max[v] > frozen_frames {
+            r.findings.push(Finding {
+                name: "frozen-voice",
+                detail: format!(
+                    "voice {v}: period/volume/region unchanged for {:.1} s with DMA on",
+                    seconds(frozen_max[v])
+                ),
+            });
+        }
+        if alive[v] && regions[v].len() <= 1 {
+            // The region itself matters: `start=0 len=0` is a voice that is
+            // on but playing nothing, a real fragment is one stuck sample.
+            let (start, len) = regions[v].iter().next().copied().unwrap_or((0, 0));
+            r.findings.push(Finding {
+                name: "no-retrigger",
+                detail: format!(
+                    "voice {v}: one sample region for the whole run (start={start} len={len})"
+                ),
+            });
+        }
+    }
+
+    let distinct_patterns: BTreeSet<u8> = r.patterns.iter().flatten().copied().collect();
+    if distinct_patterns.len() == 1 {
+        r.findings.push(Finding {
+            name: "single-pattern",
+            detail: format!("only pattern {:?} ever ran", distinct_patterns),
+        });
+    }
+
+    if let Some(at) = r.stopped_at {
+        r.findings.push(Finding {
+            name: "stopped-early",
+            detail: format!(
+                "player halted at {:.1} s of {:.1} s",
+                seconds(at),
+                seconds(r.frames)
+            ),
+        });
+    }
+
+    if !pcm.is_empty() && r.peak < SILENCE_PEAK {
+        r.findings.push(Finding {
+            name: "silence",
+            detail: format!("peak amplitude {} of 32767", r.peak),
+        });
+    }
+
+    if !pcm.is_empty() && r.clipped as f64 > CLIP_FRACTION * pcm.len() as f64 {
+        r.findings.push(Finding {
+            name: "clipping",
+            detail: format!(
+                "{} of {} samples at full scale ({:.2}%)",
+                r.clipped,
+                pcm.len(),
+                100.0 * r.clipped as f64 / pcm.len() as f64
+            ),
+        });
+    }
+
+    if !r.unsupported.is_empty() {
+        let list: Vec<String> = r
+            .unsupported
+            .iter()
+            .map(|(op, n)| format!("${op:02X}x{n}"))
+            .collect();
+        r.findings.push(Finding {
+            name: "unsupported-ops",
+            detail: list.join(" "),
+        });
+    }
+
+    r
+}
+
+fn write_report(r: &Report, out: &mut impl Write) -> std::io::Result<()> {
+    writeln!(out, "Jiffies: {}", r.jiffies)?;
+    writeln!(out, "Tempos: {:?}", r.tempos)?;
+    writeln!(
+        out,
+        "Trackstep lines: {} distinct, looped={}, stopped={}",
+        r.lines.len(),
+        r.looped,
+        r.stopped_at.is_some()
+    )?;
+    for (track, patterns) in r.patterns.iter().enumerate() {
+        if !patterns.is_empty() {
+            writeln!(out, "Track {track}: {} patterns {patterns:?}", patterns.len())?;
+        }
+    }
+    for voice in 0..4 {
+        writeln!(
+            out,
+            "Voice {voice}: {} note-ons, macros {:?}",
+            r.note_ons[voice], r.macros[voice]
+        )?;
+    }
+    writeln!(out, "Pattern commands: {:?}", r.commands)?;
+    if r.unsupported.is_empty() {
+        writeln!(out, "Unsupported ops: (none)")?;
+    } else {
+        writeln!(out, "Unsupported ops:")?;
+        for (op, n) in &r.unsupported {
+            writeln!(out, "  ${op:02X}: {n}")?;
+        }
+    }
+    writeln!(
+        out,
+        "PCM: {} samples, peak {}, {} clipped",
+        r.samples, r.peak, r.clipped
+    )?;
+    if r.findings.is_empty() {
+        writeln!(out, "Findings: (none)")?;
+    } else {
+        writeln!(out, "Findings:")?;
+        for f in &r.findings {
+            writeln!(out, "  {}: {}", f.name, f.detail)?;
+        }
+    }
+    Ok(())
+}
+
+fn run_lint(args: &LintArgs, out: &mut impl Write) -> Result<(), CliError> {
+    let mdat = std::fs::read(&args.mdat)?;
+    let smpl = std::fs::read(&args.smpl)?;
+    let module = tfmx::Module::parse(&mdat, &smpl)?;
+
+    const SAMPLE_RATE: u32 = 44_100;
+    const SEPARATION: u8 = 100;
+    let mut player = tfmx::Player::new(&module, args.song, SAMPLE_RATE, SEPARATION)?;
+
+    let total_frames = SAMPLE_RATE as usize * args.seconds as usize;
+    let mut events = Vec::new();
+    let mut pcm = vec![0i16; total_frames * 2];
+    for chunk in pcm.chunks_mut(4096 * 2) {
+        player.render_traced(chunk, |e| events.push(e))?;
+    }
+    let unsupported: Vec<(u8, u32)> = (0..=255u8)
+        .map(|op| (op, player.unsupported_ops().get(op)))
+        .filter(|&(_, n)| n > 0)
+        .collect();
+
+    let report = lint(&events, &unsupported, &pcm, SAMPLE_RATE);
+    write_report(&report, out)?;
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
     let result = match &cli.command {
         Command::Render(args) => run_render(args),
         Command::Info(args) => run_info(args, &mut std::io::stdout().lock()),
         Command::Trace(args) => run_trace(args, &mut std::io::stdout().lock()),
+        Command::Lint(args) => run_lint(args, &mut std::io::stdout().lock()),
     };
     if let Err(e) = result {
         eprintln!("tfmx-cli: {e}");
@@ -400,12 +690,7 @@ mod tests {
         };
         let smpl = corpus_path("smpl.turrican intro").expect("smpl present alongside mdat");
 
-        let args = InfoArgs {
-            mdat,
-            smpl,
-            song: 0,
-            seconds: 1,
-        };
+        let args = InfoArgs { mdat, smpl };
         let mut out = Vec::new();
         run_info(&args, &mut out).expect("info succeeds on a valid corpus file");
         let text = String::from_utf8(out).expect("output is UTF-8");
@@ -414,7 +699,10 @@ mod tests {
         assert!(text.contains("Layout: Fixed"));
         assert!(text.contains("0: start=75 end=129 tempo=3"));
         assert!(text.contains("1: start=52 end=74 tempo=120"));
-        assert!(text.contains("Unsupported ops:"));
+        assert!(
+            !text.contains("Unsupported ops:"),
+            "info is static since step 11.5 -- playback findings live in `lint`"
+        );
     }
 
     /// Step 5.2's roadmap check: `info` runs across the whole corpus.
@@ -440,12 +728,7 @@ mod tests {
             };
             let smpl = corpus_path(&format!("smpl.{name}")).expect("smpl present alongside mdat");
 
-            let args = InfoArgs {
-                mdat,
-                smpl,
-                song: 0,
-                seconds: 1,
-            };
+            let args = InfoArgs { mdat, smpl };
             let mut out = Vec::new();
             run_info(&args, &mut out).unwrap_or_else(|e| panic!("{name}: {e}"));
         }
@@ -672,6 +955,323 @@ mod tests {
         write_trace(&events, None, None, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert_eq!(text.matches("VOICE").count(), 2);
+    }
+
+    const RATE: u32 = 44_100;
+
+    fn jiffy(frame: u64, line: u16, stopped: bool) -> TraceEvent {
+        TraceEvent::Jiffy {
+            frame,
+            line,
+            tempo: 6,
+            stopped,
+        }
+    }
+
+    /// A voice state whose sample region is picked by `start`, so a test can
+    /// say "same region" or "new region" without touching the other fields.
+    fn region_state(start: u32, period: u16, dma_on: bool) -> tfmx::Voice {
+        let mut state = tfmx::Voice::default();
+        state.start = start;
+        state.len = 50;
+        state.period = period;
+        state.volume = 64;
+        state.dma_on = dma_on;
+        state
+    }
+
+    fn finding<'a>(report: &'a Report, name: &str) -> Option<&'a Finding> {
+        report.findings.iter().find(|f| f.name == name)
+    }
+
+    /// Enough loud, varying audio that the PCM findings stay quiet -- so a
+    /// test of an event-stream finding only ever fires that one finding.
+    fn healthy_pcm() -> Vec<i16> {
+        (0..2000).map(|i| if i % 2 == 0 { 8000 } else { -8000 }).collect()
+    }
+
+    #[test]
+    fn lint_flags_a_voice_whose_dma_never_turns_on() {
+        let events = vec![
+            jiffy(0, 0, false),
+            TraceEvent::Voice {
+                voice: 0,
+                state: region_state(100, 428, true),
+            },
+            TraceEvent::Voice {
+                voice: 3,
+                state: region_state(0, 0, false),
+            },
+        ];
+        let report = lint(&events, &[], &healthy_pcm(), RATE);
+        let f = finding(&report, "dead-voice").expect("dead-voice fires for a voice with no DMA");
+        assert!(f.detail.contains('3'), "names the dead voice: {}", f.detail);
+        assert!(!f.detail.contains('0'), "voice 0 is alive: {}", f.detail);
+    }
+
+    #[test]
+    fn lint_flags_a_voice_frozen_for_more_than_two_seconds() {
+        let state = region_state(100, 428, true);
+        let mut events = Vec::new();
+        for i in 0..=3u64 {
+            events.push(jiffy(i * RATE as u64, 0, false));
+            events.push(TraceEvent::Voice { voice: 0, state });
+        }
+        let report = lint(&events, &[], &healthy_pcm(), RATE);
+        assert!(finding(&report, "frozen-voice").is_some());
+    }
+
+    #[test]
+    fn lint_does_not_flag_a_voice_that_keeps_changing() {
+        let mut events = Vec::new();
+        for i in 0..=3u64 {
+            events.push(jiffy(i * RATE as u64, 0, false));
+            events.push(TraceEvent::Voice {
+                voice: 0,
+                state: region_state(100 + i as u32 * 10, 428 + i as u16, true),
+            });
+        }
+        let report = lint(&events, &[], &healthy_pcm(), RATE);
+        assert!(finding(&report, "frozen-voice").is_none());
+        assert!(finding(&report, "no-retrigger").is_none());
+    }
+
+    /// The `apidya (title)` symptom: the voice keeps moving, but it is always
+    /// the same sample region -- one fragment looping for the whole run.
+    #[test]
+    fn lint_flags_a_voice_whose_sample_region_never_changes() {
+        let mut events = Vec::new();
+        for i in 0..=3u64 {
+            events.push(jiffy(i * RATE as u64, 0, false));
+            events.push(TraceEvent::Voice {
+                voice: 0,
+                state: region_state(100, 428 + i as u16, true),
+            });
+        }
+        let report = lint(&events, &[], &healthy_pcm(), RATE);
+        let f = finding(&report, "no-retrigger").expect("no-retrigger fires");
+        assert!(
+            f.detail.contains("start=100"),
+            "names the stuck region: {}",
+            f.detail
+        );
+        assert!(
+            finding(&report, "frozen-voice").is_none(),
+            "a moving period is not frozen"
+        );
+    }
+
+    #[test]
+    fn lint_flags_a_run_that_only_ever_visits_one_pattern() {
+        let events = vec![
+            jiffy(0, 0, false),
+            TraceEvent::Pattern {
+                track: 0,
+                pattern: 7,
+                step: 0,
+                entry: tfmx::PatternEntry::Command(tfmx::PatternCommand::Nop),
+            },
+            TraceEvent::Pattern {
+                track: 1,
+                pattern: 7,
+                step: 1,
+                entry: tfmx::PatternEntry::Command(tfmx::PatternCommand::Nop),
+            },
+        ];
+        let report = lint(&events, &[], &healthy_pcm(), RATE);
+        assert!(finding(&report, "single-pattern").is_some());
+    }
+
+    #[test]
+    fn lint_does_not_flag_single_pattern_when_two_patterns_run() {
+        let events = vec![
+            jiffy(0, 0, false),
+            TraceEvent::Pattern {
+                track: 0,
+                pattern: 7,
+                step: 0,
+                entry: tfmx::PatternEntry::Command(tfmx::PatternCommand::Nop),
+            },
+            TraceEvent::Pattern {
+                track: 0,
+                pattern: 8,
+                step: 0,
+                entry: tfmx::PatternEntry::Command(tfmx::PatternCommand::Nop),
+            },
+        ];
+        let report = lint(&events, &[], &healthy_pcm(), RATE);
+        assert!(finding(&report, "single-pattern").is_none());
+    }
+
+    #[test]
+    fn lint_flags_a_run_that_stops_before_the_end() {
+        let events = vec![
+            jiffy(0, 0, false),
+            jiffy(RATE as u64, 1, true),
+            jiffy(2 * RATE as u64, 1, true),
+        ];
+        let report = lint(&events, &[], &healthy_pcm(), RATE);
+        let f = finding(&report, "stopped-early").expect("stopped-early fires");
+        assert!(f.detail.contains("1.0"), "reports when: {}", f.detail);
+    }
+
+    #[test]
+    fn lint_flags_a_silent_render() {
+        let events = vec![jiffy(0, 0, false)];
+        let report = lint(&events, &[], &vec![0i16; 2000], RATE);
+        assert!(finding(&report, "silence").is_some());
+    }
+
+    #[test]
+    fn lint_flags_a_clipping_render() {
+        let mut pcm = vec![1000i16; 2000];
+        pcm[..100].fill(i16::MAX);
+        let report = lint(&[jiffy(0, 0, false)], &[], &pcm, RATE);
+        let f = finding(&report, "clipping").expect("clipping fires");
+        assert!(f.detail.contains("100"), "reports the count: {}", f.detail);
+    }
+
+    #[test]
+    fn lint_does_not_flag_clipping_on_a_healthy_render() {
+        let report = lint(&[jiffy(0, 0, false)], &[], &healthy_pcm(), RATE);
+        assert!(finding(&report, "clipping").is_none());
+        assert!(finding(&report, "silence").is_none());
+    }
+
+    #[test]
+    fn lint_flags_unsupported_opcodes() {
+        let report = lint(&[jiffy(0, 0, false)], &[(0x22, 7)], &healthy_pcm(), RATE);
+        let f = finding(&report, "unsupported-ops").expect("unsupported-ops fires");
+        assert!(f.detail.contains("$22"), "names the opcode: {}", f.detail);
+    }
+
+    #[test]
+    fn lint_summarizes_jiffies_tempos_and_trackstep_lines() {
+        let events = vec![
+            TraceEvent::Jiffy {
+                frame: 0,
+                line: 0,
+                tempo: 6,
+                stopped: false,
+            },
+            TraceEvent::Jiffy {
+                frame: 100,
+                line: 1,
+                tempo: 6,
+                stopped: false,
+            },
+            TraceEvent::Jiffy {
+                frame: 200,
+                line: 0,
+                tempo: 3,
+                stopped: false,
+            },
+        ];
+        let report = lint(&events, &[], &healthy_pcm(), RATE);
+        assert_eq!(report.jiffies, 3);
+        assert_eq!(report.tempos.iter().copied().collect::<Vec<_>>(), [3, 6]);
+        assert_eq!(report.lines.len(), 2);
+        assert!(report.looped, "line 0 is revisited after line 1");
+        assert_eq!(report.stopped_at, None);
+    }
+
+    #[test]
+    fn lint_counts_patterns_macros_note_ons_and_commands() {
+        let events = vec![
+            jiffy(0, 0, false),
+            TraceEvent::Pattern {
+                track: 2,
+                pattern: 7,
+                step: 0,
+                entry: tfmx::PatternEntry::Note {
+                    note: 24,
+                    macro_number: 3,
+                    volume: 64,
+                    voice: 1,
+                    timing: tfmx::NoteTiming::Detune(0),
+                },
+            },
+            TraceEvent::Pattern {
+                track: 2,
+                pattern: 8,
+                step: 0,
+                entry: tfmx::PatternEntry::Command(tfmx::PatternCommand::Wait { jiffies: 2 }),
+            },
+            TraceEvent::Pattern {
+                track: 2,
+                pattern: 8,
+                step: 1,
+                entry: tfmx::PatternEntry::Command(tfmx::PatternCommand::Wait { jiffies: 3 }),
+            },
+            TraceEvent::Trigger {
+                voice: 1,
+                macro_number: 3,
+                note: 24,
+                volume: 64,
+                transpose: 0,
+            },
+            TraceEvent::Trigger {
+                voice: 1,
+                macro_number: 5,
+                note: 26,
+                volume: 64,
+                transpose: 0,
+            },
+        ];
+        let report = lint(&events, &[], &healthy_pcm(), RATE);
+        assert_eq!(report.patterns[2].len(), 2);
+        assert_eq!(report.patterns[0].len(), 0);
+        assert_eq!(report.macros[1].len(), 2);
+        assert_eq!(report.note_ons[1], 2);
+        assert_eq!(report.commands.get("Wait"), Some(&2));
+    }
+
+    #[test]
+    fn write_report_prints_the_summary_and_every_finding() {
+        let events = vec![jiffy(0, 0, false)];
+        let report = lint(&events, &[(0x22, 1)], &vec![0i16; 2000], RATE);
+        let mut out = Vec::new();
+        write_report(&report, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("Jiffies: 1"));
+        assert!(text.contains("silence"));
+        assert!(text.contains("unsupported-ops"));
+    }
+
+    /// Step 11.5's roadmap check: `lint` runs across the whole corpus.
+    #[test]
+    fn lint_runs_across_full_corpus_without_error() {
+        let names = [
+            "turrican intro",
+            "turrican outside",
+            "r-type",
+            "x-out (title)",
+            "turrican 2 title (st)",
+            "turrican 2 level 1-desert",
+            "turrican 2 level 3-flight",
+            "turrican 3 level 1",
+            "apidya (title)",
+            "apidya (level 1)",
+        ];
+
+        for name in names {
+            let Some(mdat) = corpus_path(&format!("mdat.{name}")) else {
+                eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+                return;
+            };
+            let smpl = corpus_path(&format!("smpl.{name}")).expect("smpl present alongside mdat");
+
+            let args = LintArgs {
+                mdat,
+                smpl,
+                song: 0,
+                seconds: 2,
+            };
+            let mut out = Vec::new();
+            run_lint(&args, &mut out).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let text = String::from_utf8(out).expect("output is UTF-8");
+            assert!(text.contains("Jiffies:"), "{name}: report has a summary");
+        }
     }
 
     /// Step 11.4's roadmap check: a corpus run of two songs produces

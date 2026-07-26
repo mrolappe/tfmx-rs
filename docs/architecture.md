@@ -370,8 +370,10 @@ reads both files into owned buffers (the only place in the whole pipeline an
 allocation for file contents happens), calls `Module::parse`, builds a `Player` with
 `--rate`/`--separation`, and calls `render()` into a stack or heap buffer in a loop,
 handing each filled block to `hound` — the WAV writer, and all file I/O, live in
-`tfmx-cli` only. Step 5.2's `tfmx-cli info` is a thinner consumer of the same
-`Module` accessors plus `Player::unsupported_ops()`.
+`tfmx-cli` only. `tfmx-cli info` is a thinner, purely static consumer of the same
+`Module` accessors (no playback since step 11.5); `tfmx-cli lint` is the one that
+runs the song, and it reads `Player::unsupported_ops()` alongside the trace and the
+rendered PCM.
 
 ---
 

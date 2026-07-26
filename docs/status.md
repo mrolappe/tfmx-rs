@@ -209,3 +209,80 @@ them differently), and whether the percussion voice is on a different voice numb
 (the per-voice stems above were never directly played back against a per-voice reference, since
 `uade123` has no solo). Both are prerequisites before concluding *where* in the trackstep → pattern
 → macro chain the divergence starts — exactly what step 11.3's trace seam is for.
+
+## Update (2026-07-26, step 11.5): corpus-wide `tfmx-cli lint` results
+
+`tfmx-cli lint <mdat> <smpl> [--song N] [--seconds S]` runs a traced render, folds the
+`TraceEvent` stream plus the unsupported-opcode counters plus the rendered PCM into one report,
+and names what looks wrong. The table below is the deliverable of step 11.5: **song 0, 30 s,
+44.1 kHz, separation 100**, every corpus module, all findings as reported by the tool.
+
+| module | jiffies | tempos | lines | loop/stop | patterns | note-ons v0/v1/v2/v3 | peak | clipped | findings |
+|---|---|---|---|---|---|---|---|---|---|
+| `turrican intro` | 375 | 3 | 55 | loop/— | 67 | 206/245/129/205 | 32768 | 7280 | no-retrigger v1 (start=36868 len=4480); clipping 0.28% |
+| `turrican outside` | 300 | 4 | 38 | loop/— | 29 | 211/194/138/0 | 27445 | 0 | dead-voice 0, 3; no-retrigger v1 (start=5878 len=3328); no-retrigger v2 (start=5878 len=3328) |
+| `r-type` | 300 | 4 | 80 | loop/— | 48 | 133/122/114/187 | 32768 | 13383 | no-retrigger v0 (start=60304 len=6672); frozen-voice v2 2.3 s; no-retrigger v3 (start=0 len=1); clipping 0.51% |
+| `x-out (title)` | 188 | 7, 65280 | 38 | —/stop | 29 | 36/36/30/25 | 32768 | 140 | frozen-voice v0 9.6 s; frozen-voice v1 10.7 s; frozen-voice v3 9.1 s; stopped-early 6.1 s |
+| `turrican 2 title (st)` | 375 | 3 | 62 | loop/— | 90 | 215/79/177/154 | 29122 | 0 | (none) |
+| `turrican 2 level 1-desert` | 300 | 4 | 68 | loop/— | 51 | 171/159/10/0 | 29357 | 0 | dead-voice 3; no-retrigger v2 (start=31026 len=1024) |
+| `turrican 2 level 3-flight` | 500 | 2 | 17 | loop/— | 32 | 345/313/219/31 | 28672 | 0 | no-retrigger v0 (start=23346 len=1543); no-retrigger v1 (start=0 len=0); no-retrigger v2 (start=66528 len=1504); no-retrigger v3 (start=0 len=0) |
+| `turrican 3 level 1` | 1500 | 0 | 45 | loop/— | 44 | 581/615/411/308 | 25082 | 0 | no-retrigger v2 (start=37124 len=2048) |
+| `apidya (title)` | 1500 | 0 | 20 | loop/— | 44 | 1050/825/600/375 | 17221 | 0 | no-retrigger v3 (start=0 len=0) |
+| `apidya (level 1)` | 300 | 4 | 12 | loop/— | 11 | 200/250/75/50 | 32768 | 900 | no-retrigger v1 (start=35228 len=3072); no-retrigger v3 (start=41372 len=4992) |
+
+`unsupported-ops` and `silence` fired **nowhere**: no module hits a recognized-but-unimplemented
+opcode in its first 30 s, and every module produces audible output. `single-pattern` fired nowhere
+either — every module walks a real trackstep list.
+
+### What the table says
+
+- **`turrican intro`, the confirmed bug, does not look broken at the sequencer level.** 55 distinct
+  trackstep lines, 67 pattern visits, all four voices triggering (206/245/129/205 note-ons), one
+  tempo, no stop. Whatever makes it play a different melody than `uade123` is *not* "the trackstep
+  layer never got going"; the dispatch is busy and varied. Its one structural finding is
+  `no-retrigger` on **voice 1**: 245 note-ons across six distinct macros (`{9, 10, 25, 32, 39, 41}`),
+  yet only ever one sample region with DMA on for the whole 30 s. A direct trace check confirms it:
+  voice 1's registers do get loaded with a *second* region (`start=17924 len=2048`), but DMA is never
+  on for that region — only 20 of 375 jiffy-end snapshots have voice 1's DMA on at all. Six macros
+  triggering 245 times and producing one audible region is the sharpest lead the corpus offers for
+  this bug, and it is exactly the kind of divergence the A/B by ear described (a missing part /
+  wrong patch). **Next thing to chase.**
+- **`x-out (title)` stops after 6.1 s** and leaves three voices frozen for 9-11 s afterwards. Its
+  tempo set is `{7, 65280}` — `65280` is `$FF00`, which does not read like a tempo at all. A stop
+  plus a nonsense tempo value in the same module points at a trackstep-decode problem, not a macro
+  one. Second lead, and a self-contained one.
+- **`no-retrigger` is noisy as specified** (8 of 10 modules) and should be read with its region
+  detail, not as a bare flag. `start=0 len=0` (`apidya (title)` v3, `turrican 2 level 3-flight`
+  v1/v3) means DMA is on over an empty region — a voice audibly doing nothing, effectively a dead
+  voice the `dead-voice` rule misses because DMA *is* on. A real `start`/`len` (e.g.
+  `turrican 3 level 1` v2, one 2048-word region for 30 s) can be perfectly legitimate: a percussion
+  or bass voice that plays one instrument throughout. The rule was implemented exactly as the
+  roadmap words it ("the sample region never changes for the whole run"); tightening it to "and the
+  voice has more than one distinct macro" would cut most of the noise, if a later step wants that.
+- **`apidya (title)`'s flagged voice is not the one the ears flagged.** Step 11.2's stems listening
+  heard v0/v1/v2 each looping one fragment and v3 silent; `lint` flags only v3 (`start=0 len=0`,
+  matching "silent"). v0-v2 each cycle through 3-4 regions in 10 s, so "never changes" does not fire
+  for them — the symptom shows up instead as *degenerate* regions, most visibly v2 sitting on
+  `start=32005 len=2` (a two-word region on loop) for 97 of its snapshots. This is consistent with
+  the TFMX 7V explanation above (garbage region data from a misread format) and is **not** evidence
+  of a Pro-2.0 bug. A "degenerate region" finding (`len` of a handful of words) would catch it, but
+  it is outside step 11.5's specified list.
+- **Clipping is real but mild** on three modules (0.28-0.51% of samples at full scale). Nothing here
+  is wall-to-wall clipping; it is peak-limited mixing on loud modules, worth remembering when
+  comparing amplitude against a reference render but not a defect on its own.
+- **`turrican 2 title (st)` is clean** — no findings at all, 90 pattern visits, all four voices busy.
+  It is the corpus's best "known-good" baseline for any A/B work that follows.
+
+### How `lint` is built (so a later step can extend it)
+
+`lint(&[TraceEvent], &[(u8, u32)], &[i16], rate) -> Report` in `tfmx-cli/src/main.rs` is a pure
+function: the trace events, the `(opcode, count)` pairs read off `Player::unsupported_ops()`, and
+the rendered PCM go in, a `Report` (summary + findings) comes out. The unsupported counters and the
+PCM cannot come out of the event stream — they live on the player and in the output buffer — so
+they are passed in alongside it rather than being added to `TraceEvent`, keeping the trace seam
+what `docs/architecture.md` §2 says it is: state-machine transitions only. Every finding is unit-
+tested from a hand-built event vector with no `Player` and no corpus file. A new finding is a new
+block at the end of `lint` plus one test; a new output format is a new `write_report`.
+
+`tfmx-cli info` is static as of this step: header text, layout and the song/tempo table, no
+playback. Everything that needed a render moved here.
