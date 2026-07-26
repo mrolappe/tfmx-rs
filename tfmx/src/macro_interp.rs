@@ -351,6 +351,26 @@ impl MacroInterpreter {
         self.pointer_vibrato = None;
     }
 
+    /// A pattern's `Note` command. If `macro_number` is already running on
+    /// this voice and hasn't reached `$07 <STOP>` (or been silenced by
+    /// `$FE`), this updates the note/volume in place instead of restarting
+    /// the program at step 0 -- a fast note run that keeps retriggering the
+    /// same macro would otherwise never survive past `$00 aa=0`'s mandatory
+    /// 1-jiffy pause to reach its own `$01 DMAon`. **Uncertain**: no [S1]
+    /// citation states this; grounded empirically by an A/B against
+    /// `uade123` on `turrican intro`'s voice 1 (`docs/status.md`), not by
+    /// the published spec.
+    pub fn note_on(&mut self, macro_number: u8, note: u8, volume: u8, transpose: i8) {
+        if macro_number == self.macro_number && !self.is_stopped() {
+            self.last_note = self.note;
+            self.note = note as i32;
+            self.transpose = transpose;
+            self.volume = volume.min(15) * 3;
+        } else {
+            self.trigger(macro_number, note, volume, transpose);
+        }
+    }
+
     /// `$21 <Play macro>`: starts `macro_number` at step 0 with `detune`
     /// folded into the next `$08`/`$09`/`$1F`'s finetune. Unlike
     /// `MacroInterpreter::trigger`, this keeps the voice's current note,
@@ -1006,6 +1026,98 @@ mod tests {
         assert_eq!(paula.voice(0).volume, 0);
         mac.trigger(0, 0, 0, 0);
         assert!(!mac.is_stopped());
+    }
+
+    // -- `note_on`: same-macro retrigger while already running --
+
+    /// The `turrican intro` bug (`docs/status.md`, step 11.5's `no-retrigger`
+    /// finding): a fast note run retriggers the *same* macro on the *same*
+    /// voice every jiffy. Every macro in that corpus module opens with `$00
+    /// aa=0` (mandatory 1-jiffy pause) and ends its note-setting opcode
+    /// (`$08`/`$09`) with another 1-jiffy suspend, so `$01 DMAon` needs two
+    /// clear jiffies after a `trigger()` to ever run. A full `trigger()` on
+    /// every repeat note resets `step` back to 0 each time, so `$01` is
+    /// never reached -- confirmed silent against this crate's own render,
+    /// where an A/B against `uade123` shows continuous audible output for
+    /// this same passage.
+    #[test]
+    fn note_on_retriggering_the_still_running_macro_does_not_reset_dma() {
+        let mdat = macro_module(&[&[
+            [0x00, 0, 0, 0],          // $00 aa=0: mandatory 1-jiffy pause
+            [0x02, 0x00, 0x00, 0x10], // SetBegin
+            [0x03, 0x00, 0x00, 0x05], // SetLen
+            [0x08, 0x00, 0x00, 0x00], // AddNote: suspends this jiffy too
+            [0x01, 0, 0, 0],          // DMAon
+            [0x14, 0, 0, 0],          // Wait key up, indefinitely
+        ]]);
+        let module = Module::parse(&mdat, &[]).expect("valid header parses");
+        let mut mac = MacroInterpreter::new();
+        let mut paula = Paula::new(100);
+
+        mac.trigger(0, 21, 8, 0);
+        run(&mut mac, &module, &mut paula, 3); // clears both suspends
+        assert!(paula.voice(0).dma_on, "should have reached $01 by jiffy 3");
+
+        // A same-macro retrigger while the program is still alive (parked
+        // in `$14`'s indefinite wait, not yet `$07`-stopped) must not wipe
+        // out what `$01` already latched.
+        mac.note_on(0, 23, 8, 0);
+        run(&mut mac, &module, &mut paula, 1);
+        assert!(
+            paula.voice(0).dma_on,
+            "a same-macro retrigger should not reset dma_on"
+        );
+    }
+
+    #[test]
+    fn note_on_with_a_different_macro_still_does_a_full_reset() {
+        let mdat = macro_module(&[
+            &[
+                [0x02, 0x00, 0x00, 0x10],
+                [0x03, 0x00, 0x00, 0x05],
+                [0x01, 0, 0, 0],
+                [0x14, 0, 0, 0],
+            ],
+            &[[0x07, 0, 0, 0]],
+        ]);
+        let module = Module::parse(&mdat, &[]).expect("valid header parses");
+        let mut mac = MacroInterpreter::new();
+        let mut paula = Paula::new(100);
+
+        mac.trigger(0, 21, 8, 0);
+        run(&mut mac, &module, &mut paula, 1);
+        assert!(paula.voice(0).dma_on);
+
+        mac.note_on(1, 21, 8, 0);
+        run(&mut mac, &module, &mut paula, 1);
+        assert!(
+            !paula.voice(0).dma_on,
+            "a different macro number must still fully retrigger"
+        );
+    }
+
+    #[test]
+    fn note_on_after_stop_does_a_full_reset_even_for_the_same_macro() {
+        let mdat = macro_module(&[&[
+            [0x07, 0, 0, 0],
+            [0x02, 0x00, 0x00, 0x10],
+            [0x03, 0x00, 0x00, 0x05],
+            [0x01, 0, 0, 0],
+            [0x14, 0, 0, 0],
+        ]]);
+        let module = Module::parse(&mdat, &[]).expect("valid header parses");
+        let mut mac = MacroInterpreter::new();
+        let mut paula = Paula::new(100);
+
+        mac.trigger(0, 21, 8, 0);
+        run(&mut mac, &module, &mut paula, 1);
+        assert!(mac.is_stopped());
+
+        // Retriggering macro 0 again after it stopped must restart at step
+        // 0, not resume from where $07 parked it.
+        mac.note_on(0, 21, 8, 0);
+        run(&mut mac, &module, &mut paula, 1);
+        assert!(mac.is_stopped(), "step 0's own $07 should stop it again");
     }
 
     // -- $08/$09/$1F: note, transpose, finetune --

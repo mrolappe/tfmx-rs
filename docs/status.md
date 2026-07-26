@@ -312,3 +312,109 @@ regressions, `Module::trackstep_line`'s `.get(start..end)` was temporarily swapp
 `&self.mdat[start..end]` indexing (reintroducing exactly the step-10.1 bug class) and the mutation
 test failed immediately, reporting the panicking module, mutation index, byte offset and flip byte;
 the change was then reverted. No source outside the new test file is different from before this step.
+
+## Update (2026-07-26): `turrican intro`'s no-retrigger bug fixed -- `note_on` replaces unconditional `trigger` -- but the full-mix A/B still sounds very different
+
+Root cause of the confirmed bug (voice 1 playing a different melody than `uade123`, first flagged
+step 6.2, narrowed by step 11.5's `lint` to a `no-retrigger` finding on voice 1): traced the exact
+macro bytecode with a scratch dump of `turrican intro`'s macro 41 (used by an 8-note run at 1 jiffy
+per note). Every macro in this module opens with `$00 aa=0` (mandatory 1-jiffy pause,
+`docs/playback-model.md` §2.4) and its note-setting opcode (`$08`/`$09`) ends its own jiffy too, so
+`$01 DMAon` needs two full clear jiffies after any trigger to ever run. `dispatch_pattern_entry`
+(`tfmx/src/player.rs`) called `MacroInterpreter::trigger()` -- a full reset of `step`, `dma_on`, the
+sample pointer and every effect -- for **every** `Note` pattern entry, regardless of whether the
+same macro was already running on that voice. A note run that retriggers the same macro every
+jiffy therefore reset `step` back to 0 every time, and `$01` was never reached.
+
+Confirmed real (not a benign artifact) by an A/B against `uade123` before touching any code: 20ms-
+window RMS across the run's 0.5-1.5s span showed this crate's voice 1 completely silent
+(`rms=0.0` throughout) while `uade123`'s reference render had continuous non-zero energy over the
+same span, no gaps -- and this crate's own full mix had two ~200-300ms silent gaps in that window
+that the reference does not.
+
+Fix: `MacroInterpreter::note_on` (`tfmx/src/macro_interp.rs`) -- if the requested `macro_number`
+equals the voice's currently-running one and the program hasn't reached `$07 <STOP>`, updates
+note/volume/transpose in place instead of calling `trigger()`; otherwise (a different macro, or the
+same macro after it stopped) it calls `trigger()` exactly as before. `dispatch_pattern_entry` now
+calls `note_on` instead of `trigger` directly. Three new `tfmx` unit tests cover: same-macro retrigger
+while still running preserves `dma_on`; a different macro number still fully resets; the same macro
+number after `$07` still fully resets. **Uncertain**: no `[S1]` citation states this same-macro
+behavior -- it is grounded empirically by the A/B above, not by the published spec.
+
+Verified after the fix: the same A/B window now shows continuous energy on this crate's voice 1
+(silent only 0.5-0.78s, its genuine pre-attack pause, then continuous through 1.26s). Corpus-wide
+`tfmx-cli lint` (step 11.5's table) re-run post-fix: `turrican intro` now reports **no findings at
+all** (was `no-retrigger v1` + clipping). All ten modules' golden hashes changed and were
+regenerated (`TFMX_REGEN_GOLDEN=1`) -- an intentional, verified output change, not a regression;
+`cargo test --workspace` is green apart from that expected regen. Committed.
+
+**But a fresh full-mix A/B after the fix still sounds very different from `uade123`** -- the
+`note_on` fix is real, tested, and closes the specific silence it targeted, but it is not the
+(whole) explanation for the original step 6.2 complaint (different melody, different starting
+patch, extra percussion voice, higher pitch). This mirrors the earlier `apidya (title)` history in
+this same file: a real, correctly-tested fix (the `Voice::frac` reset) that turned out not to be
+sufficient on its own. **Do not re-claim this is fixed without a fresh listen confirming it.**
+
+### Song-number mismatch ruled out
+
+Before chasing note/pitch dispatch further, checked whether this crate's `--song 0` and
+`uade123`'s default subsong are even the same piece of music -- they could differ if either tool
+enumerates/renumbers the header's 32 song-table slots differently.
+
+- `uade123 -g "mdat.turrican intro"` reports `subsongs: cur 0 min 0 max 4` -- 5 subsongs, current/
+  default is 0.
+- `tfmx-cli info` dumps this crate's own song table: slot 0 = `start=75 end=129 tempo=3`, slot 1 =
+  `start=52 end=74 tempo=120`, slot 2 = `start=0 end=49 tempo=160`, slot 3 = `start=50 end=50
+  tempo=5`, slot 4 = `start=138 end=138 tempo=3`, slots 5-30 all identical to slot 3, slot 31 =
+  `start=511 end=511 tempo=5`. `uade123`'s "5 subsongs" is exactly the count of slots before that
+  placeholder run starts repeating -- strong evidence its subsong index is this crate's raw slot
+  index, not a renumbering.
+- Independent cross-check by note density (a wrong song would be tempo-wildly-off, not subtly
+  wrong): this crate's song-0/1/2 trigger rates from `tfmx-cli trace` are 26.1/s, 81.2/s, 132.2/s
+  respectively (10s render each). Onset rate measured directly from `uade123`'s reference audio
+  (20ms-window RMS envelope, simple threshold-jump onset counter) is **27.1/s** -- matches song 0
+  almost exactly; songs 1 and 2 would be obviously, grossly faster.
+
+**Conclusion: song numbering does correspond (song 0 == uade123 subsong 0).** The remaining
+discrepancy is genuinely in note/pitch/patch dispatch, not a song-selection bug.
+
+### Tempo-table semantics clarified (in the course of the above)
+
+Answering "why does tempo 3 vs. tempo 160 look so different" turned up nothing new beyond
+`docs/playback-model.md` §3.2, but confirms it against this specific module's own data: values
+`<=15` use the 50Hz-divider path (`50/(v+1)` Hz -- tempo 3 -> 12.5 Hz jiffy rate, not a literal
+"3 BPM"), values `>15` use the CIA/BPM path where the stored value **is** literally the BPM
+(tempo 160 -> 160 BPM, a normal fast action-game tempo). Slot 0 (tempo 3, lines 75-129) and slot 2
+(tempo 160, lines 0-49) are most likely two separate pieces of music sharing one `mdat` file (a
+slow intro/title cue and a fast in-game tune), not one tune with an inconsistent tempo.
+
+Also checked whether `start == end` reliably means "dummy/empty slot": **no, it's mixed.** Traced
+slot 3 directly: line 50 decodes as `TRACKSTEP Command(Stop)` -- genuinely empty, and 27 of the 32
+slots point at this exact value, almost certainly the composer's tool default-filling unused song
+slots. But slot 4 (`138/138`) and slot 31 (`511/511`) are also `start==end` and traced to **real**
+`Tracks([...])` lines with genuine note/pattern content -- legitimate one-line songs that loop that
+single trackstep line forever, not dummies. The reliable dummy signal is the line decoding to
+`Command(Stop)`, not the `start==end` shape by itself.
+
+### Next task: keep digging on the note/pitch/patch discrepancy
+
+Not yet tried, in likely order of leverage:
+
+1. **Per-voice stems A/B** (`tfmx-cli render --stems`) against a fresh `uade123` render of the
+   same song/duration, voice-by-voice -- the same technique that found the `note_on` bug, applied
+   more broadly across the whole render rather than one 1-second window.
+2. **Transpose handling** -- `dispatch_pattern_entry`/`PatternRunner` transpose plumbing
+   (`tfmx/src/sequencer.rs`, `tfmx/src/player.rs`) has not been A/B-verified against a reference;
+   a sign or accumulation error here would produce exactly "higher pitch" and "different melody"
+   without touching timing at all.
+3. **Note-to-period mapping** (`note_period` in `tfmx/src/macro_interp.rs`) -- not yet checked
+   against a known-good frequency table for more than a couple of spot values.
+4. **Which pattern/macro is actually selected for the "starting patch"** the user described --
+   compare the very first few `TRIGGER`/`PATTERN` events this crate emits (`tfmx-cli trace`)
+   against what `uade123`'s stems (if extractable) or its audible attack timbre suggest for voice 0
+   at t=0.
+5. The still-untouched `Portamento`-timed note case noticed in passing while investigating the
+   `note_on` fix: `NoteTiming::Portamento` (`aa >= 0xC0`, "reached by portamento from the previous
+   note ... rather than played directly", `docs/opcodes.md` §2) is decoded but never specially
+   handled -- `dispatch_pattern_entry` calls `note_on` the same way regardless of `timing`. This is
+   a second, independently plausible dispatch bug, not yet confirmed against the corpus.

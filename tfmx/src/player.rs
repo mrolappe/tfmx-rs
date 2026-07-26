@@ -265,7 +265,7 @@ fn dispatch_pattern_entry(
             ..
         } => {
             let voice = voice_of(voice) as u8;
-            macros[voice as usize].trigger(macro_number, note, volume, transpose);
+            macros[voice as usize].note_on(macro_number, note, volume, transpose);
             trace(TraceEvent::Trigger {
                 voice,
                 macro_number,
