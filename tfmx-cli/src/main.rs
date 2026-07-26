@@ -26,6 +26,11 @@ enum Command {
     /// static, no playback. For comparing this crate's decode of an
     /// instrument/pattern against a reference by eye.
     Disasm(DisasmArgs),
+    /// Compare onset timing between two rendered WAV files -- e.g. this
+    /// crate's render vs. a reference player's -- via a 20ms-window
+    /// RMS-derivative onset detector. Reports onset count/rate on each
+    /// side and an inter-onset-interval correlation.
+    OnsetDiff(OnsetDiffArgs),
 }
 
 #[derive(clap::Args)]
@@ -136,6 +141,15 @@ struct TraceArgs {
 #[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
 enum TraceFormat {
     Text,
+}
+
+#[derive(clap::Args)]
+struct OnsetDiffArgs {
+    a: PathBuf,
+    b: PathBuf,
+    /// Analysis window size in milliseconds.
+    #[arg(long, default_value_t = 20)]
+    window_ms: u32,
 }
 
 #[derive(Debug)]
@@ -767,6 +781,141 @@ fn run_lint(args: &LintArgs, out: &mut impl Write) -> Result<(), CliError> {
     Ok(())
 }
 
+/// A window's RMS must clear this floor to ever count as an onset -- keeps
+/// quiet hiss/dither from registering.
+const ONSET_NOISE_FLOOR: f64 = 128.0;
+/// An onset is a window whose RMS exceeds the previous window's by this
+/// ratio (the "threshold-jump" from the ad hoc method this promotes).
+const ONSET_JUMP_RATIO: f64 = 1.5;
+
+/// Reads a WAV file and downmixes to mono `i16`, returning `(samples, rate)`.
+fn read_wav_mono(path: &std::path::Path) -> Result<(Vec<i16>, u32), CliError> {
+    let mut reader = hound::WavReader::open(path)?;
+    let spec = reader.spec();
+    let samples: Vec<i16> = reader.samples::<i16>().collect::<Result<_, _>>()?;
+    let mono = if spec.channels <= 1 {
+        samples
+    } else {
+        let channels = spec.channels as usize;
+        samples
+            .chunks(channels)
+            .map(|frame| (frame.iter().map(|&s| s as i32).sum::<i32>() / channels as i32) as i16)
+            .collect()
+    };
+    Ok((mono, spec.sample_rate))
+}
+
+/// RMS amplitude of each non-overlapping `window_ms` window.
+fn window_rms(mono: &[i16], rate: u32, window_ms: u32) -> Vec<f64> {
+    let window_len = ((rate as u64 * window_ms as u64 / 1000).max(1)) as usize;
+    mono.chunks(window_len)
+        .map(|w| {
+            let sum_sq: f64 = w.iter().map(|&s| (s as f64) * (s as f64)).sum();
+            (sum_sq / w.len() as f64).sqrt()
+        })
+        .collect()
+}
+
+/// Onset timestamps (seconds), via a 20ms-window RMS-derivative threshold
+/// jump: a rising edge (a jumped window preceded by a non-jumped one) counts
+/// once, however many further windows the same attack ramp keeps jumping
+/// for. ponytail: fixed ratio/floor, whole-mix RMS -- promotes the ad hoc
+/// method already validated by hand across several sessions (see
+/// `docs/status.md`), which only ever applied it to silence-anchored
+/// onsets (a piece's first note, an all-voice stop). **Known ceiling**: in
+/// continuous polyphonic material the full mix rarely dips back near the
+/// noise floor between notes, so a new note arriving over still-ringing
+/// voices is invisible to this detector -- corpus-wide it undercounts
+/// density far more on dense material than on sparse. Per-voice (not
+/// full-mix) comparison would raise the ceiling, but the only reference
+/// player available (`uade123`) has no per-voice solo/mute output to diff
+/// against.
+fn detect_onsets(mono: &[i16], rate: u32, window_ms: u32) -> Vec<f64> {
+    let rms = window_rms(mono, rate, window_ms);
+    let mut onsets = Vec::new();
+    let mut in_onset = false;
+    for i in 1..rms.len() {
+        let jumped = rms[i] > ONSET_NOISE_FLOOR && rms[i] > rms[i - 1] * ONSET_JUMP_RATIO;
+        if jumped && !in_onset {
+            onsets.push(i as f64 * window_ms as f64 / 1000.0);
+        }
+        in_onset = jumped;
+    }
+    onsets
+}
+
+fn inter_onset_intervals(onsets: &[f64]) -> Vec<f64> {
+    onsets.windows(2).map(|w| w[1] - w[0]).collect()
+}
+
+/// Pearson correlation over the shorter of the two slices' lengths, paired
+/// by index. `None` if fewer than two points, or either side is constant.
+fn pearson_correlation(a: &[f64], b: &[f64]) -> Option<f64> {
+    let n = a.len().min(b.len());
+    if n < 2 {
+        return None;
+    }
+    let (a, b) = (&a[..n], &b[..n]);
+    let mean_a = a.iter().sum::<f64>() / n as f64;
+    let mean_b = b.iter().sum::<f64>() / n as f64;
+    let mut cov = 0.0;
+    let mut var_a = 0.0;
+    let mut var_b = 0.0;
+    for i in 0..n {
+        let da = a[i] - mean_a;
+        let db = b[i] - mean_b;
+        cov += da * db;
+        var_a += da * da;
+        var_b += db * db;
+    }
+    if var_a == 0.0 || var_b == 0.0 {
+        return None;
+    }
+    Some(cov / (var_a.sqrt() * var_b.sqrt()))
+}
+
+fn run_onset_diff(args: &OnsetDiffArgs, out: &mut impl Write) -> Result<(), CliError> {
+    let (mono_a, rate_a) = read_wav_mono(&args.a)?;
+    let (mono_b, rate_b) = read_wav_mono(&args.b)?;
+    let onsets_a = detect_onsets(&mono_a, rate_a, args.window_ms);
+    let onsets_b = detect_onsets(&mono_b, rate_b, args.window_ms);
+    let duration_a = mono_a.len() as f64 / rate_a as f64;
+    let duration_b = mono_b.len() as f64 / rate_b as f64;
+    let rate_per_sec = |onsets: &[f64], duration: f64| {
+        if duration > 0.0 {
+            onsets.len() as f64 / duration
+        } else {
+            0.0
+        }
+    };
+
+    writeln!(
+        out,
+        "a: {} onsets over {:.1}s ({:.1}/s)",
+        onsets_a.len(),
+        duration_a,
+        rate_per_sec(&onsets_a, duration_a)
+    )?;
+    writeln!(
+        out,
+        "b: {} onsets over {:.1}s ({:.1}/s)",
+        onsets_b.len(),
+        duration_b,
+        rate_per_sec(&onsets_b, duration_b)
+    )?;
+
+    let ioi_a = inter_onset_intervals(&onsets_a);
+    let ioi_b = inter_onset_intervals(&onsets_b);
+    match pearson_correlation(&ioi_a, &ioi_b) {
+        Some(r) => writeln!(out, "inter-onset-interval correlation: {r:.3}")?,
+        None => writeln!(
+            out,
+            "inter-onset-interval correlation: n/a (fewer than 2 intervals on one side)"
+        )?,
+    }
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
     let result = match &cli.command {
@@ -775,6 +924,7 @@ fn main() {
         Command::Trace(args) => run_trace(args, &mut std::io::stdout().lock()),
         Command::Lint(args) => run_lint(args, &mut std::io::stdout().lock()),
         Command::Disasm(args) => run_disasm(args, &mut std::io::stdout().lock()),
+        Command::OnsetDiff(args) => run_onset_diff(args, &mut std::io::stdout().lock()),
     };
     if let Err(e) = result {
         eprintln!("tfmx-cli: {e}");
@@ -1523,5 +1673,112 @@ mod tests {
             run_disasm(&neither, &mut Vec::new()),
             Err(CliError::Usage(_))
         ));
+    }
+
+    fn write_mono_wav(path: &std::path::Path, samples: &[i16], rate: u32) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for &s in samples {
+            writer.write_sample(s).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    /// Silence, then one loud burst, then silence -- a single onset should
+    /// land where the burst starts, not once per window while it sustains.
+    #[test]
+    fn detect_onsets_finds_one_onset_per_burst() {
+        let rate = 44_100;
+        let mut samples = vec![0i16; rate as usize / 10]; // 100ms silence
+        samples.extend(std::iter::repeat_n(20_000i16, rate as usize / 10)); // 100ms loud
+        samples.extend(vec![0i16; rate as usize / 10]); // 100ms silence
+
+        let onsets = detect_onsets(&samples, rate, 20);
+        assert_eq!(onsets.len(), 1, "onsets: {onsets:?}");
+        assert!(
+            (0.08..0.12).contains(&onsets[0]),
+            "onset at {} should land near the 100ms burst start",
+            onsets[0]
+        );
+    }
+
+    #[test]
+    fn detect_onsets_ignores_low_level_noise() {
+        let rate = 44_100;
+        // Constant quiet hiss, well below the noise floor -- no onset.
+        let samples = vec![10i16; rate as usize / 5];
+        let onsets = detect_onsets(&samples, rate, 20);
+        assert!(onsets.is_empty(), "onsets: {onsets:?}");
+    }
+
+    #[test]
+    fn detect_onsets_finds_two_separated_bursts() {
+        let rate = 44_100;
+        let mut samples = vec![0i16; rate as usize / 10];
+        samples.extend(std::iter::repeat_n(20_000i16, rate as usize / 10));
+        samples.extend(vec![0i16; rate as usize / 10]);
+        samples.extend(std::iter::repeat_n(20_000i16, rate as usize / 10));
+        samples.extend(vec![0i16; rate as usize / 10]);
+
+        let onsets = detect_onsets(&samples, rate, 20);
+        assert_eq!(onsets.len(), 2, "onsets: {onsets:?}");
+    }
+
+    #[test]
+    fn pearson_correlation_of_identical_sequences_is_one() {
+        let a = [0.10, 0.20, 0.15, 0.30];
+        let r = pearson_correlation(&a, &a).expect("enough samples for a correlation");
+        assert!((r - 1.0).abs() < 1e-9, "r={r}");
+    }
+
+    #[test]
+    fn pearson_correlation_of_opposite_trends_is_negative() {
+        let a = [0.0, 1.0, 2.0, 3.0];
+        let b = [3.0, 2.0, 1.0, 0.0];
+        let r = pearson_correlation(&a, &b).expect("enough samples for a correlation");
+        assert!((r + 1.0).abs() < 1e-9, "r={r}");
+    }
+
+    #[test]
+    fn pearson_correlation_needs_at_least_two_points() {
+        assert_eq!(pearson_correlation(&[1.0], &[1.0]), None);
+        assert_eq!(pearson_correlation(&[], &[]), None);
+    }
+
+    /// `onset-diff` on two copies of the same synthetic WAV: perfectly
+    /// correlated, matching onset counts.
+    #[test]
+    fn onset_diff_reports_matching_stats_for_identical_input() {
+        let rate = 44_100;
+        let mut samples = vec![0i16; rate as usize / 10];
+        for _ in 0..3 {
+            samples.extend(std::iter::repeat_n(20_000i16, rate as usize / 10));
+            samples.extend(vec![0i16; rate as usize / 10]);
+        }
+
+        let a_path = std::env::temp_dir().join("tfmx-cli-test-onset-a.wav");
+        let b_path = std::env::temp_dir().join("tfmx-cli-test-onset-b.wav");
+        write_mono_wav(&a_path, &samples, rate);
+        write_mono_wav(&b_path, &samples, rate);
+
+        let args = OnsetDiffArgs {
+            a: a_path.clone(),
+            b: b_path.clone(),
+            window_ms: 20,
+        };
+        let mut out = Vec::new();
+        run_onset_diff(&args, &mut out).expect("onset-diff succeeds on valid WAV files");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("a: 3 onsets"), "{text}");
+        assert!(text.contains("b: 3 onsets"), "{text}");
+        assert!(text.contains("correlation: 1.000"), "{text}");
+
+        std::fs::remove_file(&a_path).ok();
+        std::fs::remove_file(&b_path).ok();
     }
 }

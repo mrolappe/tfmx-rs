@@ -1092,3 +1092,53 @@ of an already-validated method. Step B is *(Sonnet 5 minimum)*, a synthesis/revi
 coding. Step C is *(Opus 5 minimum)* -- this project's roadmap reserves Opus 5 for the macro
 interpreter/sequencer specifically because subtle misreadings there have repeatedly produced
 real-but-insufficient fixes, and this step is in the same code.
+
+## Update (2026-07-26, next session): Step A done -- `tfmx-cli onset-diff`, TDD, plus an honest ceiling found
+
+Promoted the ad hoc RMS-envelope onset method into `tfmx-cli onset-diff <a.wav> <b.wav>`
+(`tfmx-cli/src/main.rs`): 20ms-window RMS, a rising-edge threshold-jump detector (window RMS clears
+a noise floor and exceeds the previous window's by 1.5x; only the first window of a jump counts, so
+one attack ramp isn't split into several onsets), reports onset count/rate per side plus a Pearson
+correlation of the two sides' inter-onset intervals. Six new unit tests (synthetic bursts/noise/two
+separated bursts, correlation of identical/inverse/too-short sequences, end-to-end on identical
+synthetic WAVs), TDD, all pass; full workspace suite and clippy clean.
+
+**Ran it corpus-wide** (all 9 non-7V modules, `--song 0 --seconds 10`, `uade123 -s 0 -t 10 -f`):
+
+| module | ours onsets/s | uade123 onsets/s | IOI correlation |
+|---|---|---|---|
+| turrican intro | 3.6 | 0.5 | 0.870 |
+| turrican outside | 0.1 | 0.9 | n/a (<2 intervals one side) |
+| turrican 2 level 1-desert | 1.6 | 3.5 | 0.204 |
+| turrican 2 level 3-flight | 2.1 | 0.1 | n/a (<2 intervals one side) |
+| turrican 3 level 1 | 4.3 | 3.5 | 0.219 |
+| turrican 2 title (st) | 2.9 | 2.7 | 0.034 |
+| r-type | 2.4 | 0.4 | -0.509 |
+| x-out (title) | 2.2 | 3.8 | -0.181 |
+| apidya (level 1) | 4.2 | 8.0 | 0.034 |
+
+**Before reading anything into this table, dug into *why* `uade123`'s turrican intro rate (0.5/s)
+contradicts an earlier session's own "27.1/s" figure for the same file (recorded above, "song
+numbering does correspond") -- same crate, same nominal method, wildly different answer demands an
+explanation before it becomes evidence.** Dumped the raw 20ms-window RMS envelope for `uade123`'s
+turrican intro render directly (throwaway, not committed): after ~4 silent windows the RMS never
+returns anywhere near the noise floor again -- it climbs from ~700 to ~3000+ over the first two
+seconds in small, continuous steps, never once falling then jumping back up by 1.5x. **This is the
+real, structural limitation of whole-mix RMS-jump onset detection, not a bug in this session's
+reimplementation**: it only ever fires on a silence-to-sound transition. In dense polyphonic music
+where a new note lands over still-ringing previous notes, total mix energy barely moves, so the
+detector is blind to it. Every prior use of this ad hoc method in this document (the piece's very
+first onset, the two all-voice silence gaps) was exactly this kind of silence-anchored moment --
+this is the first time it has been pointed at continuous dense material, and the corpus-wide table
+above is the first evidence of where the method stops working. **The direction and size of the
+divergence in the table above is therefore not reliable evidence of a shared-code bug** -- it more
+likely tracks how much silence each module's opening/style happens to contain, not true onset
+density. A per-voice comparison would raise this ceiling substantially (a single voice's own RMS
+dips to silence between its own notes far more often than a 4-voice mix does), but `uade123` has no
+per-voice solo/mute output to diff against (confirmed earlier in this document) -- there is no
+reference to compare a per-voice render to.
+
+**Conclusion for Step B**: the onset-diff table is not strong enough evidence on its own to promote
+or demote any of the three ranked hypotheses below. Posting the ranked list as originally planned,
+unweighted by this table, and flagging the metric's ceiling so the user's own hunch (if any) isn't
+crowded out by a number that looks more authoritative than it is.
