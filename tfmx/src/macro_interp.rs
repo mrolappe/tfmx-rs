@@ -245,6 +245,14 @@ const MAX_MACRO_OPS_PER_JIFFY: usize = 1024;
 #[derive(Debug)]
 pub struct MacroInterpreter {
     macro_number: u8,
+    /// The macro number a pattern's Note event last triggered this voice
+    /// with -- unlike `macro_number`, `$06 <Cont>` never changes this. A
+    /// keysplit instrument's public macro dispatches via `$1C`/`$06` into a
+    /// different macro number within the *same* jiffy as the trigger, so
+    /// by the next Note event `macro_number` has already moved on;
+    /// `note_on` needs the pattern's own number to recognize "the same
+    /// instrument is still running".
+    instrument: u8,
     step: u16,
     wait: Wait,
     saved: Option<(u8, u16)>,
@@ -282,6 +290,7 @@ impl Default for MacroInterpreter {
     fn default() -> Self {
         Self {
             macro_number: 0,
+            instrument: 0,
             step: 0,
             wait: Wait::Stopped,
             saved: None,
@@ -334,6 +343,7 @@ impl MacroInterpreter {
         self.detune = 0;
         self.volume = volume.min(15) * 3;
         self.macro_number = macro_number;
+        self.instrument = macro_number;
         self.step = 0;
         self.wait = Wait::Ready;
         self.saved = None;
@@ -351,17 +361,20 @@ impl MacroInterpreter {
         self.pointer_vibrato = None;
     }
 
-    /// A pattern's `Note` command. If `macro_number` is already running on
-    /// this voice and hasn't reached `$07 <STOP>` (or been silenced by
-    /// `$FE`), this updates the note/volume in place instead of restarting
-    /// the program at step 0 -- a fast note run that keeps retriggering the
-    /// same macro would otherwise never survive past `$00 aa=0`'s mandatory
-    /// 1-jiffy pause to reach its own `$01 DMAon`. **Uncertain**: no [S1]
-    /// citation states this; grounded empirically by an A/B against
-    /// `uade123` on `turrican intro`'s voice 1 (`docs/status.md`), not by
-    /// the published spec.
+    /// A pattern's `Note` command. If `macro_number` is the instrument
+    /// already running on this voice (per the last `trigger()`, not
+    /// necessarily `self.macro_number` -- a keysplit instrument's `$06
+    /// <Cont>` moves the program counter to a different macro number
+    /// within the same jiffy as the trigger) and hasn't reached `$07
+    /// <STOP>` (or been silenced by `$FE`), this updates the note/volume in
+    /// place instead of restarting the program at step 0 -- a fast note run
+    /// that keeps retriggering the same instrument would otherwise never
+    /// survive past `$00 aa=0`'s mandatory 1-jiffy pause to reach its own
+    /// `$01 DMAon`. **Uncertain**: no [S1] citation states this; grounded
+    /// empirically by an A/B against `uade123` on `turrican intro`'s voice 1
+    /// (`docs/status.md`), not by the published spec.
     pub fn note_on(&mut self, macro_number: u8, note: u8, volume: u8, transpose: i8) {
-        if macro_number == self.macro_number && !self.is_stopped() {
+        if macro_number == self.instrument && !self.is_stopped() {
             self.last_note = self.note;
             self.note = note as i32;
             self.transpose = transpose;
@@ -1073,6 +1086,51 @@ mod tests {
         assert!(
             paula.voice(0).dma_on,
             "a same-macro retrigger should not reset dma_on"
+        );
+    }
+
+    #[test]
+    fn note_on_retriggering_through_a_cont_indirection_does_not_reset_dma() {
+        // `turrican intro`'s voice-3 percussion instrument: the *public*
+        // macro number a pattern's Note event names (24 in the real
+        // corpus) opens with `$1C <Splitkey>`/`$06 <Cont>` into a
+        // *different* macro number that actually does the sample setup and
+        // `$01 DMAon`. Both `$1C` and `$06` run within the *same* jiffy as
+        // the trigger (neither suspends), so by the time the next Note
+        // event for this same instrument arrives, `self.macro_number` has
+        // already moved on to the target macro -- `note_on`'s
+        // `macro_number == self.macro_number` check compares the pattern's
+        // instrument number against the wrong thing and always takes the
+        // full-reset branch, so a fast repeat (one retrigger per jiffy)
+        // never survives past the target macro's own `$00 aa=0` pause to
+        // reach its `$01 DMAon`, exactly like the already-fixed same-macro
+        // case but for any instrument that dispatches through `$06`.
+        let mdat = macro_module(&[
+            &[[0x06, 0x01, 0x00, 0x00]], // macro 0: Cont into macro 1, step 0
+            &[
+                [0x00, 0, 0, 0],          // $00 aa=0: mandatory 1-jiffy pause
+                [0x02, 0x00, 0x00, 0x10], // SetBegin
+                [0x03, 0x00, 0x00, 0x05], // SetLen
+                [0x08, 0x00, 0x00, 0x00], // AddNote: suspends this jiffy too
+                [0x01, 0, 0, 0],          // DMAon
+                [0x14, 0, 0, 0],          // Wait key up, indefinitely
+            ],
+        ]);
+        let module = Module::parse(&mdat, &[]).expect("valid header parses");
+        let mut mac = MacroInterpreter::new();
+        let mut paula = Paula::new(100);
+
+        // A fast note run: the pattern retriggers instrument 0 every single
+        // jiffy, never giving the target macro two clear jiffies in a row.
+        for _ in 0..5 {
+            mac.note_on(0, 21, 8, 0);
+            run(&mut mac, &module, &mut paula, 1);
+        }
+        assert!(
+            paula.voice(0).dma_on,
+            "a per-jiffy retrigger of the same instrument must eventually \
+             reach $01 DMAon even when the instrument's own macro jumps to \
+             a different macro number via $06 Cont"
         );
     }
 

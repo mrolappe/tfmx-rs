@@ -615,3 +615,73 @@ symptom; (b) revisit whether `MAX_MACRO_OPS_PER_JIFFY` or the per-jiffy dispatch
 truncates a track's events. The first-note 160ms timing gap (this update's opening finding) remains
 unexplained too and may or may not be related -- not yet tested whether it recurs at every
 subsequent note attack or was a one-off song-start artifact.
+
+## Update (2026-07-26, next session): a second retrigger bug found and fixed via next-step (a)
+
+Did next-step (a) above: wrote a throwaway script (`tfmx-cli trace`'s text output, parsed to track
+each voice's `dma_on` across jiffies -- not committed) and confirmed the hypothesis concretely
+against `turrican intro`'s first 3s: at t=0.72s, t=1.28s, and t=2.00-2.08s, **all four voices have
+`dma_on == false` simultaneously** -- these are the spectrogram's silence gaps, not an artifact of
+the earlier eyeballed timestamps.
+
+Traced the t=0.72s gap to its cause and found a second real bug in the same area as the `note_on`
+fix (`5da3623`). Voice 3's percussion instrument is macro 24, whose bytecode (dumped via a throwaway
+`tfmx/examples/dump_macro.rs`, not committed, same technique as the earlier macro-41 dump) is:
+
+```
+step 0: 1C 20 00 02   <Splitkey> aa=0x20: if note < 32, jump to step 2
+step 1: 06 16 00 00   <Cont> macro 0x16 (22), step 0   -- the fallthrough (note >= 32)
+step 2: 06 17 00 00   <Cont> macro 0x17 (23), step 0   -- the split target (note < 32)
+step 3: 07            STOP
+```
+
+Both `$1C` and `$06` run in the *same* jiffy as the trigger (neither suspends -- `docs/opcodes.md`
+only marks `*`-flagged opcodes as ending processing for the jiffy, and neither is flagged). So one
+jiffy after `trigger(24, ...)`, `self.macro_number` has already moved on to 22 (or 23) -- `$06
+<Cont>`'s handler (`tfmx/src/macro_interp.rs`, opcode `0x06`) does `self.macro_number = b1`. The
+`note_on` fix (`5da3623`) compares the pattern's incoming macro number against `self.macro_number`
+to decide "is this instrument still running" -- for macro 24 that comparison is `24 ==
+self.macro_number`, which is `24 == 22`, always false, so **every** retrigger of this instrument
+takes the full-`trigger()`-reset branch, even while it is legitimately still running. Macro 22
+itself opens with the same `$00 aa=0` mandatory 1-jiffy pause as every other macro in this corpus, so
+a fast retrigger (this pattern retriggers roughly every 3-4 jiffies while the composition demands
+a rapid percussion run) never survives long enough to reach its own `$01 DMAon` -- the exact same
+symptom class as `5da3623`, but reached through `$06 <Cont>` indirection rather than a literal
+same-macro-number repeat.
+
+**Fixed** (TDD: failing test first, `note_on_retriggering_through_a_cont_indirection_does_not_reset_dma`
+in `tfmx/src/macro_interp.rs`): added a `MacroInterpreter::instrument` field that records the macro
+number a pattern's Note event last *triggered* this voice with, separately from `macro_number` (the
+live program-counter's macro slot, which `$06 <Cont>` legitimately mutates). `trigger()` sets both;
+`$06 <Cont>` only ever touches `macro_number`. `note_on` now compares the incoming macro number
+against `self.instrument`, not `self.macro_number`. Full workspace suite green; golden-hash diff
+changed for exactly `turrican intro`, `turrican 2 title (st)`, and `turrican 3 level 1` -- the three
+corpus modules sharing this keysplit/Cont percussion idiom -- with every other module (including
+`apidya (level 1)`, `turrican outside`, `turrican 2 level 1-desert`/`level 3-flight`) byte-identical,
+a plausible and targeted signature for a real fix rather than noise. Regenerated
+(`TFMX_REGEN_GOLDEN=1`), intentional.
+
+**Re-ran the same `dma_on` trace after the fix: the t=0.72s gap is gone** (voice 3 now stays
+`dma_on: true` continuously across that stretch's retriggers, confirmed by the trace no longer
+showing an all-false row there). **The t=1.28s and t=2.00-2.08s gaps are still present**, unchanged.
+Traced t=1.28s directly: at that trackstep line, voice 1 is explicitly silenced by a `StopVoice`
+command (legitimate, composer-authored, not a bug), while voices 0, 2, and 3 are each freshly
+retriggered by a note whose *own* macro had already reached `$07 <STOP>` on its own (not via the
+`$06 Cont` bug -- confirmed no `Cont`-indirected macro is involved at this specific line) -- so all
+three take the correct, spec-faithful full-reset path and pay their own few-jiffy `$00`-pause attack
+latency, and by chance/composition all four voices' individual dead zones overlap at this particular
+trackstep line. **Not yet determined whether this overlap is intentional (a genuine musical "breath")
+or itself a bug** (e.g. something making per-voice attack latency longer than it should be, or making
+independent voices land on the same trackstep line more often than the composition intends) -- this
+is a different mechanism from both retrigger bugs fixed so far and was not chased further this
+session, per the standing preference not to stack fixes without the user's ear confirming progress
+first.
+
+**Next steps, still open, next session**: (a) get the user's ear confirmation on this fix before
+doing anything else -- per `[[feedback_verify_audio_before_claiming_done]]`, this is real and tested
+but, like every previous fix in this investigation, may not be sufficient on its own; (b) if
+insufficient, trace the t=1.28s / t=2.00-2.08s gaps' per-voice attack latency more precisely: is each
+voice's own `$00`-pause-to-`$01` delay exactly as long as the spec says it should be, or is there a
+separate bug inflating it beyond what `5da3623`/this session's fix already account for; (c) the
+first-note 160ms timing gap (found two updates ago) is still completely unexplained and untested for
+recurrence -- still open, still not chased.
