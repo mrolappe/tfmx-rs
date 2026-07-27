@@ -39,6 +39,9 @@ cannot stand on its own as a brief, sharpen the step rather than widening the co
 - [`docs/opcodes.md`](docs/opcodes.md) — complete command reference
 - [`docs/playback-model.md`](docs/playback-model.md) — how sound is produced, plus the gotchas
 - [`docs/architecture.md`](docs/architecture.md) — code shape and design decisions
+- [`ROADMAP-history.md`](ROADMAP-history.md) — completed milestones' full step detail and
+  findings, split out of ROADMAP.md so it isn't loaded by default; pull it up for a step's
+  rationale or a past gotcha
 
 Prefer these over re-deriving anything from the upstream spec; they exist so the format
 knowledge is not trapped in the code.
