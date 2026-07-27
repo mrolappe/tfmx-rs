@@ -21,6 +21,57 @@ fn voice_of(nibble: u8) -> usize {
     (nibble & 0x03) as usize
 }
 
+/// How the eight tracks aggregate into the one shared trackstep line
+/// pointer.
+///
+/// `docs/opcodes.md` §2 states the trigger at "documented" confidence --
+/// `$F0 <End>`: *"Ends this pattern; trackstep advances."* -- so the line
+/// pointer is driven by pattern completion, not by the tick clock. What no
+/// source states is what happens when the eight tracks reach `$F0` at
+/// different times, which `docs/playback-model.md` §7 records as open.
+/// Both readings are implemented and selectable so they can be A/B'd
+/// against the TFMX editor, which is the only reference that can settle it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrackstepGate {
+    /// Every track still running a pattern must have reached `$F0`. The
+    /// line lasts as long as its longest track, which is what makes a
+    /// pure-filler pattern (`$F3 <Wait>` then `$F0`, as `turrican intro`'s
+    /// pattern 21 is in its entirety) a way to pad a short track out to the
+    /// line's length.
+    #[default]
+    AllTracks,
+    /// Any one track reaching `$F0` moves the line, truncating the rest.
+    /// The same filler pattern then reads as the line's *metronome*, fixing
+    /// its length regardless of what the other tracks were still playing.
+    AnyTrack,
+}
+
+/// Whether this jiffy may consume a trackstep line, per `gate`.
+///
+/// A track holds the line only while it is running a pattern that has not
+/// yet reached `$F0 <End>`. `$F4 <STOP>` (and `$FE <StopCustom>`) take
+/// their track out of the vote entirely: [S1] says a stopped track is
+/// *"unrecoverable until a new pattern pointer is loaded; will not run any
+/// upcoming `<End>`"* (`docs/opcodes.md` §2), so counting one as still
+/// holding would stall the song forever. With nobody holding it the line
+/// advances -- which is also what boots the very first line and what
+/// carries `$EFFE` command lines, neither of which runs a pattern at all.
+fn trackstep_line_due(patterns: &[Option<PatternRunner>; 8], gate: TrackstepGate) -> bool {
+    let mut holding = 0usize;
+    let mut ended = 0usize;
+    for runner in patterns.iter().flatten() {
+        match runner.halted() {
+            Some(PatternCommand::End) => ended += 1,
+            Some(_) => {}
+            None => holding += 1,
+        }
+    }
+    match gate {
+        TrackstepGate::AllTracks => holding == 0,
+        TrackstepGate::AnyTrack => holding == 0 || ended > 0,
+    }
+}
+
 /// Owns the whole per-song playback state and exposes the single
 /// `render()` entry point every caller (CLI, later a realtime backend)
 /// drives. `docs/architecture.md` §3.
@@ -37,12 +88,9 @@ pub struct Player<'a> {
     /// opcodes.md` §2: while non-zero, `Note` entries targeting that voice
     /// are dropped rather than dispatched.
     lock: [u32; 4],
-    /// The pattern number the *trackstep* table last assigned each track
-    /// (`None` before any assignment or after a `StopChannel`) -- distinct
-    /// from `patterns[i]`'s own live pattern number, which a `$FB <PPat>`
-    /// jump can move independently. See the reload loop's comment in
-    /// `run_jiffy` for why the two must not be conflated.
-    track_pattern: [Option<u8>; 8],
+    /// Which tracks must reach `$F0 <End>` before the shared trackstep line
+    /// pointer moves. See [`TrackstepGate`].
+    trackstep_gate: TrackstepGate,
     sample_rate: u32,
     /// Total frames rendered across every `render`/`render_traced` call on
     /// this player -- gives [`TraceEvent::Jiffy`]'s `frame` a continuous,
@@ -82,7 +130,7 @@ impl<'a> Player<'a> {
             unsupported: UnsupportedOps::default(),
             clock,
             lock: [0; 4],
-            track_pattern: [None; 8],
+            trackstep_gate: TrackstepGate::default(),
             sample_rate,
             frames_rendered: 0,
         })
@@ -92,6 +140,14 @@ impl<'a> Player<'a> {
     /// across every voice (`$1B`, `$22`-`$29`). `docs/opcodes.md` Unresolved.
     pub fn unsupported_ops(&self) -> &UnsupportedOps {
         &self.unsupported
+    }
+
+    /// Selects which tracks gate a trackstep line advance. See
+    /// [`TrackstepGate`] -- the two readings are an open question this
+    /// crate cannot settle from any published source, so the choice is the
+    /// caller's to make and to listen to.
+    pub fn set_trackstep_gate(&mut self, gate: TrackstepGate) {
+        self.trackstep_gate = gate;
     }
 
     /// Mutes `voice` (0-3) at the mix; forwards to `Paula::set_voice_muted`.
@@ -135,7 +191,7 @@ impl<'a> Player<'a> {
             unsupported,
             clock,
             lock,
-            track_pattern,
+            trackstep_gate,
             sample_rate,
             frames_rendered,
         } = self;
@@ -152,7 +208,7 @@ impl<'a> Player<'a> {
                     paula,
                     unsupported,
                     lock,
-                    track_pattern,
+                    *trackstep_gate,
                     *frames_rendered + pos as u64,
                     &mut trace,
                 )
@@ -189,7 +245,7 @@ fn run_jiffy<'a>(
     paula: &mut Paula,
     unsupported: &mut UnsupportedOps,
     lock: &mut [u32; 4],
-    track_pattern: &mut [Option<u8>; 8],
+    gate: TrackstepGate,
     frame: u64,
     trace: &mut impl FnMut(TraceEvent),
 ) -> Result<(), AccessError> {
@@ -200,52 +256,44 @@ fn run_jiffy<'a>(
         stopped: sequencer.is_stopped(),
     });
 
-    // Resolves a previously-open question (`docs/playback-model.md` §7):
-    // whether the shared trackstep line pointer advances once every active
-    // track's pattern reaches `$F0 <End>`, or unconditionally every jiffy.
-    // This crate's reading is the latter: `docs/opcodes.md` §1's per-track
-    // word table exists precisely so that "hold the current pattern, just
-    // update transpose" (`$80`) can be the common case across many
-    // consecutive jiffies -- the trackstep table is evaluated every jiffy
-    // like any other state machine here, and it is authored data (mostly
-    // `$80 Hold` words) that makes most of those evaluations a no-op, not a
-    // gating condition on pattern completion. This also matches the step
-    // 4.2 acceptance test's own framing ("trace the first 200 ticks") as
-    // one `Sequencer::advance()` call per jiffy.
-    if !sequencer.is_stopped() {
+    // `docs/opcodes.md` §2, at "documented" confidence: `$F0 <End>` --
+    // "Ends this pattern; trackstep advances." The line pointer is driven
+    // by pattern completion, not by the tick clock; `trackstep_line_due`
+    // holds it while any track is still playing. Only the aggregation
+    // across the eight tracks is unstated (`docs/playback-model.md` §7),
+    // which is what `gate` selects between.
+    let mut assigned = None;
+    if !sequencer.is_stopped() && trackstep_line_due(patterns, gate) {
         let line = sequencer.advance()?;
-        if let TrackstepLine::Command(
-            LineCommand::MasterVolSlideA { divisor, target }
-            | LineCommand::MasterVolSlideB { divisor, target },
-        ) = &line
-        {
-            paula.start_master_volume_slide(*divisor as u8, *target as u8);
+        match &line {
+            TrackstepLine::Command(
+                LineCommand::MasterVolSlideA { divisor, target }
+                | LineCommand::MasterVolSlideB { divisor, target },
+            ) => paula.start_master_volume_slide(*divisor as u8, *target as u8),
+            TrackstepLine::Tracks(slots) => assigned = Some(*slots),
+            TrackstepLine::Command(_) => {}
         }
         trace(TraceEvent::Trackstep(line));
     }
 
-    for i in 0..8u8 {
-        match sequencer.track(i) {
-            TrackSlot::Pattern { number, .. } => {
-                // Compared against `track_pattern`, not `patterns[i].pattern()`:
-                // `Sequencer::track` resolves a `$80 <Hold>` word into
-                // `Pattern{number: <its own remembered number>, ..}` every
-                // jiffy (`sequencer.rs::advance`), independent of a `$FB
-                // <PPat>` jump this track may have taken since -- comparing
-                // against the live `PatternRunner` would see that jump as a
-                // "reload" and silently undo it the very next Hold.
-                let reload = track_pattern[i as usize] != Some(number);
-                track_pattern[i as usize] = Some(number);
-                if reload {
-                    patterns[i as usize] = Some(PatternRunner::new(module, number)?);
+    // Track words are per-line data, so they are applied on the jiffy their
+    // line is consumed and not again until the next one. An explicit
+    // pattern word (re)starts that track's pattern -- restarting is the
+    // point, since the line only came up because the old one ended. `$80
+    // <Hold>` deliberately does not touch the runner: "keep the currently
+    // running pattern; only the transpose changes" (`docs/format.md` §5),
+    // which is also what keeps a `$FB <PPat>` jump this track has taken
+    // since from being silently undone.
+    if let Some(slots) = assigned {
+        for (i, slot) in slots.into_iter().enumerate() {
+            match slot {
+                TrackSlot::Pattern { number, .. } => {
+                    patterns[i] = Some(PatternRunner::new(module, number)?);
                 }
+                TrackSlot::Hold { .. } => {}
+                TrackSlot::StopChannel => patterns[i] = None,
+                TrackSlot::StopVoice { voice } => macros[voice_of(voice)].stop_voice(),
             }
-            TrackSlot::Hold { .. } => {}
-            TrackSlot::StopChannel => {
-                patterns[i as usize] = None;
-                track_pattern[i as usize] = None;
-            }
-            TrackSlot::StopVoice { voice } => macros[voice_of(voice)].stop_voice(),
         }
     }
 
@@ -278,10 +326,6 @@ fn run_jiffy<'a>(
     }
     for (track, pattern) in pattern_jumps.into_iter().enumerate() {
         if let Some(pattern) = pattern {
-            // `track_pattern` deliberately untouched: it tracks what the
-            // *sequencer* last assigned, so a later Hold that resolves back
-            // to that same remembered number still leaves this jump alone
-            // (see the reload loop's own comment).
             patterns[track] = Some(PatternRunner::new(module, pattern)?);
         }
     }
@@ -859,6 +903,258 @@ mod tests {
             player.macros[1].macro_number(),
             9,
             "track 1 must run the jumped-to pattern's note starting the next jiffy"
+        );
+    }
+
+    // -- `$F0 <End>` trackstep gating --------------------------------------
+    //
+    // `docs/opcodes.md` §2 states the trigger outright, at "documented"
+    // confidence: `$F0 <End>` -- "Ends this pattern; trackstep advances."
+    // What it does not state, and what `docs/playback-model.md` §7 records
+    // as open, is how the eight tracks aggregate. Both readings are built
+    // and tested here so they can be A/B'd against the TFMX editor.
+
+    /// One trackstep line from eight raw track words: `$00nn`-`$7Fnn` =
+    /// pattern `nn` (low byte transpose), `$80nn` = Hold, `$FFxx` =
+    /// StopChannel (`sequencer::decode_track_word`).
+    fn trackstep_line(words: [u16; 8]) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        for (i, word) in words.iter().enumerate() {
+            out[i * 2..i * 2 + 2].copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+
+    /// A synthetic module: `patterns[i]` becomes pattern `i`, `lines`
+    /// becomes trackstep lines `0..lines.len()` (song 0 spans all of them),
+    /// and every macro slot `0..16` points at one `$00` pause program --
+    /// enough to observe *which* macro number a note dispatched without any
+    /// of them producing sound.
+    fn synth_module(patterns: &[&[u8]], lines: &[[u8; 16]]) -> Vec<u8> {
+        const PATTERN_TABLE: usize = 0x400;
+        const MACRO_TABLE: usize = 0x600;
+
+        let mut mdat = vec![0u8; 0x800 + lines.len() * 16];
+        mdat[0..10].copy_from_slice(b"TFMX-SONG ");
+        mdat[0x140..0x142].copy_from_slice(&(lines.len() as u16 - 1).to_be_bytes()); // song_end
+        mdat[0x180..0x182].copy_from_slice(&1u16.to_be_bytes()); // tempo 1 -> 25 Hz
+        for (i, line) in lines.iter().enumerate() {
+            mdat[0x800 + i * 16..0x800 + (i + 1) * 16].copy_from_slice(line);
+        }
+
+        let mut offset = mdat.len() as u32;
+        for (slot, data) in patterns.iter().enumerate() {
+            mdat[PATTERN_TABLE + slot * 4..PATTERN_TABLE + slot * 4 + 4]
+                .copy_from_slice(&offset.to_be_bytes());
+            offset += data.len() as u32;
+        }
+        for data in patterns {
+            mdat.extend_from_slice(data);
+        }
+
+        let macro_offset = mdat.len() as u32;
+        for slot in 0..16usize {
+            mdat[MACRO_TABLE + slot * 4..MACRO_TABLE + slot * 4 + 4]
+                .copy_from_slice(&macro_offset.to_be_bytes());
+        }
+        // `$00 aa=0` (pause, suspends for one jiffy) then `$07 <STOP>`, so
+        // the interpreter halts inside its own program instead of reading
+        // off the end of `mdat` on the jiffy after it starts.
+        mdat.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00]);
+        mdat
+    }
+
+    /// A note longword with `Wait` timing: `$80|note`, macro, `cv`, wait.
+    const fn note_word(macro_number: u8, voice: u8, wait: u8) -> [u8; 4] {
+        [0x80, macro_number, voice, wait]
+    }
+
+    const END: [u8; 4] = [0xF0, 0x00, 0x00, 0x00];
+    const STOP: [u8; 4] = [0xF4, 0x00, 0x00, 0x00];
+
+    /// Renders exactly one jiffy of a [`synth_module`] (tempo 1 -> 25 Hz ->
+    /// 1764 frames per tick, and the clock leaves the boundary exactly at
+    /// the end of the block, so one call is one jiffy from the first on).
+    fn jiffy(player: &mut Player) {
+        let mut out = vec![0i16; 1764 * 2];
+        player.render(&mut out).expect("stays in range");
+    }
+
+    /// The core of the rule, independent of how tracks aggregate: a line
+    /// holds while its pattern is still running. Track 0's pattern waits 3
+    /// jiffies after its note before reaching `$F0`, so the next line's
+    /// note cannot be dispatched until jiffy 5.
+    #[test]
+    fn trackstep_line_holds_until_its_pattern_reaches_end() {
+        let mut pattern0 = note_word(5, 0, 3).to_vec();
+        pattern0.extend_from_slice(&END);
+        let mut pattern1 = note_word(9, 0, 0).to_vec();
+        pattern1.extend_from_slice(&END);
+
+        let mdat = synth_module(
+            &[&pattern0, &pattern1],
+            &[
+                trackstep_line([0x0000, 0xFF00, 0xFF00, 0xFF00, 0xFF00, 0xFF00, 0xFF00, 0xFF00]),
+                trackstep_line([0x0100, 0xFF00, 0xFF00, 0xFF00, 0xFF00, 0xFF00, 0xFF00, 0xFF00]),
+            ],
+        );
+        let module = Module::parse(&mdat, &[]).expect("valid header parses");
+        let mut player = Player::new(&module, 0, 44100, 100).expect("song 0 in range");
+
+        // jiffy 0 loads line 0; jiffies 1-3 are the note's own wait; jiffy 4
+        // fetches `$F0`. Only jiffy 5 may consume line 1.
+        for expected_jiffy in 0..5 {
+            jiffy(&mut player);
+            assert_eq!(
+                player.macros[0].macro_number(),
+                5,
+                "line 0's pattern is still running at jiffy {expected_jiffy}; \
+                 the trackstep line must not have advanced yet"
+            );
+        }
+        jiffy(&mut player);
+        assert_eq!(
+            player.macros[0].macro_number(),
+            9,
+            "the jiffy after `$F0 <End>`, the line advances and line 1's note runs"
+        );
+    }
+
+    /// Two tracks whose patterns end at different jiffies. Under
+    /// [`TrackstepGate::AllTracks`] the later one governs.
+    #[test]
+    fn all_tracks_gate_waits_for_the_last_track_to_end() {
+        let module_bytes = two_track_module();
+        let module = Module::parse(&module_bytes, &[]).expect("valid header parses");
+        let mut player = Player::new(&module, 0, 44100, 100).expect("song 0 in range");
+        player.set_trackstep_gate(TrackstepGate::AllTracks);
+
+        for expected_jiffy in 0..5 {
+            jiffy(&mut player);
+            assert_eq!(
+                player.macros[0].macro_number(),
+                5,
+                "track 1's pattern runs until jiffy 4, so at jiffy {expected_jiffy} \
+                 line 1 cannot have started yet"
+            );
+        }
+        jiffy(&mut player);
+        assert_eq!(
+            player.macros[0].macro_number(),
+            9,
+            "once every track has reached `$F0`, the line advances"
+        );
+    }
+
+    /// The same module under [`TrackstepGate::AnyTrack`]: track 0 reaches
+    /// `$F0` at jiffy 1, so the line moves at jiffy 2 and truncates track 1.
+    #[test]
+    fn any_track_gate_advances_on_the_first_track_to_end() {
+        let module_bytes = two_track_module();
+        let module = Module::parse(&module_bytes, &[]).expect("valid header parses");
+        let mut player = Player::new(&module, 0, 44100, 100).expect("song 0 in range");
+        player.set_trackstep_gate(TrackstepGate::AnyTrack);
+
+        jiffy(&mut player);
+        jiffy(&mut player);
+        assert_eq!(
+            player.macros[0].macro_number(),
+            5,
+            "track 0 only reaches `$F0` on jiffy 1; the line cannot have moved before jiffy 2"
+        );
+        jiffy(&mut player);
+        assert_eq!(
+            player.macros[0].macro_number(),
+            9,
+            "one track's `$F0` is enough under this reading, even with track 1 still running"
+        );
+    }
+
+    /// Track 0 ends at jiffy 1 (`Wait(0)` then `$F0`), track 1 at jiffy 4
+    /// (`Wait(3)` then `$F0`); line 1 puts a distinguishable macro on
+    /// voice 0.
+    fn two_track_module() -> Vec<u8> {
+        let mut pattern0 = note_word(5, 0, 0).to_vec();
+        pattern0.extend_from_slice(&END);
+        let mut pattern1 = note_word(6, 1, 3).to_vec();
+        pattern1.extend_from_slice(&END);
+        let mut pattern2 = note_word(9, 0, 0).to_vec();
+        pattern2.extend_from_slice(&END);
+
+        synth_module(
+            &[&pattern0, &pattern1, &pattern2],
+            &[
+                trackstep_line([0x0000, 0x0100, 0xFF00, 0xFF00, 0xFF00, 0xFF00, 0xFF00, 0xFF00]),
+                trackstep_line([0x0200, 0xFF00, 0xFF00, 0xFF00, 0xFF00, 0xFF00, 0xFF00, 0xFF00]),
+            ],
+        )
+    }
+
+    /// `$F4 <STOP>` is documented as "unrecoverable until a new pattern
+    /// pointer is loaded; **will not run any upcoming `<End>`**"
+    /// (`docs/opcodes.md` §2) -- so a track sitting on one can never cast a
+    /// vote, and must drop out of the gate rather than hold the line for
+    /// the rest of the song.
+    #[test]
+    fn a_stopped_track_does_not_hold_the_trackstep_line_forever() {
+        let pattern0 = STOP.to_vec();
+        let mut pattern1 = note_word(6, 1, 1).to_vec();
+        pattern1.extend_from_slice(&END);
+        let mut pattern2 = note_word(9, 0, 0).to_vec();
+        pattern2.extend_from_slice(&END);
+
+        let mdat = synth_module(
+            &[&pattern0, &pattern1, &pattern2],
+            &[
+                trackstep_line([0x0000, 0x0100, 0xFF00, 0xFF00, 0xFF00, 0xFF00, 0xFF00, 0xFF00]),
+                trackstep_line([0x0200, 0xFF00, 0xFF00, 0xFF00, 0xFF00, 0xFF00, 0xFF00, 0xFF00]),
+            ],
+        );
+        let module = Module::parse(&mdat, &[]).expect("valid header parses");
+        let mut player = Player::new(&module, 0, 44100, 100).expect("song 0 in range");
+        player.set_trackstep_gate(TrackstepGate::AllTracks);
+
+        for _ in 0..3 {
+            jiffy(&mut player);
+        }
+        assert_eq!(
+            player.macros[0].macro_number(),
+            0,
+            "track 1 still holds the line through jiffy 2"
+        );
+        jiffy(&mut player);
+        assert_eq!(
+            player.macros[0].macro_number(),
+            9,
+            "track 0's `$F4 <STOP>` must not veto the advance track 1 has earned"
+        );
+    }
+
+    /// A line that stops every track leaves nobody to reach `$F0`. It must
+    /// fall through to the next line rather than deadlock -- the same
+    /// no-one-is-holding-it path that boots the very first line and that
+    /// carries `$EFFE` command lines.
+    #[test]
+    fn a_line_with_no_running_pattern_advances_immediately() {
+        let mut pattern0 = note_word(9, 0, 0).to_vec();
+        pattern0.extend_from_slice(&END);
+
+        let mdat = synth_module(
+            &[&pattern0],
+            &[
+                trackstep_line([0xFF00; 8]),
+                trackstep_line([0x0000, 0xFF00, 0xFF00, 0xFF00, 0xFF00, 0xFF00, 0xFF00, 0xFF00]),
+            ],
+        );
+        let module = Module::parse(&mdat, &[]).expect("valid header parses");
+        let mut player = Player::new(&module, 0, 44100, 100).expect("song 0 in range");
+
+        jiffy(&mut player);
+        jiffy(&mut player);
+        assert_eq!(
+            player.macros[0].macro_number(),
+            9,
+            "an all-StopChannel line must not stall the song"
         );
     }
 }

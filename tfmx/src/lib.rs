@@ -13,7 +13,7 @@ mod trace;
 pub use macro_interp::{MacroEvent, MacroInterpreter, UnsupportedOps};
 pub use module::{AccessError, Module, ParseError};
 pub use paula::{Paula, Voice};
-pub use player::Player;
+pub use player::{Player, TrackstepGate};
 pub use sequencer::{
     LineCommand, NoteTiming, PatternCommand, PatternEntry, PatternRunner, Sequencer, TickClock,
     TrackSlot, TrackstepLine, decode_pattern_entry, tick_fraction,

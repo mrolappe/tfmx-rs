@@ -71,6 +71,28 @@ struct RenderArgs {
     /// filenames derived from `-o` (`out.wav` -> `out-v0.wav` .. `out-v3.wav`).
     #[arg(long)]
     stems: bool,
+    #[arg(long, value_enum, default_value_t = GateArg::All)]
+    gate: GateArg,
+}
+
+/// Which tracks must reach `$F0 <End>` before the trackstep line advances.
+/// The two readings are an open question (`docs/playback-model.md` §7); this
+/// flag exists so they can be rendered and listened to side by side.
+#[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
+enum GateArg {
+    /// Every track still running a pattern must have reached `$F0`.
+    All,
+    /// Any one track's `$F0` moves the line, truncating the others.
+    Any,
+}
+
+impl From<GateArg> for tfmx::TrackstepGate {
+    fn from(arg: GateArg) -> Self {
+        match arg {
+            GateArg::All => tfmx::TrackstepGate::AllTracks,
+            GateArg::Any => tfmx::TrackstepGate::AnyTrack,
+        }
+    }
 }
 
 /// `--solo`/`--mute` -> a per-voice mute mask. `--solo` wins if both are given.
@@ -136,6 +158,8 @@ struct TraceArgs {
     track: Option<u8>,
     #[arg(long, value_enum, default_value_t = TraceFormat::Text)]
     format: TraceFormat,
+    #[arg(long, value_enum, default_value_t = GateArg::All)]
+    gate: GateArg,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
@@ -206,6 +230,7 @@ fn render_to_wav(
     output: &std::path::Path,
 ) -> Result<(), CliError> {
     let mut player = tfmx::Player::new(module, args.song, args.rate, args.separation)?;
+    player.set_trackstep_gate(args.gate.into());
     for voice in 0..4u8 {
         player.set_voice_muted(voice, mute[voice as usize]);
     }
@@ -458,6 +483,7 @@ fn run_trace(args: &TraceArgs, out: &mut impl Write) -> Result<(), CliError> {
     const SAMPLE_RATE: u32 = 44_100;
     const SEPARATION: u8 = 100;
     let mut player = tfmx::Player::new(&module, args.song, SAMPLE_RATE, SEPARATION)?;
+    player.set_trackstep_gate(args.gate.into());
 
     let mut events = Vec::new();
     let total_frames = SAMPLE_RATE as usize * args.seconds as usize;
@@ -1031,6 +1057,7 @@ mod tests {
             solo: None,
             mute: Vec::new(),
             stems: false,
+            gate: GateArg::All,
         };
         run_render(&args).expect("render succeeds on a valid corpus file");
 
@@ -1565,6 +1592,7 @@ mod tests {
                 voice: None,
                 track: None,
                 format: TraceFormat::Text,
+                gate: GateArg::All,
             },
             &mut song0,
         )
@@ -1580,6 +1608,7 @@ mod tests {
                 voice: None,
                 track: None,
                 format: TraceFormat::Text,
+                gate: GateArg::All,
             },
             &mut song1,
         )
