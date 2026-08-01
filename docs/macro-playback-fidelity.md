@@ -1186,3 +1186,68 @@ prose, harmless since it doesn't drive the actual test data), and a full-mix + 4
 lesson (§7/§9/§13): this is not done until the user's ears confirm it against the real editor
 (the minimal scale) and ideally `uade123` (the corpus module) — do not upgrade this past "likely"
 without that.**
+
+**Ear result (same session): pitch confirmed correct on the full mix.** The user listened to the
+`turrican intro` full-mix render and reports the pitch now sounds right, as far as they can tell.
+`MIDDLE_C_NOTE` (§14, commit `e17b5e3`) can be treated as resolving the pitch complaint.
+
+---
+
+## 15. New, independently-confirmed bug: voice 2's macro-internal pulse rate is ~3.5x too slow
+
+**Not the same complaint as pitch — a separate defect, found while re-checking §2.** The user
+reports pattern `0x54`/macros `0x30`-`0x31` (voice 2, the wavetable-frame chorus/doubling effect)
+still "sounds like a slower version" of the real editor's playback, *pacing/density*, not pitch.
+Corroborating experiment: in the editor, manually increasing macro `0x30`'s `$04 <Wait>*` operand
+from `6` to `0x1A` (26) made the *editor's* own song-context playback match this crate's (wrong)
+speed — strong evidence this is a real jiffy-counting defect, not a subjective impression.
+
+**§2 never actually tested this** — it structurally checked transpose/`note_period()`/`$0D`/
+envelope-curve/`$02` *formulas*, and separately explained away the *editor's macro-preview*
+tempo mismatch (50Hz vs song tempo) as a tooling artifact. Neither check exercised the macro
+interpreter's own internal `$04 <Wait>*`/`$0F <Envelope>` *timing* against real hardware — this
+session is the first time that's been done.
+
+**Objective measurement, this session:**
+- `tfmx-cli render-pattern --pattern 84 --transpose=-24 --tempo 3` (isolates the pattern from
+  trackstep/gating) vs. a user-provided phone recording of the real editor playing pattern `0x54`
+  in-song, voice 2 soloed (`testdata/` not committed — session-scratchpad WAVs only).
+- `measure-pitch` on both: 155.28 Hz (crate) vs. 154.20 Hz (editor) — **pitch matches**, ruling out
+  a timbre/note mismatch as a confound for the next two measurements.
+- `onset-diff`: crate 39 onsets/21.0s (1.9/s) vs. editor 128 onsets/20.7s (6.2/s) — a **~3.3x**
+  gap, essentially zero inter-onset correlation (0.018).
+- Autocorrelation of the editor recording's 20ms RMS envelope (steady-state region, skipping the
+  attack) finds a clean fundamental period at **160ms**, with harmonics at 320/480/640ms — not
+  noise (ruled out background-recording-noise as an alternative explanation for the onset-diff gap
+  by inspecting the raw envelope directly: the periodicity is visually obvious, not just an
+  aggregate statistic).
+- A throwaway test (`macro_interp.rs`, written, run, reverted — `git status` clean) ran macro 48's
+  *exact* program (from `disasm`) standalone and printed DMA/volume state per jiffy: confirms this
+  crate's own internal loop (steps 9-15: `DMAoff*`→`AddVolume`→`AddNote*`(1j)→`DMAon`→`Envelope`→
+  `Wait*`(6j)→`AddBegin`, looping unconditionally to step 9) takes exactly **7 jiffies** per cycle
+  — matching the `$04 <Wait>*` operand literally and matching every documented per-opcode
+  suspend rule checked individually (`$04` gap independently confirmed as exactly 6 jiffies via a
+  second, isolated throwaway test). **The code does exactly what the opcodes and the docs say —
+  and that's 3.5x too slow.** 7 jiffies at the song's 12.5 Hz (tempo 3) = 560ms; the editor
+  measures 160ms = **exactly 2 jiffies at 12.5Hz**.
+
+**Working theory, not yet implemented or confirmed further: TFMX may have two independent clock
+domains, not one.** `docs/playback-model.md` §1 (the signal-chain intro, uncited to `[S1]`)
+currently states trackstep, pattern, *and* macro program all advance on the *same* tempo-scaled
+jiffy — this crate has always implemented that as one unified clock
+(`tfmx/src/sequencer.rs`'s `tick_fraction`, called once per jiffy, driving `Player::run_jiffy`
+which ticks trackstep/pattern/every macro together). But **every prior timing validation in this
+whole project only ever tested the trackstep/pattern side** of that claim (the `docs/trackstep-
+timing-bug.md` stopwatch experiment used a plain `Wait(31); End` *pattern*, no macro effects
+involved) — the "macro also runs on the scaled clock" half has never been checked against real
+hardware until this session, and this session's numbers argue against it: if the macro interpreter
+instead ticks at the **raw 50Hz hardware rate, independent of the song's trackstep tempo divisor**
+(i.e. trackstep/pattern advance is tempo-scaled per `docs/trackstep-timing-bug.md`'s already-
+confirmed formula, but `$04`/`$0F`/`$0B`/`$0C`/`$11`'s own jiffy counters are *not* — they always
+count raw 50Hz ticks), the same 7-op-jiffy internal loop would take 7/50s = **140ms**, within
+~14% of the measured 160ms — far closer than the current model's 560ms (3.5x off). Not proven:
+140ms vs. 160ms isn't an exact match, and no `[S1]` passage has been found yet stating this
+explicitly (or denying it) — this needs a primary-source re-check and, if adopted, is a **wide-
+blast-radius architecture change** (decoupling the macro tick clock from `tick_fraction`
+throughout `player.rs`/`sequencer.rs`), unlike every per-opcode fix earlier in this thread.
+**Not yet implemented — chosen next step for a fresh session, pending the user's direction.**
