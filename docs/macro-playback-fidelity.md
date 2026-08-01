@@ -570,14 +570,40 @@ table spelling — see `parse_note`/`NOTE_NAMES` in `tfmx-cli/src/main.rs`. `ren
    handoff; `$05 Loop`'s shared repeat-counter poisoned by the unconditional `aa=0` form) —
    `turrican intro` voice 0's `sample-region-out-of-bounds` finding is fully gone. **But the user's
    re-listen still finds voice 0 too low-pitched and still hears the playhead wander into the wrong
-   sample areas.** Read §9 in full before continuing — it has three concrete, not-yet-tried next
-   steps: (a) test whether `$11`'s post-loop wobble (±1280 bytes against a 256-byte loop — 5x the
-   loop's own size) is itself the wrong mechanism/magnitude by temporarily no-op'ing it; (b) get the
-   editor's actual loop-point values for macro 28 (§8 Recipe A step 3, never attempted) and diff
-   against this crate's `loop_start=39704`/`loop_len=128`; (c) isolate macro 28 via `render-macro` +
-   `measure-pitch` against the editor's own macro-audition, exactly as §8 intended but not yet done
-   for this specific macro. 10 `sample-region-out-of-bounds` findings remain across other corpus
-   modules, unexplored — do not assume they share today's root causes without checking.
+   sample areas.** §9's three leads: (a) resolved by §11 — `$11`'s wobble is NOT the cause, disabling
+   it makes voice 0 sound worse (do not touch); (b)/(c) resolved by §12 — see item 9 below. 9
+   `sample-region-out-of-bounds` findings remain across other corpus modules, unexplored — do not
+   assume they share today's root causes without checking.
+9. **§12 (2026-08-01, session 10) — CHOSEN NEXT STEP, START HERE**: theory 2 (editor ground truth for
+   macro 28) is done — the editor's own disassembly of macro 28 matches `tfmx-cli disasm --macro 28`
+   byte-for-byte (no decode bug), and a manual sweep test in the editor independently validated the
+   `$18 Sampleloop` loop-length formula by ear, matching its predicted `delta=0x800` breakpoint
+   exactly. **`$18`'s values are now ruled out** as the cause of "too low pitch"/"wanders" — this was
+   the last untested link in the pitch chain (`note_period()` confirmed §6, `$18` bounds fixed §5,
+   `$18` values confirmed §12, `$11` wobble ruled out §11).
+   **The live lead going into a fresh session**: `docs/opcodes.md` describes `$02 SetBegin` as adding
+   to "the sample's **base address**" (a fixed noun) vs. `$11 AddBegin` adding to "the sample
+   **pointer**" (explicitly the live/oscillating position) — two different phrases for what might be
+   two different things. The code (`tfmx/src/macro_interp.rs:606-613`) currently implements both as
+   accumulation onto the same `self.sample_start` field, i.e. treats "base address" and "pointer" as
+   identical. Macro 28 issues **two** `$02 SetBegin` calls per trigger (`+0x1C14` then `+0x7804`) —
+   the one case in this whole thread where cumulative-vs-absolute actually changes *which bytes get
+   read*, not just bounds: cumulative (current code) → `sample_start=37912`; a fixed-base reading
+   could land somewhere else entirely (e.g. `30724`-relative). Before writing any code:
+   - This rests on one sentence per opcode with no corroborating passage — re-read
+     `docs/opcodes.md` §3's `$02`/`$11` entries and `docs/format.md` §8 for anything missed.
+   - Check whether "the sample's base address" could mean something *other* than 0 (e.g. a
+     per-instrument constant from elsewhere in the format) before assuming `delta` alone is the
+     answer — `docs/format.md`'s only worked `$02` example has just one call, so it can't settle this.
+   - `sampleloop_keeps_turrican_intro_macro_28_in_bounds` (`tfmx/src/macro_interp.rs:1607`) already
+     pins the current cumulative reading with the real macro-28 numbers — it will need to change if
+     this theory is acted on, and its replacement value needs deriving from whatever "base" turns out
+     to mean, not guessed.
+   - Sweep corpus-wide impact (how many macros issue 2+ `$02` calls per trigger?) before fixing, the
+     same way §5/§7 did, since this could be a much bigger change than any fix so far in this thread.
+   - TDD required (per project convention): write the failing test first from whatever the settled
+     semantics turn out to be, then fix, then re-render for the user's ears — per this thread's own
+     repeated lesson, do not assume a structurally-correct fix is audibly meaningful until confirmed.
 
 ## Tooling added this session (2026-08-01): `tfmx-cli render-pattern`
 
@@ -928,6 +954,63 @@ unconfounded measurement available shows no pitch shift. Per the recipe's own th
 diff → worth the user's ears before ruling out entirely) the before/after WAV pairs are worth an
 A/B listen on the "wanders" question specifically, but this session did not spend the user's ears
 yet — rendered pairs are in the scratchpad, not committed anywhere permanent.
+
+## 12. Session 10: theory 2 — editor decode confirmed correct; `$18` formula independently validated by ear; new SetBegin theory recorded, not yet pursued
+
+The editor has no waveform/loop-point inspector, so theory 2 (§9/§11) ran differently than
+planned: the user read macro 28's raw instructions directly off the editor's disassembly instead —
+`SetBegin +0x1C14` (step 1), `SetBegin +0x7804` (step 7), `SetLen 0x100`/`0x400`, `Sampleloop
++0x700` (step 0xd).
+
+**Decode cross-check**: `tfmx-cli disasm --macro 28` on `turrican intro` produces the identical
+byte-for-byte sequence (`02 00 1C 14`, `02 00 78 04`, `03 00 01 00`, `03 00 04 00`, `18 00 07 00`).
+**No decode bug** — this fully answers theory 2's original question (is the macro parsed
+correctly?) with "yes."
+
+**Recipe B run (fallback, since the editor has no inspector)**: built a minimal macro in the editor
+— `SetBegin` into a known region, `SetLen 0x400` (1024 words), `DMAon`, `Sampleloop` with a
+variable delta — and auditioned it directly, sweeping the delta around macro 28's real value
+(`0x700`). Result: **looping happens even with `Sampleloop` omitted entirely** (Paula's DMA loops
+on the `SetBegin`/`SetLen` region on its own, as `docs/format.md` §8 already describes — `$18` only
+*relocates* the loop, it doesn't create looping). Sweeping the delta: **below `0x700`, the loop
+sounds "slower"; approaching `0x700`, "faster"; at/above `0x800`, other regions of the sample file
+(including silent parts) start playing too.**
+
+This matches this codebase's `$18` formula (`tfmx/src/macro_interp.rs:789-791`,
+`loop_len = sample_len.wrapping_sub_signed(delta >> 1) & 0xFFFF`) **exactly, including the precise
+threshold**: with `sample_len = 1024` words, `loop_len` hits exactly `0` at `delta = 0x800` (2048,
+i.e. `halved = 1024 = sample_len`), and wraps mod 65536 into a huge value past that — which is
+exactly why unrelated/silent regions start playing right at `0x800`, not gradually. Below that,
+smaller delta → less subtracted from `loop_len` → bigger loop region → slower; delta rising toward
+`0x700` → smaller region → faster. The real macro-28 value (`0x700` = 1792) sits well inside the
+sane range (`loop_len = 128` words), nowhere near the cliff.
+
+**Conclusion: the `$18` fix's arithmetic is now validated against real editor/hardware behavior,
+not just self-consistency** (§5/§6 only checked bounds; this checks the *direction and magnitude*
+of the resulting value against an independent ground truth, and the match is exact down to the
+breakpoint). This closes out "wrong `$18` loop-length values" as a suspect for the real macro-28
+in-song case — the formula is right, and the real delta is nowhere near the degenerate zone.
+
+**New theory recorded, not pursued this session (user's explicit choice)**: `docs/opcodes.md` §3
+describes `$02 SetBegin` as adding to "the sample's **base address**" (a fixed noun) versus `$11
+AddBegin` adding to "the sample **pointer**" (explicitly the live, oscillating position) — two
+different phrases for what might be two different things. The current code (`tfmx/src/
+macro_interp.rs:606-613`) implements both by accumulating onto the same `self.sample_start` field,
+which makes them behave identically except for `$11`'s extra oscillation — i.e. it reads "base
+address" and "pointer" as the same value. Macro 28 has **two** `SetBegin` calls in one trigger
+(`+0x1C14` then `+0x7804`), so this is the one case in this investigation where cumulative-vs-
+absolute actually diverges: cumulative (current code) gives `37912`; a fixed-base reading could
+give something entirely different (e.g. `30724`-based), landing in a different region of the sample
+file. This is the strongest remaining lead for "too low pitch"/"wanders" but rests on a single
+sentence per opcode with no corroborating passage — needs careful corpus-wide impact analysis and
+TDD before touching the code. The existing committed test
+`sampleloop_keeps_turrican_intro_macro_28_in_bounds` (`tfmx/src/macro_interp.rs:1607`) pins the
+current cumulative reading and would need to change if this theory is ever acted on.
+
+**Still open, untouched this session**: §1 (portamento-to-note drop), the "second, structurally
+different out-of-bounds region on `turrican intro` voice 0" from session 4 (separate from the now-
+validated `$18` case), and 9 other `sample-region-out-of-bounds` findings across the rest of the
+corpus.
 
 **Next**: either (a) get the user to A/B `pattern-before.wav`/`pattern-after.wav` and the
 full-mix/voice-0 pairs specifically for the "wanders" (not pitch) symptom, since the numbers here
