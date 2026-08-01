@@ -563,6 +563,18 @@ table spelling — see `parse_note`/`NOTE_NAMES` in `tfmx-cli/src/main.rs`. `ren
    `render-macro --note` masks any raw byte to its low 6 bits and also accepts a note name
    directly, so the editor's raw packed-record byte or note name can be pasted straight in without
    the `disasm`/masking detour this item used to require.
+8. **§9 (2026-08-01): two more real bugs fixed and TDD'd** (`$11 AddBegin` fighting the attack→loop
+   handoff; `$05 Loop`'s shared repeat-counter poisoned by the unconditional `aa=0` form) —
+   `turrican intro` voice 0's `sample-region-out-of-bounds` finding is fully gone. **But the user's
+   re-listen still finds voice 0 too low-pitched and still hears the playhead wander into the wrong
+   sample areas.** Read §9 in full before continuing — it has three concrete, not-yet-tried next
+   steps: (a) test whether `$11`'s post-loop wobble (±1280 bytes against a 256-byte loop — 5x the
+   loop's own size) is itself the wrong mechanism/magnitude by temporarily no-op'ing it; (b) get the
+   editor's actual loop-point values for macro 28 (§8 Recipe A step 3, never attempted) and diff
+   against this crate's `loop_start=39704`/`loop_len=128`; (c) isolate macro 28 via `render-macro` +
+   `measure-pitch` against the editor's own macro-audition, exactly as §8 intended but not yet done
+   for this specific macro. 10 `sample-region-out-of-bounds` findings remain across other corpus
+   modules, unexplored — do not assume they share today's root causes without checking.
 
 ## Tooling added this session (2026-08-01): `tfmx-cli render-pattern`
 
@@ -708,4 +720,96 @@ a complementary check costs nothing extra — pick any pattern note in the edito
 note name/transpose, and compare against `tfmx-cli disasm --pattern N`'s decode of the identical
 entry. This rules out a decode-level bug (wrong note/transpose *reaching* `note_on`, upstream of
 everything this session tested) separately from both the period-math chain (now confirmed correct)
+
+## 9. Recipe A run (2026-08-01): editor corroborates §5; two more real bugs found+fixed on the same
+voice, but the user's re-listen still finds voice 0 too low-pitched and pointer-wandering
+
+**Recipe A result**: the user played pattern `0x52`/macro `0x1c` in the editor. Macro `0x1c` loops
+cleanly in the editor's own macro-preview, but pattern `0x52` retriggers it every 1-3 jiffies, so
+what's audible is a *rhythm* of retriggered notes, not one sustained tone — an important correction
+to §8's framing (it assumed a single unbroken tone). Refined discriminator: is there **pitched, tonal
+content under the rhythm**, or is it **percussive clicks with no real tone**? The user heard **a
+clear tone under the rhythm** — corroborating §5's `loop_len=128`-words (in-bounds) interpretation
+over the old out-of-bounds one.
+
+**But `tfmx-cli lint` still flagged voice 0's `sample-region-out-of-bounds` after §5.** Tracing it
+(not the loop region — that was fine at `loop_start=39704, loop_len=128`, confirmed correct by the
+editor's own audible tone) found two further **real, distinct bugs**, both in `tfmx/src/macro_interp.rs`,
+both fixed and TDD'd this session:
+
+1. **`$11 <AddBegin>`'s one-shot form fought the attack→loop handoff.** Macro 28's `$11` opcodes
+   (steps 18/21, `±256`) fire *after* `$18 <Sampleloop>` has already handed the voice to loop
+   playback, but `MacroInterpreter::render` unconditionally re-pushed the *stale pre-loop*
+   `sample_start`/`sample_len` through `Paula::set_sample_region` every jiffy the pointer changed —
+   overwriting `Voice::next_sample`'s internal `start == loop_start` handoff (the §4 fix) right back
+   to a value the loop math never accounted for, dragging the real read pointer past the 45828-byte
+   `smpl` file. Fixed with a `loop_active` flag: once `$18` has run, `$11`'s pointer nudge (both its
+   one-shot and periodic-vibrato forms) targets `loop_start`/`loop_len` instead of the frozen
+   pre-loop snapshot. Regression test:
+   `add_begin_after_sampleloop_wobbles_the_loop_pointer_not_the_stale_attack_one`.
+2. **`$05 <Loop>`'s shared `self.repeat` counter got poisoned by the unconditional (`aa=0`) form.**
+   Macro 28 nests two counted loops (`aa=5`, i.e. 6 passes each per this crate's off-by-one
+   convention) inside an outer *unconditional* loop (`aa=0`, "jump back forever"). All three share
+   one `Option<u8>` field. The `times == 0` arm called the same `self.repeat.get_or_insert(times)` as
+   the counted arms — on a fresh `None` this inserts `Some(0)` and never clears it before jumping.
+   The next *counted* loop instruction reached then finds that stale `Some(0)` instead of `None`,
+   reads `left == 0`, and treats itself as already exhausted after **one** pass instead of its own
+   six — confirmed by direct instrumentation of `execute()`'s `0x05|0x10` arm against the real
+   corpus render: the down-going inner loop (`-256` × should-be-6) ran its full 6 passes exactly
+   once, then only 1 pass every cycle after, while the up-going loop (`+256`) kept its full 6 —
+   exactly the asymmetric drift the trace showed (`loop_start` oscillating once, then climbing
+   monotonically past file bounds). Fixed by never touching `self.repeat` for the `times == 0` case
+   (explicit `self.repeat = None` instead of `get_or_insert`). Regression test:
+   `unconditional_loop_does_not_poison_a_nested_counted_loops_repeat_state`.
+
+Both fixes: 144 `tfmx` unit tests, full workspace suite, clippy, and `mutation_robustness` all pass.
+`turrican intro` voice 0's `sample-region-out-of-bounds` finding is now **fully gone** (was present
+before both fixes; the module has zero lint findings related to sample regions afterward). Golden
+hashes regenerated for the 4 corpus modules whose audio changed:
+`turrican intro`, `apidya (title)`, `turrican 2 level 1-desert`, `turrican 2 title (st)`.
+
+**User re-listen (2026-08-01, full mix + per-voice stems, 90s, `--gate any`) still finds two
+problems on voice 0**, both persisting through both fixes above:
+
+- **Pitch still too low** on voice 0's pad, compared to `uade123`.
+- **The playhead still audibly moves into sample areas it shouldn't**, as playback of that voice
+  progresses — the *symptom* §5/this session's fix #1 targeted is gone from `lint`'s bounds check,
+  but something in the same neighborhood is still perceptible by ear.
+
+**Both fixes landed were real and are structurally correct** (verified by targeted regression tests,
+not just "stopped triggering the lint rule") — but per this thread's now-repeated pattern (§3/§4/§5
+also each "fixed the mechanism, didn't move the ear"), a bounds-respecting fix is not the same as a
+*value*-correct one. Two live theories for next session, **not yet tested**:
+
+1. **The `$11 AddBegin` wobble may itself be the wrong mechanism or the wrong magnitude post-loop.**
+   `loop_len` for macro 28 is 128 words = 256 bytes; the `$11` wobble this session redirected onto
+   `loop_start` swings ±1280 bytes — **five times the loop region's own size**. Even bounds-respecting,
+   a wobble that large relative to the loop could plausibly *be* "plays sample areas it's not supposed
+   to play" (the loop's read window sliding across five loop-lengths' worth of unrelated sample data)
+   and could also explain a pitch shift if it drags the window over lower-frequency content. Cheap
+   test: render with `$11`'s post-loop branch temporarily forced to a no-op (skip the add entirely)
+   and see whether the "wanders" complaint and/or the pitch complaint changes — isolates whether the
+   wobble itself is the culprit before chasing anything else.
+2. **`$18`'s resulting loop-length *value* may still be wrong even though now in-bounds** — this is
+   §8's original open question, only partly answered by Recipe A (Recipe A confirmed "a tone plays,
+   not silence", not "the tone is the right pitch"). A loop region that's longer than the composer
+   intended plays back at a lower perceived pitch — consistent with "too low". §8's Recipe A step 3
+   (read the editor's own loop-point/playhead inspector directly, if it has one, instead of relying on
+   the ear) was never attempted and is the most direct way to settle this: get the editor's actual
+   `loop_start`/`loop_len` (or equivalent) for macro 28 and diff against this crate's computed
+   `39704`/`128`.
+3. **Isolate via `tfmx-cli render-macro`** (bypasses trackstep/pattern/transpose, exactly §8's own
+   isolation intent, not yet applied to macro 28 specifically): render macro 28 alone, `measure-pitch`
+   it, and compare against the editor's own macro-audition of the same macro (remember §2's `--tempo`
+   gotcha — macro-preview timing is unrelated to macro-preview *pitch*, so this comparison is still
+   valid despite §2 being about tempo, not pitch).
+
+**Other corpus modules were not touched this session** and still carry `sample-region-out-of-bounds`
+findings, unexplored: `apidya (title)` (3), `r-type` (2), `turrican 3 level 1` (2), `turrican 2 level
+1-desert` (1), `turrican 2 level 3-flight` (1), `turrican 2 title (st)` (1) — 10 total, up from the
+9 recorded after §5 alone (this session's fixes changed *which* instances show up, not just the
+count, since the `$05` Loop bug is generic to any macro nesting a counted loop inside an unconditional
+one, not specific to macro 28). Whether any of these share either of today's two root causes is
+unknown — worth a sweep once voice 0 is fully resolved, but do not assume they're the same bug(s)
+without checking.
 and `$18`'s loop-length values (still open).

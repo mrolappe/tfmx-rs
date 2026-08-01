@@ -277,6 +277,11 @@ pub struct MacroInterpreter {
     sample_len: u32,
     loop_start: u32,
     loop_len: u32,
+    /// Set once `$18 <Sampleloop>` has run: from then on the voice is
+    /// reading `loop_start`/`loop_len`, not `sample_start`/`sample_len`
+    /// (a stale pre-loop snapshot), so any further pointer nudge (`$11
+    /// <AddBegin>`) must target the loop pointer instead.
+    loop_active: bool,
 
     vibrato: Option<Vibrato>,
     portamento: Option<Portamento>,
@@ -309,6 +314,7 @@ impl Default for MacroInterpreter {
             sample_len: 0,
             loop_start: 0,
             loop_len: 0,
+            loop_active: false,
             vibrato: None,
             portamento: None,
             envelope: None,
@@ -357,6 +363,7 @@ impl MacroInterpreter {
         self.sample_len = 0;
         self.loop_start = 0;
         self.loop_len = 0;
+        self.loop_active = false;
         self.vibrato = None;
         self.portamento = None;
         self.envelope = None;
@@ -545,10 +552,15 @@ impl MacroInterpreter {
             None => self.period,
         };
         let (sample_start, sample_len) = match &mut self.pointer_vibrato {
-            Some(pv) => (
-                self.sample_start.wrapping_add_signed(pv.delta()),
-                self.sample_len,
-            ),
+            Some(pv) => {
+                let delta = pv.delta();
+                if self.loop_active {
+                    self.loop_start = self.loop_start.wrapping_add_signed(delta);
+                    (self.sample_start, self.sample_len)
+                } else {
+                    (self.sample_start.wrapping_add_signed(delta), self.sample_len)
+                }
+            }
             None => (self.sample_start, self.sample_len),
         };
 
@@ -621,14 +633,22 @@ impl MacroInterpreter {
                 }
                 let times = b1;
                 let target = word23;
-                let left = *self.repeat.get_or_insert(times);
                 if times == 0 {
-                    self.step = target;
-                } else if left == 0 {
+                    // Unconditional jump, no counting -- must not touch
+                    // `self.repeat` via `get_or_insert`, which would plant a
+                    // stale `Some(0)` for the next *counted* loop instruction
+                    // (a different `$05`, sharing this same field) to
+                    // misread as "already exhausted".
                     self.repeat = None;
-                } else {
-                    self.repeat = Some(left - 1);
                     self.step = target;
+                } else {
+                    let left = *self.repeat.get_or_insert(times);
+                    if left == 0 {
+                        self.repeat = None;
+                    } else {
+                        self.repeat = Some(left - 1);
+                        self.step = target;
+                    }
                 }
                 true
             }
@@ -688,10 +708,17 @@ impl MacroInterpreter {
                 true
             }
             0x11 => {
-                // <AddBegin> -- pointer vibrato
+                // <AddBegin> -- pointer vibrato. Targets whichever pointer
+                // is actually live: the loop pointer once `$18` has handed
+                // playback off to it, the pre-loop attack pointer before
+                // that (see `loop_active`'s doc comment).
                 let step = i16::from_be_bytes([b2, b3]) as i32;
                 if b1 == 0 {
-                    self.sample_start = self.sample_start.wrapping_add_signed(step);
+                    if self.loop_active {
+                        self.loop_start = self.loop_start.wrapping_add_signed(step);
+                    } else {
+                        self.sample_start = self.sample_start.wrapping_add_signed(step);
+                    }
                     self.pointer_vibrato = None;
                 } else {
                     self.pointer_vibrato = Some(PointerVibrato {
@@ -762,6 +789,7 @@ impl MacroInterpreter {
                 let delta = sext24(b1, b2, b3);
                 self.loop_start = self.loop_start.wrapping_add_signed(delta);
                 self.loop_len = self.loop_len.wrapping_sub_signed(delta >> 1) & 0xFFFF;
+                self.loop_active = true;
                 true
             }
             0x19 => {
@@ -1084,6 +1112,43 @@ mod tests {
         let mut paula = Paula::new(100);
         run(&mut mac, &module, &mut paula, 1);
         assert_eq!(paula.voice(0).volume, 3); // 1 initial pass + 2 repeats
+    }
+
+    #[test]
+    fn unconditional_loop_does_not_poison_a_nested_counted_loops_repeat_state() {
+        // `turrican intro` macro 0x1c (28) nests a counted `$05 <Loop>` (aa=3,
+        // say) inside an outer *unconditional* one (aa=0, "jump back forever" --
+        // this crate's own reading of aa=0, matching the corpus). Both share
+        // one `self.repeat` field. The `times == 0` arm used to call
+        // `self.repeat.get_or_insert(0)` same as the counted arm, which -- on
+        // a fresh `None` -- inserts `Some(0)` and leaves it there after
+        // jumping. The next time a *counted* loop instruction is reached, it
+        // finds that stale `Some(0)` instead of `None`, reads `left == 0`, and
+        // treats itself as already exhausted after a single pass instead of
+        // its own `aa` repeats -- confirmed live via `tfmx-cli`'s `render`
+        // (instrumented) on `turrican intro`: the inner loop ran its full 6
+        // passes once, then only 1 pass on every subsequent cycle through the
+        // outer loop, producing a one-sided pointer drift instead of the
+        // intended symmetric wobble (`docs/macro-playback-fidelity.md` §8).
+        let mdat = macro_module(&[&[
+            [0x0D, 0, 0, 1],          // step 0: AddVolume +1
+            [0x05, 0x03, 0x00, 0x00], // step 1: counted loop, aa=3 -> 4 passes
+            [0x04, 0, 0, 0],          // step 2: Wait 1 jiffy
+            [0x05, 0x00, 0x00, 0x00], // step 3: unconditional loop back to 0
+        ]]);
+        let module = Module::parse(&mdat, &[]).expect("valid header parses");
+        let mut mac = MacroInterpreter::new();
+        mac.trigger(0, 0, 0, 0);
+        let mut paula = Paula::new(100);
+        run(&mut mac, &module, &mut paula, 1);
+        assert_eq!(paula.voice(0).volume, 4, "first pass through the counted loop");
+        run(&mut mac, &module, &mut paula, 1);
+        assert_eq!(
+            paula.voice(0).volume,
+            8,
+            "second pass, after the outer unconditional loop, must run the \
+             same 4 counted-loop repeats as the first -- not just 1"
+        );
     }
 
     #[test]
@@ -1567,6 +1632,38 @@ mod tests {
             loop_end_bytes < 45828,
             "loop region must stay within smpl.turrican intro's 45828 bytes, got end={loop_end_bytes}"
         );
+    }
+
+    #[test]
+    fn add_begin_after_sampleloop_wobbles_the_loop_pointer_not_the_stale_attack_one() {
+        // `$11 <AddBegin>`'s one-shot form (`aa=0`) nudges "the sample
+        // pointer" (`docs/opcodes.md` §3) -- but once `$18 <Sampleloop>` has
+        // already handed the voice off to loop playback, the only pointer
+        // still being read is `loop_start`/`loop_len`; `sample_start`/
+        // `sample_len` are a stale pre-loop snapshot. Before this fix, `$11`
+        // always wobbled `sample_start`, and `render` pushed it through
+        // `Paula::set_sample_region` every jiffy regardless of loop phase --
+        // silently undoing `Voice::next_sample`'s one-shot->loop handoff and
+        // dragging the voice's real read pointer to an address the loop math
+        // never accounted for (measured on `turrican intro` pattern
+        // 0x52/macro 0x1c via `tfmx-cli lint`'s `sample-region-out-of-bounds`
+        // finding, `docs/macro-playback-fidelity.md` §8).
+        let mdat = macro_module(&[&[
+            [0x02, 0x00, 0x00, 0x64], // SetBegin +100
+            [0x03, 0x00, 0x00, 0x0A], // SetLen 10 words
+            [0x01, 0x00, 0x00, 0x00], // DMAon
+            [0x18, 0x00, 0x00, 0x08], // Sampleloop +8 bytes -> loop_start=108, loop_len=6
+            [0x11, 0x00, 0x01, 0x00], // AddBegin one-shot +256
+            [0x07, 0, 0, 0],
+        ]]);
+        let module = Module::parse(&mdat, &[]).expect("valid header parses");
+        let mut mac = MacroInterpreter::new();
+        mac.trigger(0, 0, 0, 0);
+        let mut paula = Paula::new(100);
+        run(&mut mac, &module, &mut paula, 1);
+        let v = paula.voice(0);
+        assert_eq!(v.loop_start, 108 + 256); // the wobble lands on the live loop pointer
+        assert_eq!(v.start, 100); // attack region untouched, not re-dragged past the loop
     }
 
     #[test]
