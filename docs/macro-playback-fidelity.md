@@ -1089,3 +1089,76 @@ possible macro (a single non-looping or simply-looping sound, e.g. a synthesized
 lifted from `smpl.turrican intro`). Isolates pitch from every remaining confound (real macros'
 multi-stage envelopes, retrigger timing, the `AnyTrack` gating cascade) by construction rather than
 by after-the-fact measurement.
+
+## 14. Session 11 continued: minimal from-scratch test song built, A/B'd against the real editor — likely root cause found, a `MIDDLE_C_NOTE` anchor off by a tritone
+
+**Built `testdata/synth/`** (`gen_minimal_scale.py`, tracked in git — synthesized, not copyrighted,
+unlike the rest of `testdata/`, which stays gitignored): a from-scratch `mdat.minimal-scale`/
+`smpl.minimal-scale` pair with one trackstep line, one pattern playing a 13-note chromatic scale
+(notes `$1E`–`$2A`, one octave), through the simplest possible DMA-on macro (`$00,$02,$03,$08,$01,
+$07` — set region, set pitch from the note, DMA on, stop; Paula loops the `SetBegin`/`SetLen`
+region on its own, no `$18` needed), over a synthesized 32-sample sine cycle (chosen so note 30
+lands near real middle C, ~261 Hz). Isolates pitch from every real-corpus confound by construction.
+
+**Iteration 1** (tone at `smpl` offset 0, tempo 0): silent in the real TFMX editor, despite
+measuring correctly through this crate's own renderer. Two candidate causes fixed without proof
+either was *the* cause, both independently justified: `docs/format.md` §8 notes both real `smpl.*`
+files begin with 4 zero bytes ("suggesting offset `$0` conventionally holds a short silent null
+sample") — moved the tone to offset 4 and reserved offset 0 as silence; tempo 0 had never actually
+been validated in the editor (every prior editor tempo test used 2 or 3, `docs/trackstep-
+timing-bug.md` §3) — changed to tempo 3. **Iteration 2 was audible in the editor.**
+
+**A/B result: pitch-correct in isolation (this crate's own renderer, all 13 notes within ~1% of
+predicted), but the editor plays it at a consistently higher pitch than this crate does, for
+identical note bytes.** Precisely quantified via the user's own controlled experiment in the
+editor: changing the pattern's first note from `$1E` ("C-3") to `$18` ("F#2") made the editor's
+output match this crate's rendering of the *original* `$1E` note. Confirmed at the octave's other
+end too (`$2A`→`$24` behaves the same way). Both pairs are exactly six semitones (a tritone, factor
+`2^(6/12)≈1.414`) apart — in an equal-tempered system, only a constant note-index (or equivalently
+a constant frequency-multiplier) offset reproduces *two* such pairs exactly, so this reads as a
+uniform, note-independent error, not a per-note or per-range one.
+
+**Primary-source check**: re-fetched `[S1]` itself (J. H. Pickard, *TFMX Professional 2.0 Song File
+Format*, freely available e.g. via `libxmp`'s bundled format docs) to check for a transcription
+error in `docs/playback-model.md`'s citation. None found — the quote is verbatim: *"All notes are
+based at `$1E`=middle C (8363Hz).."*, following the same F#0/G-0/.../C-3/.../C-4 note-name table
+already in `docs/playback-model.md` §4. Critically, **`[S1]` gives only that one anchor point and a
+name table — it never states the note→frequency *formula*** (`docs/playback-model.md` line 407
+already flags the equal-tempered exponential formula as "inferred," not `[S1]`-stated). That gap is
+exactly where a wrong anchor could hide: every prior validation of `note_period()` in this
+investigation (the semitone-ratio sweep, the octave-doubling invariant, the three-octave-apart
+`measure-pitch` readings in the earlier `note_period()` round) checked the formula only *against
+itself* — a uniform wrong anchor constant preserves every ratio and every octave-doubling
+relationship perfectly while still being globally wrong, so none of those checks could ever have
+caught this. This session is the first time pitch has been checked against real hardware/editor
+ground truth at all.
+
+**Mixer ruled out as the fix location**: checked `tfmx/src/paula.rs`'s `Voice::next_sample` (the
+period→playback-rate resampling math) for a hidden constant-factor bug independent of
+`note_period()` — `freq_hz = PAULA_CLOCK_HZ / period; step = (freq_hz/sample_rate) * 2^32` is
+standard, clean resampling arithmetic with no extra factor found. The likely fix is localized to
+`tfmx/src/macro_interp.rs`'s `const MIDDLE_C_NOTE: i32 = 0x1E;`, which the evidence says should be
+`0x18` instead (keeping `MIDDLE_C_HZ = 8363.0` as-is — `[S1]`'s prose ties that number to the wrong
+index, but the number itself is a well-known standard Amiga constant, independently plausible).
+
+**Not yet done, chosen next step for a fresh session**: implement the `MIDDLE_C_NOTE` change
+(`0x1E` → `0x18`), TDD'd. This is foundational and wide-blast-radius — it shifts *every* note in
+*every* module by a tritone, so before calling it done:
+- Update every hard-coded worked example tied to the old anchor: `docs/playback-model.md` §4's
+  `period(0x1E)=424`/`freq(0x1E)=8363Hz` examples, and any `tfmx` unit test asserting an absolute
+  period/frequency value for a specific note (the octave-doubling/semitone-sweep tests are relative
+  and should keep passing unchanged; anything anchored to a literal note number's *absolute* period
+  will need its expected value recomputed against the new anchor).
+- Regenerate golden hashes for **all ten** corpus modules (this is not a narrow, module-specific
+  change like every previous fix in this thread — every rendered note shifts).
+- Re-render the `testdata/synth/mdat.minimal-scale` scale and re-verify against the editor's own
+  playback directly (the control this session already established) before trusting the corpus-wide
+  regeneration.
+- Per the standing rule, get the user's ears on a real corpus module (e.g. `turrican intro`) A/B'd
+  against `uade123` again — this is the first fix in the whole thread with a real *mechanism*
+  matching the "too low pitch, every voice" shape of the original complaint (a per-opcode data bug
+  would be spotty across voices/modules; a wrong global pitch anchor is not), so it is worth
+  treating as a serious root-cause candidate, but per this thread's own repeated lesson (`§7`, `§9`,
+  `§13`), do not declare it fixed until confirmed by ear.
+- `testdata/synth/gen_minimal_scale.py` is the fast control loop for this: regenerate, render, and
+  A/B against the editor again after the code change, before spending corpus-wide listening time.
