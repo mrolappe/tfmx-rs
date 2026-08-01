@@ -25,9 +25,12 @@ end-to-end for a clean note, redirecting suspicion onto whether `$18`'s resultin
 *values* (not just their in-bounds-ness) are actually correct — needs the editor as ground truth,
 concrete recipe at the bottom of §8, chosen next step.**
 §1 still awaits a fix decision, §2 is now resolved (editor's macro-audition previews at the fastest
-jiffy rate, not the song tempo). §6 is a resolved *tooling* gotcha (not an engine bug) found
-while using the new `render-pattern`/`render-macro` isolation commands — read it before
-re-reporting any "render-macro produces silence" symptom.**
+jiffy rate, not the song tempo). §6 and **§10 (2026-08-01, session 8)** are resolved *tooling*
+gotchas (not engine bugs) found while using the new `render-pattern`/`render-macro` isolation
+commands — read them before re-reporting any "render-macro produces silence" symptom, and before
+trusting a `measure-pitch` reading on a macro that depends on its pattern's own retriggering to stay
+audible (§10: macro 28 alone goes silent after ~60ms via `render-macro`; `render-pattern` doesn't
+have this problem). §9's theories 1 and 2 remain the live next steps.**
 
 ---
 
@@ -813,3 +816,73 @@ one, not specific to macro 28). Whether any of these share either of today's two
 unknown — worth a sweep once voice 0 is fully resolved, but do not assume they're the same bug(s)
 without checking.
 and `$18`'s loop-length values (still open).
+
+## 10. RESOLVED (tooling gotcha, not an engine bug), found 2026-08-01 (session 8): isolating macro 28 via `render-macro` is invalid — it goes silent after ~60ms
+
+Attempted §9's theory 3 (isolate macro 28 alone via `render-macro` + `measure-pitch`, compare against
+the editor's macro-audition). `render-macro --macro 28 --note 0x21 --volume 64` renders audio only in
+samples 1764-4410 (a ~60ms burst) of a 1-3s file, then **hard silence for the rest of the render** —
+so the resulting `measure-pitch` reading (8820 Hz) is worthless, almost certainly measured off that
+one short burst plus its attack transient, not the steady-state loop tone.
+
+Traced with a temporary per-jiffy `eprintln!` (added, inspected, reverted — not in the tree) printing
+`self.volume`/`dma_on`/loop registers: `dma_on` stays `true` and the loop registers stay
+well-formed and in-bounds the whole time (confirming §5/§9's fixes are not implicated) — but
+`self.volume` drops to `0` at step 13 and **never recovers**, exactly when macro 28's step 11
+(`$0E <SetVolume> aa=$00 bb=$00 cc=$38`) executes. `docs/opcodes.md` §2's `$0E` row documents the
+operand layout as `aa xx xx` — the code reads `b1` (`aa`) as the absolute volume
+(`self.volume = b1.min(64)`), and the real macro's `aa` byte here genuinely is `0`, so this is not a
+decode bug: the macro literally zeroes its own volume register at that step.
+
+**Why this doesn't reach the ear in the real song**: pattern `0x52` retriggers macro 28 every 1-3
+jiffies (§9's own Recipe A finding), and `MacroInterpreter::note_on` (`tfmx/src/macro_interp.rs:389-397`)
+takes the "same macro number, still running" branch on every one of those retriggers — which
+unconditionally overwrites `self.volume` from the pattern's own `cv` volume nibble
+(`self.volume = volume.min(15) * 3`) without resetting `self.step`. So the macro's program counter
+free-runs at its own pace (steps 11/13's `$0E` executes exactly once, ever, since the outer loop at
+steps 17-23 never revisits it), and whatever it sets is overwritten by the next retrigger within at
+most 3 jiffies (60ms) regardless. In-song, this SetVolume(0) is a real but likely single, sub-60ms,
+probably-inaudible dip near the note's own attack — not a plausible source of the persistent
+"too low pitched, wanders" complaint. `render-macro`, which triggers once and never retriggers, has
+no such recovery, so it renders as if the note died — a tooling artifact, not a playback bug. Same
+shape as §2 (tempo mismatch) and §6 (raw vs. masked note byte): `render-macro` isolates a macro from
+its pattern context, and for a macro that depends on that context's retriggering to stay audible past
+its own internal volume-zeroing step, isolation itself is the wrong tool.
+
+**Consequence for §9's next steps**: theory 3 (isolate via `render-macro`) is not viable for macro 28
+as originally proposed — use `render-pattern --pattern 82` instead (preserves the real retrigger
+cadence) if a `measure-pitch` reading on this macro/voice is still wanted. Theories 1 (no-op the `$11`
+wobble and compare) and 2 (get the editor's own loop-point ground truth for macro 28) are unaffected
+by this finding and remain the more promising next steps — neither depends on single-shot macro
+isolation.
+
+## CHOSEN NEXT STEP (session 9): theory 1 — test whether the `$11` wobble magnitude is the culprit
+
+User chose theory 1 over theory 2 to go next. Not yet executed — this is the exact recipe a fresh
+session should run, no re-deriving needed:
+
+1. **Temporarily no-op the post-loop `$11 AddBegin` wobble.** In `tfmx/src/macro_interp.rs`'s `0x11`
+   arm (currently around line 710-731, the one-shot branch at `if b1 == 0 { ... }`), change the
+   `if self.loop_active { self.loop_start = self.loop_start.wrapping_add_signed(step); }` line to skip
+   the add entirely when `self.loop_active` (leave `self.loop_start` untouched post-`$18`; keep the
+   pre-loop `else` branch as-is, since that path is outside this experiment's scope). This is a
+   throwaway experimental edit — do **not** commit it; revert immediately after rendering (`git diff`
+   should be empty again before moving on).
+2. **Render two comparison pairs, current tree vs. the no-op'd tree**, using the already-built tooling:
+   - `tfmx-cli render-pattern "testdata/mdat.turrican intro" "testdata/smpl.turrican intro" --pattern 82 --seconds 5 -o <before/after>.wav` —
+     tightest reproduction (pattern `0x52`/macro `0x1c` alone, preserves the retrigger cadence §10
+     showed matters, no full-song noise).
+   - Full-mix `tfmx-cli render "testdata/mdat.turrican intro" "testdata/smpl.turrican intro" --seconds 90 --gate any -o <before/after>.wav`
+     plus voice-0 stem — what the user actually judges "wanders"/"too low" against.
+3. **Quantify before comparing by ear** (per §7's lesson: don't trust "sounds the same" without a
+   number first) — reuse §7's own recipe: `sha256sum`, an RMS-of-diff script, `tfmx-cli onset-diff`,
+   and `tfmx-cli measure-pitch` on the voice-0 stem pair. A large diff + a measurable pitch shift
+   between before/after would corroborate the wobble as (part of) the cause; a negligible diff would
+   rule it out cheaply, without needing the user's ears at all.
+4. **Only then** ask the user to A/B the full-mix + voice-0-stem pair by ear, the same way §5/§9's
+   fixes were verified — per the standing rule, nothing here counts as resolved until they've listened.
+
+If theory 1 comes back negative (no meaningful diff, or diff doesn't move the complaint), theory 2
+(get the editor's own loop-point/playhead inspector values for macro 28, §9 above, never attempted)
+is the fallback — it's the only remaining way to check whether `$18`'s loop-length *value* itself
+(not just its bounds) matches what the composer intended.
