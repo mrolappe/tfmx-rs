@@ -886,3 +886,70 @@ If theory 1 comes back negative (no meaningful diff, or diff doesn't move the co
 (get the editor's own loop-point/playhead inspector values for macro 28, §9 above, never attempted)
 is the fallback — it's the only remaining way to check whether `$18`'s loop-length *value* itself
 (not just its bounds) matches what the composer intended.
+
+---
+
+## 11. Session 9: theory 1 run — mixed result, wobble is real but doesn't move measured pitch
+
+Ran the §9/§10 recipe exactly: temporarily no-op'd the `if self.loop_active { ... }` arm of `0x11`
+(`tfmx/src/macro_interp.rs` line ~718) so the post-loop wobble never touches `loop_start`, built,
+rendered three before/after pairs (`render-pattern --pattern 82`, full `render --gate any`,
+`render --gate any --solo 0`), reverted the edit (`git checkout --`, confirmed `git status` clean
+before doing anything else), rebuilt to restore the baseline.
+
+| scope | nonzero-diff | RMS(diff)/RMS(a) | onsets before → after | corr | measure-pitch before → after |
+|---|---|---|---|---|---|
+| pattern 82 alone, 5s | 43.7% | 113.2% | 20 → 20 | 1.000 | 441.00 Hz → 441.00 Hz (unchanged) |
+| full mix, 90s | 35.6% | 46.0% | 150 → 167 | 0.086 | n/a (mixed signal) |
+| voice 0 solo, 90s | 30.8% | 60.0% | 127 → 138 | 0.408 | 8820.00 Hz → 8820.00 Hz (unchanged) |
+
+**Not a no-op**: at every scope the diff is large — comparable in magnitude to the confirmed-real
+§7 fixes (113%/60%/46% here vs. 250%/187%/205% there) — so the wobble is definitely doing
+something audible, not a dead branch.
+
+**But the isolated case (pattern 82, no trackstep/gating interference) shows identical measured
+pitch and identical onset timing/rhythm before and after**, despite the large sample-level diff.
+That's evidence *against* the wobble being the cause of "too low pitch": in the one scope where
+this specific code path's effect isn't confounded by the `AnyTrack` gating cascade (§7's caveat —
+a timing shift in one voice can move when its pattern hits `$F0`, which moves the shared trackstep
+line, which changes what every voice plays afterward), pitch didn't move at all. The full-mix and
+voice-0-solo onset-count/correlation changes are large, but per §7 that pattern (real diff at every
+scope, inconsistent direction) is exactly what the gating cascade produces on its own, not
+specific evidence for this fix. The voice-0 `measure-pitch` reading (8820 Hz, identical both ways)
+is almost certainly not a meaningful note-pitch measurement at that scope — 90s of solo voice 0
+includes long silences and multiple different notes, so the autocorrelation is likely locking onto
+noise-floor periodicity rather than tracking a single note; the pattern-82 reading (441 Hz, a
+single sustained retriggered tone, isolated) is the one to trust.
+
+**Verdict on theory 1: doesn't explain "too low pitch."** The wobble does change sample content
+(consistent with contributing to "wanders" — it's still moving `loop_start` by 5-6x the loop
+region's size every jiffy, which is a real basis for reading the wrong bytes) but the one clean,
+unconfounded measurement available shows no pitch shift. Per the recipe's own threshold (large
+diff → worth the user's ears before ruling out entirely) the before/after WAV pairs are worth an
+A/B listen on the "wanders" question specifically, but this session did not spend the user's ears
+yet — rendered pairs are in the scratchpad, not committed anywhere permanent.
+
+**Next**: either (a) get the user to A/B `pattern-before.wav`/`pattern-after.wav` and the
+full-mix/voice-0 pairs specifically for the "wanders" (not pitch) symptom, since the numbers here
+only rule out a pitch connection, not a wander connection; or (b) move straight to theory 2 (editor
+loop-point ground truth for macro 28, §9), which is the only lead left that could explain "too low
+pitch" specifically since theory 1's one clean measurement clears the wobble of that symptom.
+
+**Ear result (same session): theory 1 is dead, and not just neutral — disabling the wobble makes
+voice 0 sound worse.** The user A/B'd `voice0-before.wav` (wobble on, current/committed code)
+against `voice0-after.wav` (wobble no-op'd): *"the pad in voice 0 before sounded better, having
+some kind of modulation sweep. the voice 0 after version sounds like the loop is looping over a
+smaller section, thus sounding faster and wrong/grainy."* So the wobble is not an unwanted
+"wandering" artifact — it's what gives the pad its sweep/chorus character, and removing it exposes
+a small, static loop region that sounds thin and grainy instead. **Do not remove or weaken this
+code path.** This also reframes "wanders" from the original complaint: it was never about this
+`$11` post-loop wobble specifically (which the user now confirms sounds *right*), so whatever
+originally prompted "the playhead moves to the wrong places" is still unidentified.
+
+New data point worth carrying into theory 2: the no-wobble loop alone (`loop_start`/`loop_len` as
+`$18` computes them, no per-jiffy movement) reads as "smaller than it should be" by ear — faster
+and grainier than the real instrument. That's a plausible base for "too low pitch" being wrong in
+the *other* direction than assumed (a loop that's too short raises pitch, doesn't lower it) — worth
+explicitly asking the editor's loop-point inspector whether `loop_len=128` words (macro 28,
+`turrican intro`) matches, undershoots, or overshoots the composer's intended region, not just
+whether some other value is "more correct" in the abstract.
