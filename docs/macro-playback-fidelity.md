@@ -1251,3 +1251,35 @@ explicitly (or denying it) — this needs a primary-source re-check and, if adop
 blast-radius architecture change** (decoupling the macro tick clock from `tick_fraction`
 throughout `player.rs`/`sequencer.rs`), unlike every per-opcode fix earlier in this thread.
 **Not yet implemented — chosen next step for a fresh session, pending the user's direction.**
+
+**Paused here (2026-08-01, user's call) — reproduction steps for whoever picks this up:**
+
+Reference recording (external, not in the repo): `/Users/mrolappe/Nextcloud/drehscheibe/
+turripat54.m4a` — the real TFMX editor playing `turrican intro` pattern `0x54` in song context,
+voice 2 soloed/others muted, ~20.7s, 44.1kHz mono AAC. Convert with
+`ffmpeg -y -i turripat54.m4a -ar 44100 -ac 1 editor-pattern54-voice2.wav`.
+
+This crate's comparison render (session scratchpad, not committed — regenerate):
+```
+tfmx-cli render-pattern "testdata/mdat.turrican intro" "testdata/smpl.turrican intro" \
+  --pattern 84 --transpose=-24 --tempo 3 --seconds 21 -o crate-pattern84-voice2.wav
+```
+
+Measurements to reproduce:
+- `tfmx-cli measure-pitch <wav>` on both — expect ~155 Hz both sides (pitch already confirmed
+  matching, not the thing to re-check).
+- `tfmx-cli onset-diff crate-pattern84-voice2.wav editor-pattern54-voice2.wav` — expect ~1.9
+  onsets/s (crate) vs. ~6.2 onsets/s (editor), correlation near 0.
+- A Python/numpy script computing a 20ms RMS envelope and its autocorrelation on the editor WAV
+  (steady-state region, e.g. windows 50-400, skip the attack) finds the clean 160ms period; no
+  ready-made CLI tool for this yet, ad hoc this session.
+
+Next concrete step: re-check `[S1]` (`docs/format.md`'s Sources table, tag S1) specifically for
+any statement about whether macro-opcode timers (`$04`/`$0F`/`$0B`/`$0C`/`$11`) run on the song's
+tempo-scaled jiffy or the raw 50Hz hardware rate — this project's own docs currently assert the
+former (`docs/playback-model.md` §1) without a citation, and no prior session tested it. If `[S1]`
+is silent (as most of §3's timing section already is on edge cases), the only way to gain more
+confidence before attempting the refactor is another *controlled* editor experiment analogous to
+the `docs/trackstep-timing-bug.md` stopwatch test — e.g. author a minimal macro with a single
+`$04 <Wait>* aaaa=N` between two audible markers, at two different song tempos, and check whether
+the real-time gap changes with tempo (unified clock) or stays fixed (raw-50Hz clock).
