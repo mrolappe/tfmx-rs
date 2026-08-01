@@ -375,7 +375,20 @@ and timing both come out wrong whenever `n` doesn't evenly divide
 ## 4. Note table, transpose, detune → period
 
 [S1] §A gives note **names**, not periods or frequencies, anchored by one
-statement in §3: **"All notes are based at `$1E`=middle C (8363Hz)."**
+statement in §3: **"All notes are based at `$1E`=middle C (8363Hz)."** **A
+real-editor A/B falsifies this anchor** (`docs/macro-playback-fidelity.md`
+§14): a from-scratch minimal scale, checked note-for-note against the actual
+TFMX editor, plays a consistent tritone (6 semitones) higher than this
+crate for identical note bytes, and the offset is uniform across two
+independently-checked octave pairs -- not a per-note or per-range error.
+`[S1]` never states a note→frequency formula, only this one anchor point, so
+the exponential formula below (already flagged as this project's own
+inference) was never actually checked against real hardware until that A/B.
+The arithmetic below uses `$18` as the anchor instead, keeping `[S1]`'s
+`8363Hz` (a well-known standalone Amiga constant, plausible independent of
+which note it's tied to). `$1E` keeps its table name "C-3" below -- only the
+*frequency anchor* moved, not the naming.
+
 Reproduced verbatim (index, name):
 
 ```
@@ -409,24 +422,24 @@ reference point) — **inferred**, not stated as a formula in [S1], but the
 standard convention for exactly this kind of note table on Amiga hardware:
 
 ```
-freq_hz(note) = 8363 × 2^((note − $1E) / 12)
+freq_hz(note) = 8363 × 2^((note − $18) / 12)
 ```
 
 **Note → period**, combining with §2.1's Paula constant:
 
 ```
 period(note) = 3_546_895 / freq_hz(note)
-             = 3_546_895 / (8363 × 2^((note − $1E) / 12))
+             = 3_546_895 / (8363 × 2^((note − $18) / 12))
 ```
 
-Worked example: `note = $1E` → exponent 0 → `freq = 8363 Hz` →
+Worked example: `note = $18` ("F#2") → exponent 0 → `freq = 8363 Hz` →
 `period = 3_546_895 / 8363 ≈ 424.2` → **424** (rounding convention itself
 is not stated by [S1]; round-half-to-even or truncate are both defensible,
 pick one and keep it consistent).
 
-Second example: `note = $2A` (one octave above `$1E`, "C-4") → exponent
-`(0x2A − 0x1E)/12 = 12/12 = 1` → `freq = 8363 × 2 = 16726 Hz` →
-`period = 3_546_895 / 16726 ≈ 212.1` → **212**, exactly half the `$1E`
+Second example: `note = $24` (one octave above `$18`, "F#3") → exponent
+`(0x24 − 0x18)/12 = 12/12 = 1` → `freq = 8363 × 2 = 16726 Hz` →
+`period = 3_546_895 / 16726 ≈ 212.1` → **212**, exactly half the `$18`
 period, as expected for an octave up.
 
 ### 4.1 Transpose
@@ -472,7 +485,7 @@ outside the two documented example points (`$0080`/`$FF80`) are meant to be
 usable at all, or whether real module data ever exercises them — treat the
 formula as validated only at those two points.
 
-Worked example: `note = $1E` (period 424, freq 8363 Hz), `bbbb = $0080`
+Worked example: `note = $18` (period 424, freq 8363 Hz), `bbbb = $0080`
 (+50%): `multiplier = 1.5` → `freq_final = 8363 × 1.5 = 12544.5 Hz` →
 `period_final = 3_546_895 / 12544.5 ≈ 282.7` → **283**.
 
@@ -560,7 +573,7 @@ pitch down** (period grows) and negative `bb` bends it up (period shrinks)
 — easy to get backwards when reading "portamento" as "pitch rises with a
 positive number."
 
-Worked example: starting period `424` (`$1E`, from §4), `aa = 1` (every
+Worked example: starting period `424` (`$18`, from §4), `aa = 1` (every
 jiffy), `bb = 10`: `period_1 = 424 × 266/256 ≈ 440.4`, `period_2 ≈ 440.4 ×
 266/256 ≈ 457.6`, and so on, each step multiplying by the same
 `266/256 ≈ 1.0391` ratio. [S1] does not state a rounding convention for

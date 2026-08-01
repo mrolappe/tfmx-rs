@@ -8,9 +8,12 @@ use crate::paula::Paula;
 /// `docs/playback-model.md` §2.1.
 const PAULA_CLOCK_HZ: f64 = 3_546_895.0;
 
-/// Note `$1E` is middle C, 8363 Hz -- the one point [S1] anchors the table
-/// to. `docs/playback-model.md` §4.
-const MIDDLE_C_NOTE: i32 = 0x1E;
+/// [S1] states this anchor at note `$1E`, but a real-editor A/B (a from-
+/// scratch minimal scale, `testdata/synth/`) measured the editor a tritone
+/// (6 semitones) higher than that for identical note bytes -- `$18` is the
+/// anchor that matches the editor. `docs/macro-playback-fidelity.md` §14,
+/// `docs/playback-model.md` §4.
+const MIDDLE_C_NOTE: i32 = 0x18;
 const MIDDLE_C_HZ: f64 = 8363.0;
 
 /// Paula period for `note` (already transposed -- may fall outside `$00`-
@@ -911,33 +914,34 @@ mod tests {
 
     #[test]
     fn middle_c_matches_the_worked_example() {
-        assert_eq!(note_period(0x1E, 0), 424);
+        assert_eq!(note_period(0x18, 0), 424);
     }
 
     #[test]
     fn one_octave_up_halves_the_period() {
-        assert_eq!(note_period(0x2A, 0), 212);
+        assert_eq!(note_period(0x24, 0), 212);
     }
 
     #[test]
     fn finetune_plus_50_percent_matches_the_worked_example() {
-        assert_eq!(note_period(0x1E, 0x0080), 283);
+        assert_eq!(note_period(0x18, 0x0080), 283);
     }
 
     #[test]
     fn finetune_minus_50_percent_lowers_pitch() {
-        assert_eq!(note_period(0x1E, -128), 848);
+        assert_eq!(note_period(0x18, -128), 848);
     }
 
     #[test]
     fn transpose_is_note_index_addition_before_lookup() {
-        assert_eq!(note_period(0x1E + 12, 0), note_period(0x2A, 0));
+        assert_eq!(note_period(0x18 + 12, 0), note_period(0x24, 0));
     }
 
     /// Sweeps the whole `$00`-`$3F` note range against an *independently
     /// derived* expectation: instead of the implementation's closed-form
     /// `powf`, walk the equal-temperament semitone ratio 2^(1/12) up or down
-    /// from the one anchor [S1] states (`$1E` = 8363 Hz). A systematic error
+    /// from the editor-validated anchor (`$18` = 8363 Hz, see
+    /// `MIDDLE_C_NOTE`'s doc comment). A systematic error
     /// in the closed form would not reproduce itself here. Tolerance +/-1 is
     /// exactly the rounding freedom `docs/playback-model.md` §4 leaves open
     /// (round-half-to-even vs. truncate, "pick one and keep it consistent").
@@ -1402,7 +1406,7 @@ mod tests {
         ]]);
         let module = Module::parse(&mdat, &[]).expect("valid header parses");
         let mut mac = MacroInterpreter::new();
-        mac.trigger(0, 0x18, 0, 0); // note $18 + 6 = $1E
+        mac.trigger(0, 0x12, 0, 0); // note $12 + 6 = $18
         let mut paula = Paula::new(100);
         tick(&mut mac, &module, &mut paula);
         assert_eq!(paula.voice(0).period, 424);
@@ -1413,7 +1417,7 @@ mod tests {
 
     #[test]
     fn set_note_uses_the_operand_directly_not_the_triggering_note() {
-        let mdat = macro_module(&[&[[0x09, 0x1E, 0x00, 0x00]]]);
+        let mdat = macro_module(&[&[[0x09, 0x18, 0x00, 0x00]]]);
         let module = Module::parse(&mdat, &[]).expect("valid header parses");
         let mut mac = MacroInterpreter::new();
         mac.trigger(0, 0x00, 0, 0); // triggering note is irrelevant to $09
@@ -1442,12 +1446,12 @@ mod tests {
     /// inheriting it.
     #[test]
     fn note_on_replaces_a_stale_play_macro_detune() {
-        let mdat = macro_module(&[&[[0x09, 0x1E, 0x00, 0x00]]]);
+        let mdat = macro_module(&[&[[0x09, 0x18, 0x00, 0x00]]]);
         let module = Module::parse(&mdat, &[]).expect("valid header parses");
         let mut mac = MacroInterpreter::new();
-        mac.trigger(0, 0x1E, 0, 0);
+        mac.trigger(0, 0x18, 0, 0);
         mac.play_macro(0, 0x40);
-        mac.note_on(0, 0x1E, 0, 0, 0);
+        mac.note_on(0, 0x18, 0, 0, 0);
         let mut paula = Paula::new(100);
         tick(&mut mac, &module, &mut paula);
         assert_eq!(paula.voice(0).period, 424);
@@ -1474,8 +1478,8 @@ mod tests {
         let mdat = macro_module(&[&[[0x1F, 0x00, 0x00, 0x00]]]);
         let module = Module::parse(&mdat, &[]).expect("valid header parses");
         let mut mac = MacroInterpreter::new();
-        mac.trigger(0, 0x1E, 0, 0); // last_note becomes $1E on the next trigger
-        mac.trigger(0, 0x00, 0, 0); // current note $00, last_note $1E
+        mac.trigger(0, 0x18, 0, 0); // last_note becomes $18 on the next trigger
+        mac.trigger(0, 0x00, 0, 0); // current note $00, last_note $18
         let mut paula = Paula::new(100);
         tick(&mut mac, &module, &mut paula);
         assert_eq!(paula.voice(0).period, 424);
@@ -1854,7 +1858,7 @@ mod tests {
         let mdat = macro_module(&[&[[0x1E, 0x06, 0xFE, 0x0A]]]);
         let module = Module::parse(&mdat, &[]).expect("valid header parses");
         let mut mac = MacroInterpreter::new();
-        mac.trigger(0, 0x18, 0, 0); // note $18 + 6 = $1E
+        mac.trigger(0, 0x12, 0, 0); // note $12 + 6 = $18
         let mut paula = Paula::new(100);
         tick(&mut mac, &module, &mut paula);
         assert_eq!(paula.voice(0).period, 424);

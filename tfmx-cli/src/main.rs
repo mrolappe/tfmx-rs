@@ -44,7 +44,7 @@ enum Command {
     RenderPattern(RenderPatternArgs),
     /// Measure a rendered WAV's fundamental frequency via autocorrelation --
     /// e.g. this crate's `render-macro` output vs. the editor's own
-    /// macro-audition, or against the documented `8363 * 2^((note-30)/12)`
+    /// macro-audition, or against the documented `8363 * 2^((note-24)/12)`
     /// note table. For isolating `note_period()`/pitch from every other
     /// layer (trackstep, pattern, macro effects) that could also be wrong.
     MeasurePitch(MeasurePitchArgs),

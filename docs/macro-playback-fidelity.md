@@ -1162,3 +1162,27 @@ index, but the number itself is a well-known standard Amiga constant, independen
   `§13`), do not declare it fixed until confirmed by ear.
 - `testdata/synth/gen_minimal_scale.py` is the fast control loop for this: regenerate, render, and
   A/B against the editor again after the code change, before spending corpus-wide listening time.
+
+**Update (2026-08-01, session 12): `MIDDLE_C_NOTE` changed `0x1E` -> `0x18`, TDD'd, not yet heard.**
+Implemented exactly the change §14 proposed, nothing more: `tfmx/src/macro_interp.rs`'s
+`MIDDLE_C_NOTE` constant, doc comment updated to record the editor A/B rather than cite `[S1]`'s
+(now-falsified) anchor claim. Five tests hard-coded an absolute period at note `$1E` (the old
+anchor) — updated to `$18` (renumbering the note bytes each test triggers, not just the literal
+expected period, so each test still exercises "the anchor note") — plus two worked-example
+literals (`middle_c_matches_the_worked_example`, `one_octave_up_halves_the_period`) and their
+octave-up counterpart moved `$2A` -> `$24` to stay one octave above the new anchor. The
+octave-doubling and independently-walked-semitone-ratio sweep tests needed no change (self-
+referential against `MIDDLE_C_NOTE`, not a hard-coded note). `docs/playback-model.md` §4's worked
+examples and prose updated to the `$18` anchor, with an explicit note that `$1E` keeps its table
+*name* ("C-3") — only the frequency anchor moved. `tfmx-cli`'s `measure-pitch` help text
+(`note-30` -> `note-24`) updated too. 145 `tfmx` unit tests, full workspace suite (`tfmx-cli`'s 59
++ golden + doctest), `mutation_robustness` and clippy all pass. Golden hashes regenerated for
+**all ten** corpus modules, as expected (every note's pitch shifts by this fix, unlike every
+earlier narrower fix in this thread). Rendered fresh WAVs for the user's A/B, not yet listened to:
+`testdata/synth/mdat.minimal-scale` re-rendered (session scratchpad, not committed — the
+generator script's own header comment about which note lands near "real middle C" is now stale
+prose, harmless since it doesn't drive the actual test data), and a full-mix + 4 stems of
+`turrican intro` (`--seconds 90 --gate any`, session scratchpad). **Per this thread's own repeated
+lesson (§7/§9/§13): this is not done until the user's ears confirm it against the real editor
+(the minimal scale) and ideally `uade123` (the corpus module) — do not upgrade this past "likely"
+without that.**
