@@ -28,21 +28,26 @@ fn voice_of(nibble: u8) -> usize {
 /// `$F0 <End>`: *"Ends this pattern; trackstep advances."* -- so the line
 /// pointer is driven by pattern completion, not by the tick clock. What no
 /// source states is what happens when the eight tracks reach `$F0` at
-/// different times, which `docs/playback-model.md` §7 records as open.
-/// Both readings are implemented and selectable so they can be A/B'd
-/// against the TFMX editor, which is the only reference that can settle it.
+/// different times, which `docs/playback-model.md` §7 recorded as open --
+/// **now settled**: in the TFMX editor, authoring one track's pattern to a
+/// fixed 2-jiffy length and another's to 200 jiffies on the same trackstep
+/// line, the line advanced in both cases as soon as the *short* track hit
+/// `$F0`, with zero effect from the long track's length. Only `AnyTrack`
+/// predicts that. Both readings stay implemented for comparison, but
+/// `AnyTrack` is the confirmed default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrackstepGate {
     /// Every track still running a pattern must have reached `$F0`. The
     /// line lasts as long as its longest track, which is what makes a
     /// pure-filler pattern (`$F3 <Wait>` then `$F0`, as `turrican intro`'s
     /// pattern 21 is in its entirety) a way to pad a short track out to the
-    /// line's length.
-    #[default]
+    /// line's length. Ruled out by the editor test described above.
     AllTracks,
     /// Any one track reaching `$F0` moves the line, truncating the rest.
     /// The same filler pattern then reads as the line's *metronome*, fixing
     /// its length regardless of what the other tracks were still playing.
+    /// Confirmed against the TFMX editor -- see above.
+    #[default]
     AnyTrack,
 }
 

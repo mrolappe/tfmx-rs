@@ -608,12 +608,11 @@ impl MacroInterpreter {
             }
             0x04 => {
                 // <Wait>*: waits `word23` jiffies (no "+1" -- docs/opcodes.md §3).
-                if word23 == 0 {
-                    true
-                } else {
-                    self.wait = Wait::Jiffies(word23 - 1);
-                    false
-                }
+                // Asterisked, so it always suspends for at least one jiffy
+                // (docs/opcodes.md §3 intro) -- same convention as `$00`'s own
+                // `aa == 0` case -- even when `word23 == 0`.
+                self.wait = Wait::Jiffies(word23.saturating_sub(1));
+                false
             }
             0x05 | 0x10 => {
                 // <Loop> / <Loop key up>
@@ -743,15 +742,26 @@ impl MacroInterpreter {
                 false
             }
             0x18 => {
-                // <Sampleloop>. `loop_len` mirrors Paula's 16-bit length
-                // register (`docs/format.md` §8) -- when `delta` exceeds the
-                // current loop_len, mask to that width so the subtraction
-                // wraps mod 65536 like the real chip, not mod 2^32 (which
-                // would produce a length that reads far past the sample
-                // buffer and goes silent for the rest of the note).
+                // <Sampleloop>. `docs/opcodes.md` §4: the 24-bit delta is
+                // added to `loop_start` (a *byte* address, same units as
+                // `$02 SetBegin`) and subtracted from `loop_len` -- but
+                // `loop_len` mirrors Paula's length register, which counts
+                // *words* (`docs/format.md` §8, one count = 2 bytes, same as
+                // `$03 SetLen`). Applying the byte-valued delta directly to
+                // the word-valued length breaks the doc's own stated
+                // invariant ("the sample's end point is unchanged"): halving
+                // it first is what keeps `loop_start + loop_len*2` constant.
+                // An arithmetic shift (not `/2`) matches a real 68000's ASR
+                // idiom for negative deltas, consistent with the rounding
+                // convention already adopted elsewhere (`docs/playback-
+                // model.md` §5.3). When the halved delta exceeds the current
+                // loop_len, mask to 16 bits so the subtraction wraps mod
+                // 65536 like the real chip, not mod 2^32 (which would
+                // produce a length that reads far past the sample buffer and
+                // goes silent for the rest of the note).
                 let delta = sext24(b1, b2, b3);
                 self.loop_start = self.loop_start.wrapping_add_signed(delta);
-                self.loop_len = self.loop_len.wrapping_sub_signed(delta) & 0xFFFF;
+                self.loop_len = self.loop_len.wrapping_sub_signed(delta >> 1) & 0xFFFF;
                 true
             }
             0x19 => {
@@ -1033,6 +1043,30 @@ mod tests {
         }
         tick(&mut mac, &module, &mut paula);
         assert_eq!(paula.voice(0).volume, 0x28);
+    }
+
+    #[test]
+    fn wait_with_zero_jiffies_still_suspends_one_jiffy() {
+        // `$04` is asterisked (`docs/opcodes.md` §3 intro): it can suspend the
+        // macro program, same convention as `$00`'s own `aa == 0` case
+        // (`dma_off_reset_with_zero_aa_suspends_one_jiffy` above). `aaaa == 0`
+        // must still yield to the next jiffy, not skip suspension outright --
+        // otherwise a `$05 Loop` with no other suspending step in its body
+        // (e.g. `turrican intro` macro 10) spins the whole loop instantly
+        // every tick instead of pacing one iteration per real jiffy.
+        let mdat = macro_module(&[&[
+            [0x04, 0x00, 0x00, 0x00],
+            [0x0E, 0x20, 0x00, 0x00],
+            [0x07, 0, 0, 0],
+        ]]);
+        let module = Module::parse(&mdat, &[]).expect("valid header parses");
+        let mut mac = MacroInterpreter::new();
+        mac.trigger(0, 0, 0, 0);
+        let mut paula = Paula::new(100);
+        tick(&mut mac, &module, &mut paula);
+        assert_eq!(paula.voice(0).volume, 0, "not yet -- $04 still suspends one jiffy");
+        tick(&mut mac, &module, &mut paula);
+        assert_eq!(paula.voice(0).volume, 0x20, "runs next jiffy");
     }
 
     // -- $05/$10 Loop --
@@ -1433,11 +1467,15 @@ mod tests {
 
     #[test]
     fn sampleloop_compounds_on_repeated_calls() {
+        // Deltas are even (word-aligned, as real corpus data is) so halving
+        // is exact -- see the `$18` arm's own comment for why the delta
+        // (bytes, same units as `$02 SetBegin`) must be halved before it hits
+        // `loop_len` (words, Paula's length register, `$03 SetLen`'s units).
         let mdat = macro_module(&[&[
             [0x02, 0x00, 0x00, 0x64], // SetBegin +100
             [0x03, 0x00, 0x00, 0x0A], // SetLen 10
-            [0x18, 0x00, 0x00, 0x05], // Sampleloop +5/-5
-            [0x18, 0x00, 0x00, 0x05], // again -- compounds, not idempotent
+            [0x18, 0x00, 0x00, 0x04], // Sampleloop +4 bytes / -2 words
+            [0x18, 0x00, 0x00, 0x04], // again -- compounds, not idempotent
             [0x07, 0, 0, 0],
         ]]);
         let module = Module::parse(&mdat, &[]).expect("valid header parses");
@@ -1448,17 +1486,39 @@ mod tests {
         let v = paula.voice(0);
         assert_eq!(v.start, 100); // attack region untouched by $18
         assert_eq!(v.len, 10);
-        assert_eq!(v.loop_start, 110); // two +5 calls
-        assert_eq!(v.loop_len, 0); // two -5 calls
+        assert_eq!(v.loop_start, 108); // two +4-byte calls
+        assert_eq!(v.loop_len, 6); // two -2-word calls
+    }
+
+    #[test]
+    fn sampleloop_preserves_the_sample_end_point() {
+        // `docs/opcodes.md` §4: "$18 ... moves the loop start forward (or
+        // back) by aaaaaa bytes while shrinking (or growing) the remaining
+        // sample length by the same amount, so the sample's end point is
+        // unchanged." That's only true in *byte* terms if the byte-valued
+        // delta is halved before it's subtracted from the word-valued
+        // `loop_len` -- pin the invariant directly rather than a magic
+        // number.
+        let mdat = macro_module(&[&[
+            [0x02, 0x00, 0x00, 0x64], // SetBegin +100
+            [0x03, 0x00, 0x00, 0x0A], // SetLen 10 words -- end = 100 + 20 = 120
+            [0x18, 0x00, 0x00, 0x08], // Sampleloop +8 bytes
+            [0x07, 0, 0, 0],
+        ]]);
+        let module = Module::parse(&mdat, &[]).expect("valid header parses");
+        let mut mac = MacroInterpreter::new();
+        mac.trigger(0, 0, 0, 0);
+        let mut paula = Paula::new(100);
+        run(&mut mac, &module, &mut paula, 1);
+        let v = paula.voice(0);
+        assert_eq!(v.loop_start as u64 + v.loop_len as u64 * 2, 120);
     }
 
     #[test]
     fn sampleloop_underflow_wraps_at_16_bits_like_real_paula_hardware() {
-        // `turrican intro`'s macro 28 does exactly this: `$03 SetLen 1024`
-        // then `$18 Sampleloop +1792` -- the delta exceeds the current
-        // loop_len. Paula's length register is 16-bit hardware (`docs/
-        // format.md` §8); a real chip wraps this subtraction mod 65536, not
-        // mod 2^32. Wrapping in 32-bit space instead produces a length near
+        // Paula's length register is 16-bit hardware (`docs/format.md` §8);
+        // a real chip wraps an underflowing subtraction mod 65536, not mod
+        // 2^32. Wrapping in 32-bit space instead produces a length near
         // `u32::MAX`, which makes `Voice::next_sample` read far past the
         // sample buffer forever -- silently returning 0 (silence) for the
         // rest of the note instead of the wrapped-but-audible waveform real
@@ -1466,7 +1526,7 @@ mod tests {
         let mdat = macro_module(&[&[
             [0x02, 0x00, 0x00, 0x64], // SetBegin +100
             [0x03, 0x00, 0x00, 0x0A], // SetLen 10 -- loop_len starts at 10
-            [0x18, 0x00, 0x00, 0x0F], // Sampleloop +15/-15: underflows
+            [0x18, 0x00, 0x00, 0x1E], // Sampleloop +30 bytes / -15 words: underflows
             [0x07, 0, 0, 0],
         ]]);
         let module = Module::parse(&mdat, &[]).expect("valid header parses");
@@ -1476,6 +1536,37 @@ mod tests {
         run(&mut mac, &module, &mut paula, 1);
         let v = paula.voice(0);
         assert_eq!(v.loop_len, 65531); // (10i32 - 15) as u16 -- not ~u32::MAX
+    }
+
+    #[test]
+    fn sampleloop_keeps_turrican_intro_macro_28_in_bounds() {
+        // `turrican intro` pattern 0x52/macro 0x1c on voice 0
+        // (`docs/macro-playback-fidelity.md` §5): before this fix,
+        // `loop_len` computed as 1024 - 1792 (masked mod 65536) = 64768
+        // words = 129536 bytes, reaching far past the 45828-byte
+        // `smpl.turrican intro` file and reading as silence for most of the
+        // note. Halving the delta first keeps the sample's end point fixed
+        // (100 + 1024*2 = 39912+... see below) and lands well within bounds.
+        let mdat = macro_module(&[&[
+            [0x02, 0x00, 0x1C, 0x14], // SetBegin +0x1C14 = 7188
+            [0x02, 0x00, 0x78, 0x04], // SetBegin +0x7804 = 30724 -> 37912
+            [0x03, 0x00, 0x04, 0x00], // SetLen 0x0400 = 1024 words
+            [0x18, 0x00, 0x07, 0x00], // Sampleloop +0x0700 = 1792 bytes
+            [0x07, 0, 0, 0],
+        ]]);
+        let module = Module::parse(&mdat, &[]).expect("valid header parses");
+        let mut mac = MacroInterpreter::new();
+        mac.trigger(0, 0, 0, 0);
+        let mut paula = Paula::new(100);
+        run(&mut mac, &module, &mut paula, 1);
+        let v = paula.voice(0);
+        assert_eq!(v.loop_start, 39704);
+        assert_eq!(v.loop_len, 128); // was 64768 before the fix
+        let loop_end_bytes = v.loop_start as u64 + v.loop_len as u64 * 2;
+        assert!(
+            loop_end_bytes < 45828,
+            "loop region must stay within smpl.turrican intro's 45828 bytes, got end={loop_end_bytes}"
+        );
     }
 
     #[test]

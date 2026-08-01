@@ -31,6 +31,23 @@ enum Command {
     /// RMS-derivative onset detector. Reports onset count/rate on each
     /// side and an inter-onset-interval correlation.
     OnsetDiff(OnsetDiffArgs),
+    /// Render a single macro to a WAV file, triggered directly with a given
+    /// note/volume -- no trackstep, pattern or track transpose involved.
+    /// For comparing this crate's macro playback against an editor's own
+    /// macro-audition feature, isolated from any song-context transpose.
+    RenderMacro(RenderMacroArgs),
+    /// Render a single pattern to a WAV file, run directly against its own
+    /// Note/Command entries -- no trackstep or song context, just a fixed
+    /// stand-in transpose/tempo (both trackstep-row inputs in a real song).
+    /// For isolating a pattern's own behavior (e.g. `$F0` timing) from
+    /// multi-track trackstep gating.
+    RenderPattern(RenderPatternArgs),
+    /// Measure a rendered WAV's fundamental frequency via autocorrelation --
+    /// e.g. this crate's `render-macro` output vs. the editor's own
+    /// macro-audition, or against the documented `8363 * 2^((note-30)/12)`
+    /// note table. For isolating `note_period()`/pitch from every other
+    /// layer (trackstep, pattern, macro effects) that could also be wrong.
+    MeasurePitch(MeasurePitchArgs),
 }
 
 #[derive(clap::Args)]
@@ -73,6 +90,127 @@ struct RenderArgs {
     stems: bool,
     #[arg(long, value_enum, default_value_t = GateArg::All)]
     gate: GateArg,
+}
+
+#[derive(clap::Args)]
+struct RenderMacroArgs {
+    mdat: PathBuf,
+    smpl: PathBuf,
+    #[arg(short = 'o', long = "output")]
+    output: PathBuf,
+    /// Macro number to trigger (0-127).
+    #[arg(long = "macro")]
+    macro_number: u8,
+    /// Note to trigger it with, before any macro-internal transpose
+    /// (`$08`/`$09`/`$1F`). Accepts a note name as shown in the editor
+    /// (`C-3`, `F#0`, `H-2`, `docs/playback-model.md` §4) or a raw note
+    /// byte, decimal or hex (`33`, `0x21`, `$21`) -- a raw byte is masked
+    /// to its low 6 bits, same as real pattern decoding, so pasting the
+    /// editor's byte for a packed pattern record (e.g. `$A1`) works
+    /// without doing that arithmetic by hand. Default is `C-3`, this
+    /// crate's middle-C anchor.
+    #[arg(long, default_value = "C-3", value_parser = parse_note)]
+    note: u8,
+    #[arg(long, default_value_t = 64)]
+    volume: u8,
+    /// Which of Paula's 4 voices to render on -- only affects stereo
+    /// position (`docs/playback-model.md` §2.1's fixed pan-per-voice), not
+    /// the macro's own behaviour.
+    #[arg(long, default_value_t = 0)]
+    voice: u8,
+    /// Jiffy rate: a stored tempo value, same encoding as the header table
+    /// (`docs/playback-model.md` §3.2). Only affects effect speeds
+    /// (envelope/vibrato/portamento `every` counts, `<Wait>`), not pitch.
+    #[arg(long, default_value_t = 0)]
+    tempo: u16,
+    #[arg(long, default_value_t = 5)]
+    seconds: u32,
+    #[arg(long, default_value_t = 44_100)]
+    rate: u32,
+    #[arg(long, default_value_t = 100)]
+    separation: u8,
+}
+
+#[derive(clap::Args)]
+struct RenderPatternArgs {
+    mdat: PathBuf,
+    smpl: PathBuf,
+    #[arg(short = 'o', long = "output")]
+    output: PathBuf,
+    /// Pattern number to run (0-127).
+    #[arg(long)]
+    pattern: u8,
+    /// Stand-in for the trackstep row's per-track transpose -- the one
+    /// piece of a Note entry a real song context supplies from outside the
+    /// pattern itself (`docs/playback-model.md` §7). Constant for the whole
+    /// render, unlike a live trackstep line which can change it every jiffy.
+    /// Accepts a plain signed decimal (`-24`) or a raw byte as the
+    /// trackstep word's low byte shows it (`0xE8`, `$E8`).
+    #[arg(long, default_value_t = 0, value_parser = parse_transpose)]
+    transpose: i8,
+    /// Jiffy rate: same encoding as the header table (`docs/playback-
+    /// model.md` §3.2). Only affects effect speeds and `$F3 <Wait>`, not
+    /// pitch.
+    #[arg(long, default_value_t = 0)]
+    tempo: u16,
+    #[arg(long, default_value_t = 10)]
+    seconds: u32,
+    #[arg(long, default_value_t = 44_100)]
+    rate: u32,
+    #[arg(long, default_value_t = 100)]
+    separation: u8,
+}
+
+/// Note names by raw table index (`docs/playback-model.md` §4), verbatim
+/// from the editor's own note table -- index `n` is the note byte with its
+/// low 6 bits equal to `n` (top 2 bits are pattern-record framing, not part
+/// of the note).
+const NOTE_NAMES: [&str; 64] = [
+    "F#0", "G-0", "G#0", "A-0", "A#0", "H-0", "C-1", "C#1", "D-1", "D#1", "E-1", "F-1", "F#1",
+    "G-1", "G#1", "A-1", "A#1", "H-1", "C-2", "C#2", "D-2", "D#2", "E-2", "F-2", "F#2", "G-2",
+    "G#2", "A-2", "A#2", "H-2", "C-3", "C#3", "D-3", "D#3", "E-3", "F-3", "F#3", "G-3", "G#3",
+    "A-3", "A#3", "H-3", "C-4", "C#4", "D-4", "D#4", "E-4", "F-4", "F#3!", "G-3!", "G#3!", "A-3!",
+    "A#3!", "H-3!", "C-4!", "C#4!", "D-4!", "D#4!", "E-4!", "F-4!", "!F#!", "!G-!", "!G#!", "!A-!",
+];
+
+/// `--note` accepts either a note name (`C-3`, case-insensitive) or a raw
+/// byte (decimal, `0x`-hex or `$`-hex), masked to its low 6 bits so the
+/// editor's raw packed-record byte can be pasted directly (see
+/// `docs/macro-playback-fidelity.md` §6).
+fn parse_note(s: &str) -> Result<u8, String> {
+    if let Some(index) = NOTE_NAMES.iter().position(|name| name.eq_ignore_ascii_case(s)) {
+        return Ok(index as u8);
+    }
+    let (radix, digits) = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Some(hex) => (16, hex),
+        None => match s.strip_prefix('$') {
+            Some(hex) => (16, hex),
+            None => (10, s),
+        },
+    };
+    let raw = u8::from_str_radix(digits, radix).map_err(|_| {
+        format!(
+            "'{s}' is not a note name (e.g. \"C-3\") or a byte 0-255 (decimal, 0x.., or $..)"
+        )
+    })?;
+    Ok(raw & 0x3F)
+}
+
+/// `--transpose` accepts a plain signed decimal (`-24`, clap's pre-existing
+/// behaviour) or a raw byte (`0x`-hex or `$`-hex, e.g. `0xE8`/`$E8`) as the
+/// trackstep track word's low byte shows it, cast via `byte as i8`
+/// (two's-complement) -- no masking, unlike `--note`: the transpose byte has
+/// no top-bit framing to strip (`tfmx/src/sequencer.rs:149-166`).
+fn parse_transpose(s: &str) -> Result<i8, String> {
+    let hex = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).or_else(|| s.strip_prefix('$'));
+    if let Some(digits) = hex {
+        let raw = u8::from_str_radix(digits, 16)
+            .map_err(|_| format!("'{s}' is not a raw byte 0x00-0xFF"))?;
+        return Ok(raw as i8);
+    }
+    s.parse::<i8>().map_err(|_| {
+        format!("'{s}' is not a signed decimal (-128..127) or a raw byte (0x.. or $..)")
+    })
 }
 
 /// Which tracks must reach `$F0 <End>` before the trackstep line advances.
@@ -176,6 +314,18 @@ struct OnsetDiffArgs {
     window_ms: u32,
 }
 
+#[derive(clap::Args)]
+struct MeasurePitchArgs {
+    wav: PathBuf,
+    /// Seconds to skip before measuring -- avoids the attack transient/DMA
+    /// startup click landing inside the analysis window.
+    #[arg(long, default_value_t = 0.2)]
+    skip_seconds: f64,
+    /// How much audio, starting after `--skip-seconds`, to analyze.
+    #[arg(long, default_value_t = 0.3)]
+    window_seconds: f64,
+}
+
 #[derive(Debug)]
 enum CliError {
     Io(std::io::Error),
@@ -250,6 +400,217 @@ fn render_to_wav(
         let chunk_frames = frames_left.min(4096);
         let out = &mut buf[..chunk_frames * 2];
         player.render(out)?;
+        for &sample in out.iter() {
+            writer.write_sample(sample)?;
+        }
+        frames_left -= chunk_frames;
+    }
+    writer.finalize()?;
+    Ok(())
+}
+
+/// Drives `MacroInterpreter` + `Paula` directly -- no `Sequencer`, no
+/// trackstep/pattern layer, no track transpose. Mirrors
+/// `Player::render_inner`'s tick-then-mix loop (`tfmx/src/player.rs`) at a
+/// single-voice scale, using the same seam `MacroInterpreter`'s own unit
+/// tests already drive standalone.
+fn run_render_macro(args: &RenderMacroArgs) -> Result<(), CliError> {
+    let mdat = std::fs::read(&args.mdat)?;
+    let smpl = std::fs::read(&args.smpl)?;
+    let module = tfmx::Module::parse(&mdat, &smpl)?;
+
+    let mut interp = tfmx::MacroInterpreter::new();
+    let mut paula = tfmx::Paula::new(args.separation);
+    let mut unsupported = tfmx::UnsupportedOps::default();
+    let mut clock = tfmx::TickClock::new(args.tempo);
+    let voice = args.voice & 0x03;
+    interp.trigger(args.macro_number, args.note, args.volume, 0);
+
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate: args.rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&args.output, spec)?;
+
+    let total_frames = args.rate as usize * args.seconds as usize;
+    let mut buf = vec![0i16; 4096 * 2];
+    let mut frames_left = total_frames;
+    let mut error = None;
+    while frames_left > 0 && error.is_none() {
+        let chunk_frames = frames_left.min(4096);
+        let out = &mut buf[..chunk_frames * 2];
+        let mut pos = 0usize;
+        clock.advance(args.rate, chunk_frames as u32, |tick_due, span_frames| {
+            if tick_due
+                && error.is_none()
+                && let Err(e) = interp.tick(&module, &mut paula, voice, &mut unsupported, |_| {})
+            {
+                error = Some(e);
+            }
+            let start = pos * 2;
+            let end = start + span_frames as usize * 2;
+            paula.render(module.smpl(), args.rate, &mut out[start..end]);
+            pos += span_frames as usize;
+        });
+        if let Some(e) = error {
+            return Err(e.into());
+        }
+        for &sample in out.iter() {
+            writer.write_sample(sample)?;
+        }
+        frames_left -= chunk_frames;
+    }
+    writer.finalize()?;
+    Ok(())
+}
+
+/// Routes one decoded pattern entry to the voice it names -- the same
+/// dispatch `Player`'s private `dispatch_pattern_entry` (`tfmx/src/
+/// player.rs`) does, reimplemented here against `MacroInterpreter`'s public
+/// methods since that function isn't exported. `$FB <PPat>`'s `track`
+/// operand is dropped: with only one pattern running there is no second
+/// track to jump to, so it's read as "replace the running pattern",
+/// covering the common self-loop/chain case but not a real multi-track jump.
+fn dispatch_pattern_entry_standalone(
+    entry: tfmx::PatternEntry,
+    transpose: i8,
+    macros: &mut [tfmx::MacroInterpreter; 4],
+    paula: &mut tfmx::Paula,
+    lock: &mut [u32; 4],
+) -> Option<u8> {
+    use tfmx::{PatternCommand, PatternEntry, NoteTiming};
+    let voice_of = |nibble: u8| (nibble & 0x03) as usize;
+    match entry {
+        PatternEntry::Note {
+            note,
+            macro_number,
+            volume,
+            voice,
+            timing,
+        } => {
+            let voice = voice_of(voice);
+            if lock[voice] > 0 {
+                return None;
+            }
+            let detune = match timing {
+                NoteTiming::Detune(detune) => detune,
+                NoteTiming::Wait(_) | NoteTiming::Portamento(_) => 0,
+            };
+            macros[voice].note_on(macro_number, note, volume, transpose, detune);
+            None
+        }
+        PatternEntry::Command(command) => match command {
+            PatternCommand::KeyUp { voice } => {
+                macros[voice_of(voice)].signal_key_up();
+                None
+            }
+            PatternCommand::Vibrato { speed, voice, depth } => {
+                macros[voice_of(voice)].start_vibrato(speed, depth as i8);
+                None
+            }
+            PatternCommand::Envelope { amount, speed, voice, target } => {
+                macros[voice_of(voice)].start_envelope(amount, speed + 1, target);
+                None
+            }
+            PatternCommand::Portamento { speed, voice, rate } => {
+                macros[voice_of(voice)].start_portamento(speed, rate as i8 as i16);
+                None
+            }
+            PatternCommand::Fade { speed, target } => {
+                paula.start_master_volume_slide(speed, target);
+                None
+            }
+            PatternCommand::Lock { channel, ticks } => {
+                lock[voice_of(channel)] = ticks as u32;
+                None
+            }
+            PatternCommand::PlayPattern { pattern, .. } => Some(pattern),
+            // Flow/timing commands (`Loop`/`Jump`/`Wait`/`GoSub`/`Return`/
+            // `Nop`) and the halt commands are already applied by
+            // `PatternRunner::apply` before `emit` returns here -- nothing
+            // voice-facing left to dispatch.
+            _ => None,
+        },
+    }
+}
+
+/// Drives one `PatternRunner` + the 4-voice `MacroInterpreter` array +
+/// `Paula` directly -- no `Sequencer`, so no trackstep line and no
+/// multi-track transpose refresh (`args.transpose` stands in, constant for
+/// the whole render). Mirrors `run_jiffy`'s per-jiffy order (pattern step,
+/// then macro tick) at single-pattern scale, the same way `run_render_macro`
+/// mirrors it at single-voice scale.
+fn run_render_pattern(args: &RenderPatternArgs) -> Result<(), CliError> {
+    let mdat = std::fs::read(&args.mdat)?;
+    let smpl = std::fs::read(&args.smpl)?;
+    let module = tfmx::Module::parse(&mdat, &smpl)?;
+
+    let mut runner = tfmx::PatternRunner::new(&module, args.pattern)?;
+    let mut macros: [tfmx::MacroInterpreter; 4] = core::array::from_fn(|_| tfmx::MacroInterpreter::new());
+    let mut paula = tfmx::Paula::new(args.separation);
+    let mut unsupported = tfmx::UnsupportedOps::default();
+    let mut lock = [0u32; 4];
+    let mut clock = tfmx::TickClock::new(args.tempo);
+
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate: args.rate,
+        bits_per_sample: 16,
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(&args.output, spec)?;
+
+    let total_frames = args.rate as usize * args.seconds as usize;
+    let mut buf = vec![0i16; 4096 * 2];
+    let mut frames_left = total_frames;
+    let mut error = None;
+    while frames_left > 0 && error.is_none() {
+        let chunk_frames = frames_left.min(4096);
+        let out = &mut buf[..chunk_frames * 2];
+        let mut pos = 0usize;
+        clock.advance(args.rate, chunk_frames as u32, |tick_due, span_frames| {
+            if tick_due && error.is_none() {
+                let mut jump = None;
+                let step = runner.advance(|_pattern, _step, entry| {
+                    if let Some(target) = dispatch_pattern_entry_standalone(
+                        entry,
+                        args.transpose,
+                        &mut macros,
+                        &mut paula,
+                        &mut lock,
+                    ) {
+                        jump = Some(target);
+                    }
+                });
+                match step {
+                    Ok(()) => {}
+                    Err(e) => error = Some(e.into()),
+                }
+                if let Some(target) = jump {
+                    match tfmx::PatternRunner::new(&module, target) {
+                        Ok(r) => runner = r,
+                        Err(e) => error = Some(e.into()),
+                    }
+                }
+                for remaining in &mut lock {
+                    *remaining = remaining.saturating_sub(1);
+                }
+                for (voice, mac) in macros.iter_mut().enumerate() {
+                    if let Err(e) = mac.tick(&module, &mut paula, voice as u8, &mut unsupported, |_| {}) {
+                        error = Some(e.into());
+                    }
+                }
+            }
+            let start = pos * 2;
+            let end = start + span_frames as usize * 2;
+            paula.render(module.smpl(), args.rate, &mut out[start..end]);
+            pos += span_frames as usize;
+        });
+        if let Some(e) = error {
+            return Err(e);
+        }
         for &sample in out.iter() {
             writer.write_sample(sample)?;
         }
@@ -735,6 +1096,39 @@ fn lint(events: &[TraceEvent], unsupported: &[(u8, u32)], pcm: &[i16], rate: u32
     r
 }
 
+/// Flags a voice whose attack or loop sample region reads past the end of
+/// `smpl`. `Paula::next_sample`'s `unwrap_or(0)` silently renders an
+/// out-of-bounds read as digital zero instead of erroring
+/// (`docs/macro-playback-fidelity.md` §5), so a bug like this shows up as
+/// unexplained silence, not a crash -- worth a lint finding regardless of
+/// what turns out to cause any one instance of it. Takes the event stream
+/// separately from `lint()` (rather than a new parameter to it) since only
+/// this check needs `smpl`'s length.
+fn check_sample_bounds(events: &[TraceEvent], smpl_len: usize) -> Vec<Finding> {
+    let mut out_of_bounds = [false; 4];
+    for e in events {
+        if let TraceEvent::Voice { voice, state } = e {
+            if !state.dma_on {
+                continue;
+            }
+            let attack_end = state.start as usize + state.len as usize * 2;
+            let loop_end = state.loop_start as usize + state.loop_len as usize * 2;
+            if attack_end > smpl_len || loop_end > smpl_len {
+                out_of_bounds[(*voice as usize) & 3] = true;
+            }
+        }
+    }
+    (0..4)
+        .filter(|&v| out_of_bounds[v])
+        .map(|v| Finding {
+            name: "sample-region-out-of-bounds",
+            detail: format!(
+                "voice {v}: a requested sample or loop region reads past the end of smpl"
+            ),
+        })
+        .collect()
+}
+
 fn write_report(r: &Report, out: &mut impl Write) -> std::io::Result<()> {
     writeln!(out, "Jiffies: {}", r.jiffies)?;
     writeln!(out, "Tempos: {:?}", r.tempos)?;
@@ -802,7 +1196,10 @@ fn run_lint(args: &LintArgs, out: &mut impl Write) -> Result<(), CliError> {
         .filter(|&(_, n)| n > 0)
         .collect();
 
-    let report = lint(&events, &unsupported, &pcm, SAMPLE_RATE);
+    let mut report = lint(&events, &unsupported, &pcm, SAMPLE_RATE);
+    report
+        .findings
+        .extend(check_sample_bounds(&events, module.smpl().len()));
     write_report(&report, out)?;
     Ok(())
 }
@@ -900,6 +1297,49 @@ fn pearson_correlation(a: &[f64], b: &[f64]) -> Option<f64> {
     Some(cov / (var_a.sqrt() * var_b.sqrt()))
 }
 
+/// Fundamental frequency of `samples` via autocorrelation: the lag (within
+/// `[min_freq, max_freq]`'s corresponding range) whose shifted copy
+/// correlates best with the original. Works on any dominantly-periodic
+/// waveform, not just a clean sine -- unlike counting zero crossings, this
+/// doesn't get confused by a raw 8-bit PCM sample's own harmonic content
+/// within one playback loop, since it directly measures the loop's repeat
+/// period rather than assuming a single crossing pair per cycle.
+fn measure_pitch_hz(samples: &[i16], rate: u32, min_freq: f64, max_freq: f64) -> Option<f64> {
+    let mean = samples.iter().map(|&s| s as f64).sum::<f64>() / samples.len().max(1) as f64;
+    let x: Vec<f64> = samples.iter().map(|&s| s as f64 - mean).collect();
+
+    let min_lag = ((rate as f64 / max_freq).floor() as usize).max(1);
+    let max_lag = ((rate as f64 / min_freq).ceil() as usize).min(x.len() / 2);
+    if min_lag >= max_lag {
+        return None;
+    }
+
+    let mut best_lag = min_lag;
+    let mut best_corr = f64::MIN;
+    for lag in min_lag..=max_lag {
+        let corr: f64 = (0..x.len() - lag).map(|i| x[i] * x[i + lag]).sum();
+        if corr > best_corr {
+            best_corr = corr;
+            best_lag = lag;
+        }
+    }
+    Some(rate as f64 / best_lag as f64)
+}
+
+fn run_measure_pitch(args: &MeasurePitchArgs, out: &mut impl Write) -> Result<(), CliError> {
+    let (mono, rate) = read_wav_mono(&args.wav)?;
+    let skip = ((args.skip_seconds * rate as f64) as usize).min(mono.len());
+    let window_len = ((args.window_seconds * rate as f64) as usize).max(1);
+    let end = (skip + window_len).min(mono.len());
+    let window = &mono[skip..end];
+
+    match measure_pitch_hz(window, rate, 50.0, 8000.0) {
+        Some(hz) => writeln!(out, "{hz:.2} Hz")?,
+        None => writeln!(out, "no periodic signal found in the analysis window")?,
+    }
+    Ok(())
+}
+
 fn run_onset_diff(args: &OnsetDiffArgs, out: &mut impl Write) -> Result<(), CliError> {
     let (mono_a, rate_a) = read_wav_mono(&args.a)?;
     let (mono_b, rate_b) = read_wav_mono(&args.b)?;
@@ -951,6 +1391,9 @@ fn main() {
         Command::Lint(args) => run_lint(args, &mut std::io::stdout().lock()),
         Command::Disasm(args) => run_disasm(args, &mut std::io::stdout().lock()),
         Command::OnsetDiff(args) => run_onset_diff(args, &mut std::io::stdout().lock()),
+        Command::RenderMacro(args) => run_render_macro(args),
+        Command::RenderPattern(args) => run_render_pattern(args),
+        Command::MeasurePitch(args) => run_measure_pitch(args, &mut std::io::stdout().lock()),
     };
     if let Err(e) = result {
         eprintln!("tfmx-cli: {e}");
@@ -961,6 +1404,69 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--note` takes a note name exactly as the editor's own table spells
+    /// it (`docs/playback-model.md` §4), case-insensitively.
+    #[test]
+    fn parse_note_accepts_note_names() {
+        assert_eq!(parse_note("C-3").unwrap(), 0x1E);
+        assert_eq!(parse_note("c-3").unwrap(), 0x1E, "case-insensitive");
+        assert_eq!(parse_note("F#0").unwrap(), 0x00);
+        assert_eq!(parse_note("H-2").unwrap(), 0x1D);
+    }
+
+    /// A plain decimal or hex byte within `0x00-0x3F` passes through
+    /// unchanged -- this is the pre-existing behaviour `render-macro`
+    /// callers already relied on.
+    #[test]
+    fn parse_note_accepts_raw_byte_already_in_range() {
+        assert_eq!(parse_note("33").unwrap(), 33);
+        assert_eq!(parse_note("0x21").unwrap(), 0x21);
+        assert_eq!(parse_note("$21").unwrap(), 0x21);
+    }
+
+    /// The editor shows a packed pattern-record byte (top 2 bits are
+    /// timing framing, not note) -- `docs/macro-playback-fidelity.md` §6:
+    /// pasting it raw used to silently mistrigger. `--note` now masks it
+    /// to the low 6 bits, same as real pattern decoding.
+    #[test]
+    fn parse_note_masks_raw_byte_above_0x3f() {
+        assert_eq!(parse_note("161").unwrap(), 0x21, "0xA1 & 0x3F");
+        assert_eq!(parse_note("0xA1").unwrap(), 0x21);
+    }
+
+    #[test]
+    fn parse_note_rejects_garbage() {
+        assert!(parse_note("not-a-note").is_err());
+    }
+
+    /// Plain signed decimal keeps working exactly as clap's default
+    /// `FromStr` parsed it before `parse_transpose` existed.
+    #[test]
+    fn parse_transpose_accepts_signed_decimal() {
+        assert_eq!(parse_transpose("-24").unwrap(), -24);
+        assert_eq!(parse_transpose("24").unwrap(), 24);
+        assert_eq!(parse_transpose("0").unwrap(), 0);
+    }
+
+    /// The trackstep word's low byte as the editor/disasm shows it (raw
+    /// hex, unsigned) -- `docs/macro-playback-fidelity.md`'s "NEXT UP":
+    /// word `$54E8` -> transpose byte `$E8`, which is -24 two's-complement
+    /// (`tfmx/src/sequencer.rs:855-862`). No masking, unlike `--note`: the
+    /// transpose byte has no top-bit framing to strip.
+    #[test]
+    fn parse_transpose_accepts_raw_hex_byte_twos_complement() {
+        assert_eq!(parse_transpose("0xE8").unwrap(), -24);
+        assert_eq!(parse_transpose("$E8").unwrap(), -24);
+        assert_eq!(parse_transpose("0x7F").unwrap(), 127);
+        assert_eq!(parse_transpose("0x00").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_transpose_rejects_garbage() {
+        assert!(parse_transpose("not-a-number").is_err());
+        assert!(parse_transpose("0x1FF").is_err(), "byte overflow");
+    }
 
     fn read_corpus(name: &str) -> Option<Vec<u8>> {
         let path = format!("{}/../testdata/{}", env!("CARGO_MANIFEST_DIR"), name);
@@ -1060,6 +1566,47 @@ mod tests {
             gate: GateArg::All,
         };
         run_render(&args).expect("render succeeds on a valid corpus file");
+
+        let reader = hound::WavReader::open(&output).expect("output is a valid WAV file");
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 2);
+        assert_eq!(spec.sample_rate, 44_100);
+        assert_eq!(spec.bits_per_sample, 16);
+        assert_eq!(reader.duration(), 44_100, "WAV must hold exactly 1 second");
+
+        std::fs::remove_file(&output).ok();
+    }
+
+    /// `render-macro` triggers a macro directly -- no trackstep/pattern
+    /// layer -- and produces a WAV of the requested length, same shape as
+    /// `render`'s own check above.
+    #[test]
+    fn render_macro_writes_a_wav_of_the_requested_length() {
+        let Some(mdat) = read_corpus("mdat.turrican intro") else {
+            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+            return;
+        };
+        let smpl = read_corpus("smpl.turrican intro").expect("smpl present alongside mdat");
+        let mdat_path = std::env::temp_dir().join("tfmx-cli-test-macro-input.mdat");
+        let smpl_path = std::env::temp_dir().join("tfmx-cli-test-macro-input.smpl");
+        std::fs::write(&mdat_path, &mdat).unwrap();
+        std::fs::write(&smpl_path, &smpl).unwrap();
+        let output = std::env::temp_dir().join("tfmx-cli-test-macro-output.wav");
+
+        let args = RenderMacroArgs {
+            mdat: mdat_path,
+            smpl: smpl_path,
+            output: output.clone(),
+            macro_number: 48,
+            note: 33,
+            volume: 64,
+            voice: 2,
+            tempo: 3,
+            seconds: 1,
+            rate: 44_100,
+            separation: 100,
+        };
+        run_render_macro(&args).expect("render-macro succeeds on a valid corpus file");
 
         let reader = hound::WavReader::open(&output).expect("output is a valid WAV file");
         let spec = reader.spec();
@@ -1444,6 +1991,57 @@ mod tests {
     }
 
     #[test]
+    fn check_sample_bounds_flags_an_attack_region_reading_past_the_end_of_smpl() {
+        let mut state = tfmx::Voice::default();
+        state.start = 100;
+        state.len = 50; // words -> 100 bytes, end = 200
+        state.dma_on = true;
+        let events = vec![TraceEvent::Voice { voice: 2, state }];
+        let findings = check_sample_bounds(&events, 150);
+        let f = findings
+            .iter()
+            .find(|f| f.name == "sample-region-out-of-bounds")
+            .expect("flags an out-of-bounds attack region");
+        assert!(f.detail.contains('2'), "names the voice: {}", f.detail);
+    }
+
+    #[test]
+    fn check_sample_bounds_flags_a_loop_region_reading_past_the_end_of_smpl() {
+        let mut state = tfmx::Voice::default();
+        state.start = 0;
+        state.len = 10;
+        state.loop_start = 100;
+        state.loop_len = 50; // words -> 100 bytes, end = 200
+        state.dma_on = true;
+        let events = vec![TraceEvent::Voice { voice: 1, state }];
+        let findings = check_sample_bounds(&events, 150);
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].detail.contains('1'), "names the voice: {}", findings[0].detail);
+    }
+
+    #[test]
+    fn check_sample_bounds_does_not_flag_a_region_within_smpl() {
+        let mut state = tfmx::Voice::default();
+        state.start = 100;
+        state.len = 50;
+        state.loop_start = 0;
+        state.loop_len = 0;
+        state.dma_on = true;
+        let events = vec![TraceEvent::Voice { voice: 2, state }];
+        assert!(check_sample_bounds(&events, 200).is_empty());
+    }
+
+    #[test]
+    fn check_sample_bounds_ignores_a_voice_with_dma_off() {
+        let mut state = tfmx::Voice::default();
+        state.start = 100_000; // way out of bounds, but never actually reads
+        state.len = 50;
+        state.dma_on = false;
+        let events = vec![TraceEvent::Voice { voice: 0, state }];
+        assert!(check_sample_bounds(&events, 200).is_empty());
+    }
+
+    #[test]
     fn lint_summarizes_jiffies_tempos_and_trackstep_lines() {
         let events = vec![
             TraceEvent::Jiffy {
@@ -1809,5 +2407,78 @@ mod tests {
 
         std::fs::remove_file(&a_path).ok();
         std::fs::remove_file(&b_path).ok();
+    }
+
+    #[test]
+    fn measure_pitch_hz_detects_a_known_sine_frequency() {
+        let rate = 44_100;
+        let freq = 440.0;
+        let samples: Vec<i16> = (0..8_000)
+            .map(|i| {
+                let t = i as f64 / rate as f64;
+                (10_000.0 * (2.0 * std::f64::consts::PI * freq * t).sin()) as i16
+            })
+            .collect();
+        let hz = measure_pitch_hz(&samples, rate, 50.0, 8000.0).expect("periodic signal found");
+        assert!((hz - freq).abs() < 2.0, "measured {hz} Hz, expected ~{freq} Hz");
+    }
+
+    #[test]
+    fn measure_pitch_hz_detects_a_repeating_non_sine_period() {
+        // A raw 8-bit-PCM-like repeating shape (not a clean sine) -- e.g. a
+        // sawtooth-ish waveform with harmonic content within one cycle, the
+        // way a real sampled instrument loop looks. Autocorrelation should
+        // still lock onto the loop's own repeat period rather than a
+        // harmonic of it.
+        let rate = 44_100;
+        let period_samples = 100; // 441 Hz
+        let cycle: Vec<i16> = (0..period_samples)
+            .map(|i| ((i * 30_000 / period_samples) as i16) - 15_000)
+            .collect();
+        let samples: Vec<i16> = cycle.iter().copied().cycle().take(8_000).collect();
+        let hz = measure_pitch_hz(&samples, rate, 50.0, 8000.0).expect("periodic signal found");
+        let expected = rate as f64 / period_samples as f64;
+        assert!(
+            (hz - expected).abs() < 2.0,
+            "measured {hz} Hz, expected ~{expected} Hz"
+        );
+    }
+
+    #[test]
+    fn measure_pitch_hz_does_not_panic_on_silence() {
+        let samples = vec![0i16; 8_000];
+        measure_pitch_hz(&samples, 44_100, 50.0, 8000.0);
+    }
+
+    #[test]
+    fn run_measure_pitch_reports_the_measured_frequency() {
+        let rate = 44_100;
+        let freq = 440.0;
+        let samples: Vec<i16> = (0..8_000)
+            .map(|i| {
+                let t = i as f64 / rate as f64;
+                (10_000.0 * (2.0 * std::f64::consts::PI * freq * t).sin()) as i16
+            })
+            .collect();
+        let path = std::env::temp_dir().join("tfmx-cli-test-measure-pitch.wav");
+        write_mono_wav(&path, &samples, rate);
+
+        let args = MeasurePitchArgs {
+            wav: path.clone(),
+            skip_seconds: 0.0,
+            window_seconds: 0.15,
+        };
+        let mut out = Vec::new();
+        run_measure_pitch(&args, &mut out).expect("measure-pitch succeeds on a valid WAV file");
+        let text = String::from_utf8(out).unwrap();
+        let hz: f64 = text
+            .trim()
+            .strip_suffix(" Hz")
+            .expect("prints a Hz value")
+            .parse()
+            .expect("Hz value is a number");
+        assert!((hz - freq).abs() < 2.0, "{text}");
+
+        std::fs::remove_file(&path).ok();
     }
 }

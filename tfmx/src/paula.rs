@@ -30,6 +30,13 @@ pub struct Voice {
     pub dma_on: bool,
     pub loop_start: u32,
     pub loop_len: u32,
+    /// The most recent `(start, len)` a caller explicitly requested via
+    /// `Paula::set_sample_region`, distinct from `start`/`len` which
+    /// `next_sample` may since have silently advanced to `loop_start`/
+    /// `loop_len`. Lets `set_sample_region` tell "the macro program changed
+    /// the region" apart from "the same region re-broadcast on an unrelated
+    /// jiffy" -- only the former should touch `start`/`len` mid-playback.
+    requested_region: Option<(u32, u32)>,
     /// Sub-sample playback position within `[start, start+len)`, as a
     /// `FRAC_BITS`-fraction fixed-point value; mixer-internal only (step 3.2).
     frac: u64,
@@ -133,10 +140,21 @@ impl Paula {
         self.voices[voice as usize].volume = volume;
     }
 
+    /// `MacroInterpreter::tick()` calls this every jiffy, even ones where
+    /// the macro program made no change to the region (e.g. sitting in a
+    /// `$04 <Wait>`). Applying `start`/`len` unconditionally would undo
+    /// `Voice::next_sample`'s one-shot attack->loop handoff on the very next
+    /// jiffy after it happens, corrupting `frac`'s reinterpretation against
+    /// the wrong region every time. Only a genuine change to the requested
+    /// region should touch `start`/`len` here; a real retrigger re-syncs
+    /// them unconditionally via the `set_dma` off->on edge instead.
     pub fn set_sample_region(&mut self, voice: u8, start: u32, len: u32) {
         let v = &mut self.voices[voice as usize];
-        v.start = start;
-        v.len = len;
+        if v.requested_region != Some((start, len)) {
+            v.requested_region = Some((start, len));
+            v.start = start;
+            v.len = len;
+        }
     }
 
     pub fn set_loop_region(&mut self, voice: u8, loop_start: u32, loop_len: u32) {
@@ -157,6 +175,15 @@ impl Paula {
         let v = &mut self.voices[voice as usize];
         if on && !v.dma_on {
             v.frac = 0;
+            // Force a resync to the latest requested region even if
+            // `set_sample_region`'s change-detection skipped it (a retrigger
+            // can legitimately re-request the same (start, len) as before,
+            // after `next_sample` has since drifted `start`/`len` to the
+            // loop region -- see `set_sample_region`'s own comment).
+            if let Some((start, len)) = v.requested_region {
+                v.start = start;
+                v.len = len;
+            }
         }
         v.dma_on = on;
     }
@@ -480,6 +507,53 @@ mod tests {
         assert!(
             left[150] < 0,
             "expected loop-region output after transition, got {}",
+            left[150]
+        );
+    }
+
+    #[test]
+    fn repeated_identical_set_sample_region_calls_do_not_undo_the_loop_handoff() {
+        // Mirrors MacroInterpreter::tick()'s real call pattern: it
+        // re-asserts sample_start/sample_len via set_sample_region on every
+        // single jiffy, even when the macro hasn't changed them at all --
+        // e.g. while sitting in a `$04 <Wait>`. If Paula naively reapplied
+        // the identical attack-region values every call, it would undo
+        // Voice::next_sample's one-shot attack->loop handoff every tick,
+        // corrupting `frac`'s reinterpretation against the wrong region.
+        let sample_rate = 8_000u32;
+        let period = (PAULA_CLOCK_HZ / sample_rate as f64).round() as u16;
+
+        let mut source = vec![0i8; 200];
+        source[0..100].fill(100);
+        source[100..200].fill(-100);
+
+        let mut paula = Paula::new(100);
+        paula.set_period(0, period);
+        paula.set_volume(0, 64);
+        paula.set_sample_region(0, 0, 50); // attack: 50 words = 100 samples
+        paula.set_loop_region(0, 100, 50); // loop: 100 samples at byte 100
+        paula.set_dma(0, true);
+
+        // Render in small spans, re-asserting the SAME attack region before
+        // each one -- exactly what happens every jiffy while a macro
+        // program is simply waiting.
+        let mut left = Vec::new();
+        for _ in 0..25 {
+            paula.set_sample_region(0, 0, 50);
+            paula.set_loop_region(0, 100, 50);
+            let mut out = vec![0i16; 10 * 2];
+            paula.render(&source, sample_rate, &mut out);
+            left.extend(out.iter().step_by(2).copied());
+        }
+
+        assert!(
+            left[10] > 0,
+            "expected attack-region output early on, got {}",
+            left[10]
+        );
+        assert!(
+            left[150] < 0,
+            "expected to have transitioned to and stayed in the loop region, got {}",
             left[150]
         );
     }
