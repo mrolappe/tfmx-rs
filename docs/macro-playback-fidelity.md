@@ -1036,3 +1036,56 @@ the *other* direction than assumed (a loop that's too short raises pitch, doesn'
 explicitly asking the editor's loop-point inspector whether `loop_len=128` words (macro 28,
 `turrican intro`) matches, undershoots, or overshoots the composer's intended region, not just
 whether some other value is "more correct" in the abstract.
+
+## 13. Session 11: `$02 SetBegin` made absolute per docs — real corpus fix, does not move the ear complaint
+
+Acted on §12's recorded theory. `docs/playback-model.md` §2's own table already states `$02
+SetBegin` targets an "absolute smpl offset" — unlike `$18 Sampleloop`'s explicitly-documented
+additive, non-idempotent delta (§7 gotchas, its own doc comment in `tfmx/src/macro_interp.rs`).
+The code contradicted its own project's docs: `self.sample_start = self.sample_start
+.wrapping_add_signed(delta)` accumulated every `$02` within a trigger onto the previous one.
+
+**Corpus-wide scan before touching code** (literal-listing `$02` count per macro via `tfmx-cli
+disasm`, all 128 macros × 10 modules): 60+ macros across 6 of 10 modules issue `$02` two or three
+times per trigger, not just macro 28. `turrican 2 level 1-desert` macro 33 issues it three times,
+each followed by its own `SetLen`/`Wait`/`$19 <Set one shot sample>` — three independent one-shot
+samples played back to back, which only makes sense if each `$02` is absolute; cumulative
+addressing would walk every sample after the first arbitrarily far from any real data.
+
+**Fix**: `tfmx/src/macro_interp.rs`'s `0x02` arm now sets `self.sample_start` directly from the
+24-bit operand instead of adding it to the running value. `$11 AddBegin` and `$18 Sampleloop` are
+untouched — both already have their own explicit "this one is additive" doc language, so the
+absolute reading applies to `$02` only. TDD: `set_begin_is_absolute_not_cumulative` added; the
+existing `sampleloop_keeps_turrican_intro_macro_28_in_bounds` test's expected `loop_start` updated
+(37912 cumulative → 30724 absolute, the macro's *second* `$02` value winning outright).
+
+**Structural result, measured before asking for ears**: `tfmx-cli lint`'s `sample-region-out-of-
+bounds` findings across the corpus dropped from 9 (6 modules) to 3 (all in `apidya (title)`, the
+already out-of-scope TFMX 7V module) — every other affected module's out-of-bounds reads are now
+gone. 145 `tfmx` unit tests, full workspace suite, `mutation_robustness`, clippy all pass. 4 of 10
+modules' golden hashes changed within the first 10s (`apidya (level 1)`, `r-type`, `turrican 2
+level 3-flight`, `turrican 2 title (st)`); `turrican intro`'s did not (macro 28's pattern-0x52
+usage falls later than 10s), regenerated.
+
+**Isolated pattern-82 measurement** (no trackstep/gating confound, same recipe as §11): rhythm
+unchanged (20→20 onsets, correlation 1.000) but measured pitch jumped **441 Hz → 8820 Hz**, a 20x
+change, moving in the "was too low" direction but by an implausibly large amount for a single
+semitone-scale correction.
+
+**Ear result: negative.** The user A/B'd `voice0-before.wav`/`voice0-after.wav` and the full mix:
+**"it does not sound pitch correct (and overall the other voices also do not sound pitch correct).
+and the wandering also does not seem to be fixed."** So this fix, like §7/§9's, is real and
+independently justified (matches the project's own docs, fixes 6 real out-of-bounds bugs) but is
+not the explanation for the standing "too low pitch"/"wanders" complaint — and the fact that
+*other, unrelated voices* also sound pitch-wrong is new information: it reframes the complaint as
+not specific to macro 28's `$02` handling, or possibly not specific to any single opcode at all.
+**Kept and committed anyway** (user's explicit call) since it stands on its own evidence
+independent of this thread's main complaint.
+
+**Next**: the user is pivoting the diagnostic strategy — rather than continuing to chase individual
+opcodes inside real, complex corpus macros, build a minimal from-scratch test song: a handful of
+trackstep lines on one track playing one pattern, which plays a musical scale through the simplest
+possible macro (a single non-looping or simply-looping sound, e.g. a synthesized sine wave or one
+lifted from `smpl.turrican intro`). Isolates pitch from every remaining confound (real macros'
+multi-stage envelopes, retrigger timing, the `AnyTrack` gating cascade) by construction rather than
+by after-the-fact measurement.

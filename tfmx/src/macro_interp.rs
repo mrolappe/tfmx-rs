@@ -604,9 +604,14 @@ impl MacroInterpreter {
                 true
             }
             0x02 => {
-                // <SetBegin>
-                let delta = sext24(b1, b2, b3);
-                self.sample_start = self.sample_start.wrapping_add_signed(delta);
+                // <SetBegin>. `docs/playback-model.md` §2's own table
+                // states this targets an "absolute smpl offset" -- unlike
+                // `$18 Sampleloop`'s explicitly-documented additive,
+                // non-idempotent delta (§7 gotchas). A second `$02` within
+                // one trigger (a common corpus idiom -- see
+                // `set_begin_is_absolute_not_cumulative`) replaces the
+                // pointer rather than adding onto it.
+                self.sample_start = (sext24(b1, b2, b3) as u32) & 0x00FF_FFFF;
                 self.loop_start = self.sample_start;
                 self.loop_len = self.sample_len;
                 true
@@ -1015,6 +1020,33 @@ mod tests {
         assert_eq!(v.len, 5);
         assert!(v.dma_on);
         assert!(mac.is_stopped()); // the program's own $07 stops it
+    }
+
+    #[test]
+    fn set_begin_is_absolute_not_cumulative() {
+        // `docs/playback-model.md` §2's own table already states `$02
+        // SetBegin` targets an "absolute smpl offset" -- unlike `$18
+        // Sampleloop`'s explicitly-documented non-idempotent, additive
+        // delta (§7 gotchas). A second `$02` within the same trigger (a
+        // common corpus idiom: an attack region followed by an unrelated
+        // sustain/loop region, e.g. `turrican intro` macro 28, or several
+        // one-shot samples played back to back, e.g. `turrican 2
+        // level 1-desert` macro 33) must replace the pointer, not add onto
+        // it.
+        let mdat = macro_module(&[&[
+            [0x02, 0x00, 0x00, 0x64], // SetBegin +100
+            [0x02, 0x00, 0x00, 0xC8], // SetBegin +200 -- absolute, not +300
+            [0x03, 0x00, 0x00, 0x05],
+            [0x01, 0x00, 0x00, 0x00],
+            [0x07, 0x00, 0x00, 0x00],
+        ]]);
+        let module = Module::parse(&mdat, &[]).expect("valid header parses");
+        let mut mac = MacroInterpreter::new();
+        mac.trigger(0, 0, 0, 0);
+        let mut paula = Paula::new(100);
+        run(&mut mac, &module, &mut paula, 1);
+        let v = paula.voice(0);
+        assert_eq!(v.start, 200);
     }
 
     #[test]
@@ -1606,15 +1638,17 @@ mod tests {
     #[test]
     fn sampleloop_keeps_turrican_intro_macro_28_in_bounds() {
         // `turrican intro` pattern 0x52/macro 0x1c on voice 0
-        // (`docs/macro-playback-fidelity.md` §5): before this fix,
+        // (`docs/macro-playback-fidelity.md` §5): before the `$18` fix,
         // `loop_len` computed as 1024 - 1792 (masked mod 65536) = 64768
         // words = 129536 bytes, reaching far past the 45828-byte
         // `smpl.turrican intro` file and reading as silence for most of the
         // note. Halving the delta first keeps the sample's end point fixed
-        // (100 + 1024*2 = 39912+... see below) and lands well within bounds.
+        // and lands well within bounds. The macro's second `$02 SetBegin`
+        // is absolute (`set_begin_is_absolute_not_cumulative`), so it
+        // replaces the first rather than adding onto it.
         let mdat = macro_module(&[&[
-            [0x02, 0x00, 0x1C, 0x14], // SetBegin +0x1C14 = 7188
-            [0x02, 0x00, 0x78, 0x04], // SetBegin +0x7804 = 30724 -> 37912
+            [0x02, 0x00, 0x1C, 0x14], // SetBegin +0x1C14 = 7188 -- overwritten below
+            [0x02, 0x00, 0x78, 0x04], // SetBegin +0x7804 = 30724, absolute
             [0x03, 0x00, 0x04, 0x00], // SetLen 0x0400 = 1024 words
             [0x18, 0x00, 0x07, 0x00], // Sampleloop +0x0700 = 1792 bytes
             [0x07, 0, 0, 0],
@@ -1625,8 +1659,8 @@ mod tests {
         let mut paula = Paula::new(100);
         run(&mut mac, &module, &mut paula, 1);
         let v = paula.voice(0);
-        assert_eq!(v.loop_start, 39704);
-        assert_eq!(v.loop_len, 128); // was 64768 before the fix
+        assert_eq!(v.loop_start, 32516); // 30724 + 1792
+        assert_eq!(v.loop_len, 128); // unaffected by the SetBegin fix
         let loop_end_bytes = v.loop_start as u64 + v.loop_len as u64 * 2;
         assert!(
             loop_end_bytes < 45828,
