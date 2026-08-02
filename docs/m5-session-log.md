@@ -153,3 +153,46 @@ No mistakes hit worth recording as wrong turns this phase — the two `tfmx` acc
 and the walker itself passed their tests on the first real corpus run once the one seeded test
 bug (a hand-encoded `cv` byte with volume/voice nibbles swapped in
 `reachable_patterns_and_macros_from_trackstep`) was caught by its own assertion and fixed.
+
+## Phase 5.3 — Zone resolution (`$1C`/`$1D`)
+
+Delegated to an Opus 5 agent (self-contained brief: opcode semantics from `docs/opcodes.md`,
+the runtime `$1C`/`$1D` reference in `tfmx/src/macro_interp.rs`, the existing walker to extend).
+
+New `tfmx-analysis/src/zones.rs`: `resolve_zones(module, macro_number) -> ZoneTable`, a
+symbolic pass that interprets a macro's `$1C <Splitkey>`/`$1D <Splitvol>` branches over
+intervals rather than concrete values, partitioning the whole `0..=$3F` (note) x `0..=64`
+(entry volume) rectangle into disjoint zones, each carrying its live sample region, volume
+register and envelope.
+
+**The interval algebra**: DFS over paths, each carrying a `(note interval, entry-volume
+interval)` rectangle plus accumulated state; splits cut the rectangle and empty halves are
+pruned. `$1C` cuts the note axis directly, since no macro opcode ever writes the note register.
+`$1D` compares the volume *register*, already touched by `$0D`/`$0E`/`$1E`, tracked as
+`clamp(entry + offset, lo, hi)` -- three fields, not a single accumulated offset, because
+clamping does not compose with addition (`$0D -10` then `$0D +10` leaves entry-volume 0 at 10,
+not 0). `$0F <Envelope>` (time-varying volume) or a revisited step yields `ZoneExit::Unresolved`
+rather than a guess. `walk_song` and its tests are untouched; `SamplePointer`/`sext24` widened to
+`pub(crate)` for reuse rather than re-derived.
+
+New fixture: `testdata/synth/gen_split_probe.py` (+ generated `mdat`/`smpl.split-probe`,
+`testdata/synth/` un-ignored) -- a from-scratch macro with one `$1C` threshold, for a
+known-boundary test independent of the real corpus.
+
+**Check results**: `turrican intro` macro 28 (no `$1C`/`$1D` in its disasm) resolves to exactly
+one full-rectangle zone matching that linear structure field-for-field; the probe macro resolves
+to exactly two zones split at the right note boundary. Corroborating, not required by the check:
+macro 24's real keysplit, macro 5's `$1D` chain, and a coverage test probing every macro of all
+10 corpus modules to confirm every point lands in exactly one zone. 240 workspace tests pass
+(9 new), clippy clean, `wasm32-unknown-unknown` build for `tfmx` unaffected (only `tfmx-analysis`
+touched).
+
+**Open finding, not acted on**: macro 5's `$1D` chain (`$0D +$15` then four `$1D`s at
+`$20/$2A/$34/$3C`) reads as dead code (3 of 4 `Cont` targets unreachable) under the documented
+"jump if volume < aa" polarity from `docs/opcodes.md:177`, but as a clean 5-way velocity-layered
+fan-out under the reverse polarity ("jump if volume >= aa") -- suggestive the documented polarity
+may be backwards. Not investigated further this phase since 5.3's check criterion is to match
+*current* documented/runtime behavior, not to resolve fidelity questions; a fidelity thread issue
+if picked up later. Test `zones::tests::turrican_intro_macro_5_splitvol_chain` documents today's
+reading. Also noted: macro 28's `$0E <SetVolume>` has `aa=$00` (resolved volume 0, `cc=$38`
+unused) -- mirrors the interpreter, not investigated.
