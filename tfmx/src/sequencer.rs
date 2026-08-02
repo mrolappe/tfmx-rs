@@ -172,7 +172,12 @@ fn word_at(bytes: &[u8; 16], i: usize) -> u16 {
     u16::from_be_bytes([bytes[i * 2], bytes[i * 2 + 1]])
 }
 
-fn decode_line(bytes: &[u8; 16]) -> TrackstepLine {
+/// Decodes one raw trackstep line, with no execution-state context (loaded
+/// tracks, section repeats). [`Sequencer`] is the stateful driver for
+/// actually running the trackstep table; this is the seam a static walker
+/// (`docs/m5-plan.md` Phase 5.2) hooks into instead, same relationship as
+/// [`decode_pattern_entry`] has to [`PatternRunner`].
+pub fn decode_line(bytes: &[u8; 16]) -> TrackstepLine {
     if word_at(bytes, 0) != EFFE {
         let mut slots = [TrackSlot::StopChannel; 8];
         for (i, slot) in slots.iter_mut().enumerate() {

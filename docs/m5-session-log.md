@@ -79,3 +79,77 @@ the phase's "don't prematurely build into the crate structure" instruction. Raw 
 (WinUAE console text) were kept outside the repo (session-local), consistent with this
 project's existing practice for other rendered/captured artifacts derived from the copyrighted
 test corpus.
+
+## Phase 5.2 — Static walker core (`tfmx-analysis`)
+
+**User's re-decide call (session 16, before this phase started)**: treat the 5.1 spike's
+positive result as sufficient and move straight to the static walker, rather than spending more
+of this milestone automating Memwatch capture or chasing the WinUAE-vs-fs-uae playback
+inconsistency. Both stay open, unblocked, for a future session that wants the register-log
+oracle specifically.
+
+**Two small, justified additions to the `tfmx` core** (not scope creep — both are existing
+private logic the walker needed exposed, no new behavior):
+
+- `Module::pattern_offset(n)` / `Module::macro_offset(n)`: the absolute `mdat` byte offset a
+  pattern/macro's data starts at. `Module::pattern`/`macro_` only ever returned the byte slice,
+  not where it began — fine for every existing consumer (they all just read forward from
+  offset 0 of the slice), but the provenance map needs the absolute start to report a byte
+  span. Refactored `pointer_table_entry` into `pointer_table_offset` (returns the `u32`) so
+  both accessors and the new offset methods share one bounds-checked lookup. TDD'd against the
+  same known corpus entries the existing `pattern_and_macro_access_known_file` test uses.
+- `sequencer::decode_line` made `pub` and re-exported as `tfmx::decode_line`, mirroring
+  `decode_pattern_entry`'s existing seam (stateless decode, no execution-state context) — the
+  walker needed a way to turn a raw trackstep line's 16 bytes into `TrackstepLine` without
+  pulling in `Sequencer`'s stateful trackstep runner.
+
+**Design choice: the walker does not execute control flow, it lists linearly to the
+terminator — same shape as `tfmx-cli disasm`.** Patterns are scanned from step 0 to
+`$F0 End`/`$F4 Stop` (or a 256-step cap, mirroring `disasm`'s `MAX_DISASM_STEPS`); macros from
+step 0 to `$07 STOP`. `$F1 Loop`/`$1C Splitkey`/`$1D Splitvol` branches are not followed —
+their operands are read (so a `Jump`/`GoSub`/`PlayPattern` target pattern, or a `$06 Cont`/
+`$15 Go submacro`/`$21 Play macro` target macro, is still queued as reachable) but the walk
+does not jump to the branch target's *step*; every referenced pattern/macro number gets its
+own from-step-0 scan when it's popped off the worklist. This means a pattern only ever reached
+via `Jump{step: 40}` still gets scanned from step 0, not step 40 — an approximation, but the
+same one `disasm` already makes, and it errs toward *more* provenance coverage, not less. Not
+revisited this phase; would need real per-track program-counter simulation (closer to
+`PatternRunner`/`MacroInterpreter`) to do exactly, and that is out of Phase 5.2's scope per
+`m5-plan.md`.
+
+**Sample-region tracking is best-effort, not zone resolution.** `$02 SetBegin`/`$03 SetLen`/
+`$11 AddBegin` (only its `aa == 0` one-shot form — the oscillating `aa != 0` vibrato form isn't
+resolved to a static offset)/`$12 AddLen`/`$18 Sampleloop`/`$19 Set one shot sample` update a
+small `SamplePointer` struct that mirrors `macro_interp.rs`'s own bookkeeping (same absolute-
+`$02`, halved-`$18`-delta units as the two macro-fidelity fixes already landed on `main`), and
+every touch snapshots the "live" region (loop region once `$18` has run, else the plain sample
+region) into `WalkResult::sample_regions`. This does **not** attempt `$1C`/`$1D` interval
+splitting into note/velocity zones — that is Phase 5.3's job, the milestone's stated "spine".
+
+**Corpus result** (`walk_song(module, 0)`, all 10 corpus modules, song 0 only):
+
+```
+turrican intro: 53 patterns, 25 macros reachable; provenance 6072/19108 bytes (31.8%)
+turrican outside: 29 patterns, 8 macros reachable; provenance 2176/12252 bytes (17.8%)
+r-type: 37 patterns, 14 macros reachable; provenance 2432/7432 bytes (32.7%)
+x-out (title): 27 patterns, 10 macros reachable; provenance 4004/9116 bytes (43.9%)
+turrican 2 title (st): 61 patterns, 39 macros reachable; provenance 8344/20340 bytes (41.0%)
+turrican 2 level 1-desert: 48 patterns, 13 macros reachable; provenance 3572/13024 bytes (27.4%)
+turrican 2 level 3-flight: 32 patterns, 14 macros reachable; provenance 3524/14328 bytes (24.6%)
+turrican 3 level 1: 28 patterns, 11 macros reachable; provenance 6768/16732 bytes (40.4%)
+apidya (title): 43 patterns, 22 macros reachable; provenance 4300/7056 bytes (60.9%)
+apidya (level 1): 9 patterns, 10 macros reachable; provenance 1364/8148 bytes (16.7%)
+```
+
+`apidya (title)` is the only module whose raw voice nibbles include 4-7 with no 3 — the 7V
+signature holds across the whole corpus, asserted in
+`walker::tests::walks_all_corpus_modules_song_0_without_panic`. Coverage is deliberately far
+from 100% and not treated as a bug: only song 0 is walked (most modules carry more than one
+song slot, unexplored this phase), and header/pointer tables themselves are structural data,
+never claimed by any pattern/macro span — matching the phase's own interpretation note in
+`m5-plan.md` ("the signal is the delta across modules, not 100%").
+
+No mistakes hit worth recording as wrong turns this phase — the two `tfmx` accessor additions
+and the walker itself passed their tests on the first real corpus run once the one seeded test
+bug (a hand-encoded `cv` byte with volume/voice nibbles swapped in
+`reachable_patterns_and_macros_from_trackstep`) was caught by its own assertion and fixed.

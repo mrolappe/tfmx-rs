@@ -1,0 +1,16 @@
+[package]
+name = "tfmx-analysis"
+description = "Static module walker for TFMX songs: reachability, byte provenance, sample regions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+tfmx = { path = "../tfmx" }
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]

@@ -16,6 +16,6 @@ pub use paula::{Paula, Voice};
 pub use player::{Player, TrackstepGate};
 pub use sequencer::{
     LineCommand, NoteTiming, PatternCommand, PatternEntry, PatternRunner, Sequencer, TickClock,
-    TrackSlot, TrackstepLine, decode_pattern_entry, tick_fraction,
+    TrackSlot, TrackstepLine, decode_line, decode_pattern_entry, tick_fraction,
 };
 pub use trace::TraceEvent;

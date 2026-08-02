@@ -164,14 +164,34 @@ impl<'a> Module<'a> {
     /// hits an `$F0` End command; there is no length field to bounds it
     /// more tightly. `docs/format.md` §6.
     pub fn pattern(&self, n: u8) -> Result<&'a [u8], AccessError> {
-        pointer_table_entry(self.mdat, self.pattern_ptr_offset, n, MAX_PATTERNS)
+        let offset = pointer_table_offset(self.mdat, self.pattern_ptr_offset, n, MAX_PATTERNS)?;
+        self.mdat
+            .get(offset as usize..)
+            .ok_or(AccessError::OutOfRange)
     }
 
     /// Macro `n`'s data, from its start to the end of `mdat`. Same shape as
     /// [`Module::pattern`]; the macro interpreter (step 4.4) terminates on
     /// `$07 STOP`. `docs/format.md` §7.
     pub fn macro_(&self, n: u8) -> Result<&'a [u8], AccessError> {
-        pointer_table_entry(self.mdat, self.macro_ptr_offset, n, MAX_MACROS)
+        let offset = pointer_table_offset(self.mdat, self.macro_ptr_offset, n, MAX_MACROS)?;
+        self.mdat
+            .get(offset as usize..)
+            .ok_or(AccessError::OutOfRange)
+    }
+
+    /// Absolute `mdat` byte offset of pattern `n`'s data -- the same offset
+    /// [`Module::pattern`] slices from, exposed for callers (the static
+    /// walker, `docs/m5-plan.md` Phase 5.2) that need to know *where* a
+    /// pattern lives, not just its bytes, to report byte-provenance spans.
+    pub fn pattern_offset(&self, n: u8) -> Result<u32, AccessError> {
+        pointer_table_offset(self.mdat, self.pattern_ptr_offset, n, MAX_PATTERNS)
+    }
+
+    /// Absolute `mdat` byte offset of macro `n`'s data. See
+    /// [`Module::pattern_offset`].
+    pub fn macro_offset(&self, n: u8) -> Result<u32, AccessError> {
+        pointer_table_offset(self.mdat, self.macro_ptr_offset, n, MAX_MACROS)
     }
 
     /// Trackstep line `line`'s 16 raw bytes (8 words, one per track).
@@ -211,12 +231,12 @@ impl<'a> Module<'a> {
     }
 }
 
-fn pointer_table_entry(
+fn pointer_table_offset(
     mdat: &[u8],
     table_offset: u32,
     n: u8,
     max: u8,
-) -> Result<&[u8], AccessError> {
+) -> Result<u32, AccessError> {
     if n >= max {
         return Err(AccessError::OutOfRange);
     }
@@ -229,8 +249,7 @@ fn pointer_table_entry(
     if entry_end > mdat.len() {
         return Err(AccessError::OutOfRange);
     }
-    let data_offset = read_long(mdat, entry_offset) as usize;
-    mdat.get(data_offset..).ok_or(AccessError::OutOfRange)
+    Ok(read_long(mdat, entry_offset))
 }
 
 fn read_word_table(mdat: &[u8], offset: usize) -> [u16; TABLE_ENTRIES] {
@@ -371,6 +390,48 @@ mod tests {
         // whose first longword decodes as 00 00 00 00.
         let macro0 = module.macro_(0).expect("macro 0 in range");
         assert_eq!(&macro0[0..4], &[0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn pattern_and_macro_offset_known_file() {
+        let Some(mdat) = read_corpus("mdat.turrican 2 level 1-desert") else {
+            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+            return;
+        };
+        let smpl =
+            read_corpus("smpl.turrican 2 level 1-desert").expect("smpl present alongside mdat");
+        let module = Module::parse(&mdat, &smpl).expect("valid header parses");
+
+        // Same entries as `pattern_and_macro_access_known_file`, but checking
+        // the raw offset the accessor derives the slice from, not the bytes.
+        assert_eq!(
+            module.pattern_offset(0).expect("pattern 0 in range"),
+            0x00000A48
+        );
+        assert_eq!(
+            module.macro_offset(0).expect("macro 0 in range"),
+            0x000022EC
+        );
+    }
+
+    #[test]
+    fn pattern_and_macro_offset_out_of_range_is_err_not_panic() {
+        let mut mdat = vec![0u8; HEADER_LEN];
+        mdat[0..10].copy_from_slice(b"TFMX-SONG ");
+        let module = Module::parse(&mdat, &[]).expect("minimal header parses");
+
+        assert_eq!(
+            module.pattern_offset(128).unwrap_err(),
+            AccessError::OutOfRange
+        );
+        assert_eq!(
+            module.macro_offset(128).unwrap_err(),
+            AccessError::OutOfRange
+        );
+        assert_eq!(
+            module.pattern_offset(0).unwrap_err(),
+            AccessError::OutOfRange
+        );
     }
 
     #[test]

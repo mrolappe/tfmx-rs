@@ -1,5 +1,5 @@
 [workspace]
-members = ["tfmx", "tfmx-cli", "tfmx-play", "tfmx-web"]
+members = ["tfmx", "tfmx-analysis", "tfmx-cli", "tfmx-play", "tfmx-web"]
 resolver = "3"
 
 [workspace.package]
