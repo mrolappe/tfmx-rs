@@ -41,6 +41,10 @@ cannot stand on its own as a brief, sharpen the step rather than widening the co
 - [`docs/architecture.md`](docs/architecture.md) — code shape and design decisions
 - [`docs/m5-plan.md`](docs/m5-plan.md) — the approved M5 "Export and static analysis" brief:
   decisions and their rationale, per-phase subtasks and minimum models, the 7V posture
+- [`docs/analysis-tooling-ideas.md`](docs/analysis-tooling-ideas.md) — M5's idea ledger: every
+  brainstormed idea with its status and rationale
+- [`docs/m5-session-log.md`](docs/m5-session-log.md) — M5's per-phase session log: what was
+  done, problems hit, mistakes made and how they were resolved
 - [`ROADMAP-history.md`](ROADMAP-history.md) — completed milestones' full step detail and
   findings, split out of ROADMAP.md so it isn't loaded by default; pull it up for a step's
   rationale or a past gotcha
