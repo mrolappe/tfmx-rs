@@ -823,7 +823,7 @@ impl MacroInterpreter {
             }
             0x1D => {
                 // <Splitvol>
-                if self.volume < b1 {
+                if self.volume >= b1 {
                     self.step = word23;
                 }
                 true
@@ -1828,7 +1828,13 @@ mod tests {
     }
 
     #[test]
-    fn splitvol_jumps_only_when_volume_is_below_the_threshold() {
+    fn splitvol_jumps_only_when_volume_is_at_or_above_the_threshold() {
+        // Polarity confirmed against the real TFMX editor (not just [S1]'s
+        // prose) via a from-scratch two-branch probe
+        // (testdata/synth/gen_splitvol_probe.py): a volume below the
+        // threshold played the *fallthrough* branch and a volume at/above
+        // it played the *jump* branch -- the reverse of docs/opcodes.md's
+        // former "jumps if volume is less than aa" reading.
         let mdat = macro_module(&[&[
             [0x1D, 0x20, 0x00, 0x03],
             [0x0D, 0, 0, 1],
@@ -1839,16 +1845,16 @@ mod tests {
         let module = Module::parse(&mdat, &[]).expect("valid header parses");
 
         let mut mac = MacroInterpreter::new();
-        mac.trigger(0, 0, 5, 0); // volume 5*3=15 < $20 -> taken
+        mac.trigger(0, 0, 5, 0); // volume 5*3=15 < $20 -> not taken
         let mut paula = Paula::new(100);
         run(&mut mac, &module, &mut paula, 1);
-        assert_eq!(paula.voice(0).volume, 25); // 15 + 10
+        assert_eq!(paula.voice(0).volume, 16); // 15 + 1
 
         let mut mac = MacroInterpreter::new();
-        mac.trigger(0, 0, 15, 0); // volume 15*3=45 >= $20 -> not taken
+        mac.trigger(0, 0, 15, 0); // volume 15*3=45 >= $20 -> taken
         let mut paula = Paula::new(100);
         run(&mut mac, &module, &mut paula, 1);
-        assert_eq!(paula.voice(0).volume, 46); // 45 + 1
+        assert_eq!(paula.voice(0).volume, 55); // 45 + 10
     }
 
     // -- $1E AddVol+Note --

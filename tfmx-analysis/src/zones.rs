@@ -274,11 +274,13 @@ fn walk(bytes: &[u8], macro_number: u8, mut path: Path, zones: &mut Vec<Zone>) {
                 path.notes = (lo.max(cut), hi);
             }
             0x1D => {
-                // Jumps if `volume < b1`. The register is a monotone
-                // non-decreasing function of the entry volume, so the taken
-                // set is always a prefix of the volume axis -- found by
-                // scanning the 65 possible entry values rather than by
-                // inverting the clamp.
+                // Jumps if `volume >= b1` (confirmed against the real TFMX
+                // editor, 2026-08-02 -- see docs/opcodes.md's note on
+                // `$1D`; the reverse of [S1]'s literal "less than" wording).
+                // The register is a monotone non-decreasing function of the
+                // entry volume, so the taken set is always a suffix of the
+                // volume axis -- found by scanning the 65 possible entry
+                // values rather than by inverting the clamp.
                 if path.volume == MacroVolume::Unknown {
                     let step = path.step - 1;
                     return path.finish(macro_number, ZoneExit::Unresolved { step }, zones);
@@ -287,14 +289,14 @@ fn walk(bytes: &[u8], macro_number: u8, mut path: Path, zones: &mut Vec<Zone>) {
                 let cut = (lo..=hi)
                     .find(|&e| path.volume.eval(e).is_some_and(|v| v >= b1))
                     .unwrap_or(hi.saturating_add(1));
-                if cut > lo {
-                    let taken = path.fork(word23, path.notes, (lo, cut - 1));
+                if cut <= hi {
+                    let taken = path.fork(word23, path.notes, (cut, hi));
                     walk(bytes, macro_number, taken, zones);
                 }
-                if cut > hi {
-                    return;
+                if cut <= lo {
+                    return; // whole rectangle branched away
                 }
-                path.volumes = (cut, hi);
+                path.volumes = (lo, cut - 1);
             }
             0x0D => path.volume = path.volume.add(b3 as i8),
             0x1E => path.volume = path.volume.add(b3 as i8),
@@ -425,8 +427,10 @@ mod tests {
 
     #[test]
     fn splitvol_boundary_accounts_for_a_preceding_addvolume() {
-        // $0D +$15 then $1D $20: the register is entry+21, so the branch is
-        // taken for entry volumes below 32-21 = 11.
+        // $0D +$15 then $1D $20: the register is entry+21, so (jump if
+        // volume >= aa, confirmed against real hardware -- see
+        // docs/opcodes.md's note on $1D) the branch is taken for entry
+        // volumes at or above 32-21 = 11.
         let zones = zones_of(&[
             [0x0D, 0x00, 0x00, 0x15],
             [0x1D, 0x20, 0x00, 0x03],
@@ -440,11 +444,18 @@ mod tests {
         assert_eq!(
             quiet.exit,
             ZoneExit::Cont {
-                macro_number: 9,
+                macro_number: 8,
                 step: 0
             }
         );
         assert_eq!(loud.volumes, 11..=VOLUME_MAX);
+        assert_eq!(
+            loud.exit,
+            ZoneExit::Cont {
+                macro_number: 9,
+                step: 0
+            }
+        );
         assert!(zones.iter().all(|z| z.notes == (0..=NOTE_MAX)));
     }
 
@@ -593,14 +604,16 @@ mod tests {
     }
 
     /// Macro 5 is the corpus's only `$1D` chain: `$0D +$15` then four
-    /// `$1D`s at $20/$2A/$34/$3C, each jumping to the *next* `$1D`.
+    /// `$1D`s at $20/$2A/$34/$3C, each jumping to the *next* `$1D` and
+    /// falling through to `$06 Cont 4/3/2/1`, with the final jump landing on
+    /// `$06 Cont 0`.
     ///
-    /// With `$1D`'s documented "jump if volume < aa" polarity that chain is
-    /// degenerate: once the first test passes (register < $20) every later
-    /// one passes too, so steps 4/6/8 (`$06 Cont 3/2/1`) are unreachable and
-    /// the macro has two zones, not five. Recorded here as the behaviour of
-    /// the semantics this crate implements today -- see the Phase 5.3 notes
-    /// for why the polarity itself is now in question.
+    /// `$1D`'s polarity was confirmed against the real TFMX editor
+    /// (2026-08-02, see docs/opcodes.md's note on `$1D`) to be "jump if
+    /// volume >= aa", the reverse of [S1]'s literal wording. Under that
+    /// polarity this chain is a clean 5-way ascending velocity fan-out
+    /// (quietest -> macro 4, loudest -> macro 0), not the 2-zone degenerate
+    /// reading the old (wrong) polarity produced.
     #[test]
     fn turrican_intro_macro_5_splitvol_chain() {
         let Some((mdat, smpl)) = corpus("turrican intro") else {
@@ -610,33 +623,31 @@ mod tests {
         let module = Module::parse(&mdat, &smpl).expect("valid module");
         let table = resolve_zones(&module, 5).expect("macro 5 in range");
 
-        assert_eq!(table.zones.len(), 2);
-        let quiet = table
-            .zones
-            .iter()
-            .find(|z| *z.volumes.start() == 0)
-            .unwrap();
-        let loud = table
-            .zones
-            .iter()
-            .find(|z| *z.volumes.start() == 11)
-            .unwrap();
-        assert_eq!(quiet.volumes, 0..=10, "entry + $15 < $20");
-        assert_eq!(
-            quiet.exit,
-            ZoneExit::Cont {
-                macro_number: 0,
-                step: 0
-            }
-        );
-        assert_eq!(loud.volumes, 11..=VOLUME_MAX);
-        assert_eq!(
-            loud.exit,
-            ZoneExit::Cont {
-                macro_number: 4,
-                step: 0
-            }
-        );
+        assert_eq!(table.zones.len(), 5);
+        let layer = |start: u8| {
+            table
+                .zones
+                .iter()
+                .find(|z| *z.volumes.start() == start)
+                .unwrap_or_else(|| panic!("no zone starting at entry volume {start}"))
+        };
+        let expect = |start: u8, end: u8, macro_number: u8| {
+            let z = layer(start);
+            assert_eq!(z.volumes, start..=end, "layer starting at {start}");
+            assert_eq!(
+                z.exit,
+                ZoneExit::Cont {
+                    macro_number,
+                    step: 0
+                },
+                "layer starting at {start}"
+            );
+        };
+        expect(0, 10, 4); // entry + $15 < $20
+        expect(11, 20, 3); // $20 <= entry + $15 < $2A
+        expect(21, 30, 2); // $2A <= entry + $15 < $34
+        expect(31, 38, 1); // $34 <= entry + $15 < $3C
+        expect(39, VOLUME_MAX, 0); // entry + $15 >= $3C
     }
 
     #[test]

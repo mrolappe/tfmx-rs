@@ -174,7 +174,7 @@ the mnemonic below exactly as in the source.
 | `$1A` | `<Wait on DMA>*` | `xx aa aa` | Plays the sample `aaaa` times, then continues with the next instruction. | documented — see note |
 | `$1B` | `<Random play>` | unstated | [S1] names the command and writes only "?" for its effect — no operand layout or behavior is given at all. | unknown — see [Unresolved](#unresolved) |
 | `$1C` | `<Splitkey>` | `aa bb bb` | Jumps to step `bbbb` in this macro if the current note is less than `aa`. | documented |
-| `$1D` | `<Splitvol>` | `aa bb bb` | Jumps to step `bbbb` in this macro if the volume is less than `aa`. Intended for use after `<AddVolume>` to do velocity checks. | documented |
+| `$1D` | `<Splitvol>` | `aa bb bb` | Jumps to step `bbbb` in this macro if the volume is at or above `aa`. Intended for use after `<AddVolume>` to do velocity checks. See note below the table — [S1]'s stated polarity is backwards. | documented (polarity corrected against real hardware) |
 | `$1E` | `<AddVol+Note>*` | `aa $FE bb` | Performs an `<AddVolume>` with `bb` as its parameter, then an `<AddNote>` with `aa` as transpose. May suspend the macro program as `<AddNote>` does. See diagram in §4. | documented |
 | `$1F` | `<SetPrevNote>*` | `aa bb bb` | Loads the last note, transposed by `aa` (and by track transpose where applicable), into the period register. `bbbb` is a finetune value as in `$08`. Ends sound processing for this jiffy. | documented |
 | `$20` | `<Signal>` | `aa bb bb` | Loads `bbbb` into signal register `aa`&3. | documented |
@@ -186,6 +186,24 @@ count, not a DMA-completion wait. The operand layout and the literal effect
 text are both taken directly from the spec (hence "documented"), but the
 name and the description do not obviously agree — implementers should treat
 the *name* as suspect and the *stated behavior* as the contract to follow.
+
+Note on `$1D`: [S1] states "jumps if volume is less than `aa`", and this
+crate implemented that literally until 2026-08-02. `turrican intro` macro 5
+opens with `$0D +$15` then four ascending `$1D` thresholds
+(`$20`/`$2A`/`$34`/`$3C`) — under the literal-[S1] polarity, three of its
+four jump targets are unreachable dead code, but under the reverse polarity
+it reads as a clean 5-way velocity-layered fan-out. A from-scratch two-branch
+probe built to settle this (`testdata/synth/gen_splitvol_probe.py`, one
+`$0D +0` primer then one `$1D` threshold) was loaded in the real TFMX editor
+and triggered at two note volumes straddling the threshold: the *lower*
+volume played the *fallthrough* branch and the *higher* volume played the
+*jump* branch — the reverse of [S1]'s literal wording. Also confirmed in the
+same session: `$1D` (and presumably `$0D`/`$0E`/`$1E`) only reads a note's
+actual volume once an explicit volume-setting opcode has run since trigger
+— a bare `$1D` as a macro's first opcode, with no preceding `$0D`/`$0E`,
+always took the jump regardless of the note's volume in the real editor.
+No real corpus macro observed so far puts `$1D` before priming the volume
+register, so this second point is a model-accuracy footnote, not a fix.
 
 ---
 

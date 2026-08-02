@@ -196,3 +196,43 @@ may be backwards. Not investigated further this phase since 5.3's check criterio
 if picked up later. Test `zones::tests::turrican_intro_macro_5_splitvol_chain` documents today's
 reading. Also noted: macro 28's `$0E <SetVolume>` has `aa=$00` (resolved volume 0, `cc=$38`
 unused) -- mirrors the interpreter, not investigated.
+
+**Follow-up (2026-08-02), while building an ear-check fixture (`testdata/synth/
+gen_splitvol_probe.py`) for the polarity question above**: loading a synthetic `mdat` in the TFMX
+editor whose trackstep table reserves only *one* real line (all 8 tracks `$FF00`/stopped) still
+shows non-empty data in trackstep lines 1-5 after a full editor/emulator restart and reload. The
+bytes it displays there are exactly the pattern/macro bytecode that happens to follow the
+trackstep table in the file (confirmed by hexdump) -- the editor is not respecting the one-line
+table boundary and is reading raw file bytes past it as more trackstep lines, rather than treating
+them as absent/default. Not investigated further (out of scope for the polarity question), but
+worth remembering when generating any synthetic fixture for editor loading: reserve several real,
+explicitly-stopped trackstep lines (not just as many as the song logically uses), or the editor's
+view will show misleading "phantom" song data past the last real line. Unclear yet whether this is
+purely an editor-display quirk or hints at a real per-file minimum trackstep-table size assumption
+worth checking against `docs/format.md`.
+
+**RESOLVED (2026-08-02): the polarity finding above is a confirmed engine bug, now fixed.** The
+ear-check fixture settled it against the real TFMX editor: a `$0D +0` primer then one `$1D`
+threshold, triggered at two note volumes straddling it, played the *fallthrough* branch for the
+*lower* volume and the *jump* branch for the *higher* volume -- the reverse of [S1]'s literal
+"jumps if volume is less than `aa`". Also confirmed in the same test: `$1D` only reads a
+meaningful volume once an explicit volume-setting opcode (`$0D`/`$0E`) has run since trigger --
+a bare `$1D` as a macro's first opcode always took the jump regardless of the note's volume in
+the real editor. This crate's `trigger()` seeds the volume register eagerly, so it never needed
+that priming, and no real corpus macro observed so far puts `$1D` before an explicit `$0D`/`$0E`,
+so that second point is a model-accuracy footnote, not a fix.
+
+Fixed `tfmx/src/macro_interp.rs`'s `$1D` handler (`self.volume < b1` -> `self.volume >= b1`,
+TDD'd -- test renamed `splitvol_jumps_only_when_volume_is_at_or_above_the_threshold`).
+`tfmx-analysis/src/zones.rs`'s `$1D` branch mirrors the same flip (taken set is now a *suffix* of
+the volume axis, not a prefix); `turrican_intro_macro_5_splitvol_chain` rewritten for the now-5-zone
+ascending fan-out (quietest -> macro 4 ... loudest -> macro 0), matching the "clean fan-out" reading
+the finding predicted. `docs/opcodes.md:177`'s row and a new note below its table record the
+corrected polarity and the priming requirement, both with the real-hardware citation. 147 `tfmx` +
+19 `tfmx-analysis` + full workspace tests pass, clippy clean, `wasm32-unknown-unknown` build for
+`tfmx` unaffected. The `tfmx-cli` golden-hash regression suite is unchanged byte-for-byte -- traced
+and confirmed macro 5 is never actually triggered within any corpus module's first 90 s of any
+song (it's statically reachable in `turrican intro` song 2 per the static walker, but only via a
+`$06 Cont` chain from macros never observed triggered in that window), so this fix has no
+corpus-audible effect the existing regression net could catch either way; a real in-song A/B is
+still open for whoever finds where macro 5's chain actually plays.
