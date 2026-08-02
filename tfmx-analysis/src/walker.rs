@@ -17,7 +17,7 @@ use tfmx::{
 /// follows for the same reason: it does not execute `$F1`/`$F2`/`$1C`/`$1D`
 /// branches, just records every reference it sees along the one line from
 /// entry to terminator.
-const MAX_STEPS: usize = 256;
+pub(crate) const MAX_STEPS: usize = 256;
 
 /// What a [`Span`] covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -210,8 +210,8 @@ fn queue(queue: &mut VecDeque<u8>, queued: &mut BTreeSet<u8>, n: u8) {
 /// Mirrors `tfmx/src/macro_interp.rs`'s sample-pointer bookkeeping for the
 /// opcodes this walker statically tracks; see that module's `$02`/`$18`
 /// comments for the units this copies.
-#[derive(Default)]
-struct SamplePointer {
+#[derive(Default, Clone)]
+pub(crate) struct SamplePointer {
     sample_start: u32,
     sample_len: u32,
     loop_start: u32,
@@ -220,19 +220,19 @@ struct SamplePointer {
 }
 
 impl SamplePointer {
-    fn set_begin(&mut self, value: i32) {
+    pub(crate) fn set_begin(&mut self, value: i32) {
         self.sample_start = (value as u32) & 0x00FF_FFFF;
         self.loop_start = self.sample_start;
         self.loop_len = self.sample_len;
     }
 
-    fn set_len(&mut self, len: u32) {
+    pub(crate) fn set_len(&mut self, len: u32) {
         self.sample_len = len;
         self.loop_start = self.sample_start;
         self.loop_len = self.sample_len;
     }
 
-    fn add_begin(&mut self, step: i32) {
+    pub(crate) fn add_begin(&mut self, step: i32) {
         if self.loop_active {
             self.loop_start = self.loop_start.wrapping_add_signed(step);
         } else {
@@ -240,17 +240,17 @@ impl SamplePointer {
         }
     }
 
-    fn add_len(&mut self, delta: u32) {
+    pub(crate) fn add_len(&mut self, delta: u32) {
         self.sample_len = self.sample_len.wrapping_add(delta) & 0xFFFF;
     }
 
-    fn sampleloop(&mut self, delta: i32) {
+    pub(crate) fn sampleloop(&mut self, delta: i32) {
         self.loop_start = self.loop_start.wrapping_add_signed(delta);
         self.loop_len = self.loop_len.wrapping_sub_signed(delta >> 1) & 0xFFFF;
         self.loop_active = true;
     }
 
-    fn live(&self) -> (u32, u32) {
+    pub(crate) fn live(&self) -> (u32, u32) {
         if self.loop_active {
             (self.loop_start, self.loop_len)
         } else {
@@ -259,7 +259,7 @@ impl SamplePointer {
     }
 }
 
-fn sext24(hi: u8, mid: u8, lo: u8) -> i32 {
+pub(crate) fn sext24(hi: u8, mid: u8, lo: u8) -> i32 {
     let raw = ((hi as u32) << 16) | ((mid as u32) << 8) | (lo as u32);
     if raw & 0x0080_0000 != 0 {
         (raw | 0xFF00_0000) as i32
