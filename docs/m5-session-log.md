@@ -339,3 +339,54 @@ it; flagged here for whoever picks up the ear-check. `$08`/`$09`/`$1E`/`$1F` mac
 changes are not decoded into their own `NoteOn`s — only the pattern-level `Trigger`'s note is
 mapped, and any pitch movement from those opcodes shows up as pitch bend instead (same mechanism as
 vibrato/portamento, since it's driven off the observed period, not the opcode).
+
+## Phase 5.6 — Fidelity scoreboard
+
+New `tfmx-cli fidelity-scoreboard` subcommand, per `docs/m5-plan.md`'s Phase 5.6 brief: batch-render
+the corpus, score it against reference material, write a tracked metrics file. Phase 5.1's WinUAE
+register-log spike was ruled unusable as an automated oracle (manual copy-paste capture, unresolved
+trust risk — see that phase's own entry above), so this uses the "audio metrics otherwise" branch
+the plan called for.
+
+**Design**: for each of the 10 corpus modules, render this crate's own output via the existing
+`render_to_wav` (same function `render` uses) and a reference render via `uade123` (a GPL reference
+player *executed*, not read from — the hard rule in `CLAUDE.md` explicitly permits this), then feed
+both WAVs through the *existing* `detect_onsets`/`inter_onset_intervals`/`pearson_correlation` and
+`measure_pitch_hz` functions `onset-diff`/`measure-pitch` already had — extracted into a new pure
+`compute_module_fidelity` function (no file I/O) so the metric math is unit-testable without a
+reference player or the corpus on disk. `render_reference_wav` shells out to `uade123 -1 -s <song>
+-t <seconds> -f <wav> <mdat>`, with its child stdout/stderr discarded — `-f` still emulates in real
+time and prints a continuous "Playing time position" progress line regardless of file output, which
+would otherwise flood this tool's own stdout.
+
+**Tracked file**: `docs/fidelity-scoreboard.json`, one `ModuleFidelity` object per module
+(`onset_correlation`, `our_pitch_hz`, `reference_pitch_hz`) plus a `honesty_note` field carrying the
+plan's own honesty requirement verbatim into the artifact itself, not just this log.
+
+**Finding, documented in the honesty note rather than silently reported**: `our_pitch_hz`/
+`reference_pitch_hz` came back a constant, degenerate ~8820Hz (`= sample_rate / 5`, the detector's
+own minimum allowed lag) on 9 of the 10 modules, for *both* sides — autocorrelation over a whole
+30-second dense polyphonic mix collapses toward the shortest allowed lag rather than tracking a real
+note, the same failure mode this project's fidelity-thread history already flagged for `measure-
+pitch` at full-mix/voice-solo scope (§11 of `docs/macro-playback-fidelity.md`: "not trusted as a
+real single-note pitch measurement at that scope"). Rather than quietly shipping a meaningless
+number, the scoreboard's `honesty_note` says so explicitly. `onset_correlation` does not share this
+problem — it ranges informatively from -0.37 to 0.99 across the corpus, `turrican 2 level 3-flight`
+the only module currently near 1.0.
+
+**Check results**: `fidelity_scoreboard_runs_across_full_corpus_without_error` (new, mirrors the
+existing corpus-loop tests, skips CI-safely if `uade123` or the corpus is missing) actually ran the
+full batch in this session (both `uade123` and the corpus were present) and confirmed all 10 modules
+produce valid JSON. `compute_module_fidelity_mutation_moves_onset_correlation` is the plan's own
+"a deliberate known-bad mutation moves the metric" check: an identical-rhythm comparison correlates
+at ~1.0, a comparison against a deliberately re-clustered onset rhythm drops by >0.5 — both written
+test-first per this project's TDD rule. 3 new tests total, full workspace suite green (83
+`tfmx-cli` tests, up from 80), clippy clean (the same one pre-existing unrelated warning as prior
+phases, not touched), `wasm32-unknown-unknown` build for `tfmx` unaffected (only `tfmx-cli`
+touched, no new dependency — `uade123` is invoked as an external process, already a corpus-fetch/
+A/B tool this project relies on, not a crate dependency).
+
+Not done, out of scope for this phase: no attempt to make `onset_correlation` itself more
+informative (e.g. per-voice comparison) — the plan scoped this phase to reusing the existing
+metrics, not improving them; per-voice onset detection is already recorded as a known ceiling on
+`detect_onsets` itself, not reopened here.

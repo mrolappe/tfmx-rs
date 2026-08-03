@@ -60,6 +60,11 @@ enum Command {
     /// mapping from 5.3's zone tables to MIDI program/drum/drop.
     /// `docs/m5-plan.md` Phase 5.5.
     ExportMidi(ExportMidiArgs),
+    /// Batch-render the corpus against a reference player and score onset
+    /// timing/pitch agreement per module, writing a tracked JSON metrics
+    /// file. `docs/m5-plan.md` Phase 5.6. Regression detection, not a truth
+    /// oracle -- see the scoreboard's own `honesty_note` field.
+    FidelityScoreboard(FidelityScoreboardArgs),
 }
 
 #[derive(clap::Args)]
@@ -355,6 +360,23 @@ enum TraceFormat {
 }
 
 #[derive(clap::Args)]
+struct FidelityScoreboardArgs {
+    /// Directory holding the corpus (`mdat.<name>`/`smpl.<name>` pairs),
+    /// e.g. produced by `testdata/fetch.sh`.
+    #[arg(long, default_value = "testdata")]
+    testdata_dir: PathBuf,
+    #[arg(long, default_value_t = 0)]
+    song: u8,
+    #[arg(long, default_value_t = 30)]
+    seconds: u32,
+    /// Reference player invoked as `<player> -f <wav> -t <seconds> <mdat>`.
+    #[arg(long, default_value = "uade123")]
+    reference_player: String,
+    #[arg(short = 'o', long, default_value = "docs/fidelity-scoreboard.json")]
+    output: PathBuf,
+}
+
+#[derive(clap::Args)]
 struct OnsetDiffArgs {
     a: PathBuf,
     b: PathBuf,
@@ -383,6 +405,7 @@ enum CliError {
     Access(tfmx::AccessError),
     Json(serde_json::Error),
     Usage(&'static str),
+    Reference(String),
 }
 
 impl From<std::io::Error> for CliError {
@@ -424,6 +447,7 @@ impl std::fmt::Display for CliError {
             CliError::Access(e) => write!(f, "out-of-range access: {e:?}"),
             CliError::Json(e) => write!(f, "JSON error: {e}"),
             CliError::Usage(msg) => write!(f, "usage error: {msg}"),
+            CliError::Reference(msg) => write!(f, "reference player: {msg}"),
         }
     }
 }
@@ -1507,6 +1531,173 @@ fn run_onset_diff(args: &OnsetDiffArgs, out: &mut impl Write) -> Result<(), CliE
     Ok(())
 }
 
+/// The fixed 10-module corpus `testdata/fetch.sh` provides, name-only (no
+/// `mdat.`/`smpl.` prefix) -- same list the `tests` module's corpus-loop
+/// tests hardcode, kept separate since that one is `#[cfg(test)]`-only.
+const CORPUS_MODULES: [&str; 10] = [
+    "turrican intro",
+    "turrican outside",
+    "r-type",
+    "x-out (title)",
+    "turrican 2 title (st)",
+    "turrican 2 level 1-desert",
+    "turrican 2 level 3-flight",
+    "turrican 3 level 1",
+    "apidya (title)",
+    "apidya (level 1)",
+];
+
+const FIDELITY_HONESTY_NOTE: &str = "Regression detection only, not a truth \
+    oracle: this project's history includes onset/RMS metrics moving while a \
+    human ear judged no improvement (docs/m5-session-log.md). A metric that \
+    moves is evidence to investigate, not proof of (in)fidelity. \
+    our_pitch_hz/reference_pitch_hz are measured over the whole rendered \
+    span of a dense polyphonic mix, the same scope this project's own \
+    fidelity investigation already found untrustworthy for measure-pitch \
+    (autocorrelation collapses toward the shortest allowed lag rather than \
+    tracking a real note) -- treat these two fields as noise unless a \
+    module happens to be near-monophonic, not as a pitch comparison.";
+
+#[derive(serde::Serialize)]
+struct ModuleFidelity {
+    module: String,
+    /// Pearson correlation of inter-onset intervals between this crate's
+    /// render and the reference, `[-1, 1]`; `None` if either side had fewer
+    /// than two onsets.
+    onset_correlation: Option<f64>,
+    our_pitch_hz: Option<f64>,
+    reference_pitch_hz: Option<f64>,
+}
+
+#[derive(serde::Serialize)]
+struct FidelityScoreboard {
+    honesty_note: &'static str,
+    seconds: u32,
+    modules: Vec<ModuleFidelity>,
+}
+
+/// Pure metric computation over already-loaded PCM -- kept separate from
+/// rendering/subprocess I/O so a deliberate mutation of `ours` can be
+/// unit-tested without a reference player or the corpus on disk.
+fn compute_module_fidelity(
+    module: &str,
+    ours: (&[i16], u32),
+    reference: (&[i16], u32),
+) -> ModuleFidelity {
+    let (ours_mono, ours_rate) = ours;
+    let (ref_mono, ref_rate) = reference;
+    let ioi_ours = inter_onset_intervals(&detect_onsets(ours_mono, ours_rate, 20));
+    let ioi_ref = inter_onset_intervals(&detect_onsets(ref_mono, ref_rate, 20));
+    ModuleFidelity {
+        module: module.to_string(),
+        onset_correlation: pearson_correlation(&ioi_ours, &ioi_ref),
+        our_pitch_hz: measure_pitch_hz(ours_mono, ours_rate, 50.0, 8000.0),
+        reference_pitch_hz: measure_pitch_hz(ref_mono, ref_rate, 50.0, 8000.0),
+    }
+}
+
+/// Runs the reference player to render `mdat` (its `smpl.*` sibling is
+/// found by the player itself, same directory) to `output`.
+fn render_reference_wav(
+    player: &str,
+    mdat_path: &std::path::Path,
+    song: u8,
+    seconds: u32,
+    output: &std::path::Path,
+) -> Result<(), CliError> {
+    // `uade123` is a real-time Amiga emulator even with `-f`, and prints a
+    // running "Playing time position" progress line regardless -- discarded
+    // here rather than flooding this tool's own stdout.
+    let status = std::process::Command::new(player)
+        .arg("-1")
+        .args(["-s", &song.to_string()])
+        .args(["-t", &seconds.to_string()])
+        .arg("-f")
+        .arg(output)
+        .arg(mdat_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| CliError::Reference(format!("failed to run `{player}`: {e}")))?;
+    if !status.success() {
+        return Err(CliError::Reference(format!(
+            "`{player}` exited with {status} on {}",
+            mdat_path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn run_fidelity_scoreboard(args: &FidelityScoreboardArgs) -> Result<(), CliError> {
+    let tmp = std::env::temp_dir();
+    let mut modules = Vec::with_capacity(CORPUS_MODULES.len());
+    for name in CORPUS_MODULES {
+        let mdat_path = args.testdata_dir.join(format!("mdat.{name}"));
+        let smpl_path = args.testdata_dir.join(format!("smpl.{name}"));
+        if !mdat_path.exists() || !smpl_path.exists() {
+            return Err(CliError::Usage(
+                "corpus module missing -- run `sh testdata/fetch.sh` first",
+            ));
+        }
+
+        let our_wav = tmp.join(format!("tfmx-fidelity-{name}-ours.wav"));
+        let ref_wav = tmp.join(format!("tfmx-fidelity-{name}-reference.wav"));
+
+        let mdat = std::fs::read(&mdat_path)?;
+        let smpl = std::fs::read(&smpl_path)?;
+        let module = tfmx::Module::parse(&mdat, &smpl)?;
+        let render_args = RenderArgs {
+            mdat: mdat_path.clone(),
+            smpl: smpl_path.clone(),
+            output: our_wav.clone(),
+            song: args.song,
+            seconds: args.seconds,
+            rate: 44_100,
+            separation: 100,
+            solo: None,
+            mute: Vec::new(),
+            stems: false,
+            gate: GateArg::All,
+        };
+        render_to_wav(&module, &render_args, [false; 4], &our_wav)?;
+        render_reference_wav(
+            &args.reference_player,
+            &mdat_path,
+            args.song,
+            args.seconds,
+            &ref_wav,
+        )?;
+
+        let ours = read_wav_mono(&our_wav)?;
+        let reference = read_wav_mono(&ref_wav)?;
+        modules.push(compute_module_fidelity(
+            name,
+            (&ours.0, ours.1),
+            (&reference.0, reference.1),
+        ));
+    }
+
+    let scoreboard = FidelityScoreboard {
+        honesty_note: FIDELITY_HONESTY_NOTE,
+        seconds: args.seconds,
+        modules,
+    };
+    if let Some(parent) = args.output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut out = std::fs::File::create(&args.output)?;
+    serde_json::to_writer_pretty(&mut out, &scoreboard).map_err(CliError::Json)?;
+    writeln!(out)?;
+
+    for m in &scoreboard.modules {
+        match m.onset_correlation {
+            Some(r) => println!("{}: onset correlation {r:.3}", m.module),
+            None => println!("{}: onset correlation n/a", m.module),
+        }
+    }
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
     let result = match &cli.command {
@@ -1521,6 +1712,7 @@ fn main() {
         Command::MeasurePitch(args) => run_measure_pitch(args, &mut std::io::stdout().lock()),
         Command::Dump(args) => run_dump(args, &mut std::io::stdout().lock()),
         Command::ExportMidi(args) => run_export_midi(args),
+        Command::FidelityScoreboard(args) => run_fidelity_scoreboard(args),
     };
     if let Err(e) = result {
         eprintln!("tfmx-cli: {e}");
@@ -2779,5 +2971,105 @@ mod tests {
         assert!((hz - freq).abs() < 2.0, "{text}");
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Builds a mono track: silence up to each onset time, a loud burst,
+    /// then silence to the next -- mirrors `detect_onsets_finds_two_
+    /// separated_bursts`'s shape but at caller-chosen, possibly irregular
+    /// onset times, so tests can control the resulting inter-onset-interval
+    /// pattern precisely.
+    fn samples_with_bursts_at(rate: u32, onset_times_ms: &[u32], burst_ms: u32) -> Vec<i16> {
+        let mut samples = Vec::new();
+        let mut t_ms = 0u32;
+        for &onset_ms in onset_times_ms {
+            let silence_len = ((onset_ms - t_ms) as u64 * rate as u64 / 1000) as usize;
+            samples.extend(vec![0i16; silence_len]);
+            let burst_len = (burst_ms as u64 * rate as u64 / 1000) as usize;
+            samples.extend(std::iter::repeat_n(20_000i16, burst_len));
+            t_ms = onset_ms + burst_ms;
+        }
+        samples.extend(vec![0i16; rate as usize / 10]);
+        samples
+    }
+
+    /// Phase 5.6's own check: a deliberate known-bad mutation (onsets moved
+    /// to a differently-shaped rhythm) must move the onset-correlation
+    /// metric, not leave it unchanged.
+    #[test]
+    fn compute_module_fidelity_mutation_moves_onset_correlation() {
+        let rate = 44_100;
+        let reference = samples_with_bursts_at(rate, &[100, 300, 700, 1400], 10);
+        let matching = reference.clone();
+        let mutated = samples_with_bursts_at(rate, &[100, 200, 260, 300], 10);
+
+        let good = compute_module_fidelity("test", (&matching, rate), (&reference, rate));
+        let bad = compute_module_fidelity("test", (&mutated, rate), (&reference, rate));
+
+        let good_r = good.onset_correlation.expect("identical rhythms correlate");
+        let bad_r = bad.onset_correlation.expect("enough onsets for a correlation");
+        assert!((good_r - 1.0).abs() < 1e-6, "identical input: r={good_r}");
+        assert!(
+            bad_r < good_r - 0.5,
+            "mutation should move the metric: good={good_r} bad={bad_r}"
+        );
+    }
+
+    #[test]
+    fn fidelity_scoreboard_serializes_to_valid_json() {
+        let scoreboard = FidelityScoreboard {
+            honesty_note: FIDELITY_HONESTY_NOTE,
+            seconds: 30,
+            modules: vec![ModuleFidelity {
+                module: "turrican intro".to_string(),
+                onset_correlation: Some(0.42),
+                our_pitch_hz: Some(440.0),
+                reference_pitch_hz: None,
+            }],
+        };
+        let text = serde_json::to_string(&scoreboard).expect("serializes");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(value["modules"][0]["module"], "turrican intro");
+        assert!((value["modules"][0]["onset_correlation"].as_f64().unwrap() - 0.42).abs() < 1e-9);
+        assert!(value["modules"][0]["reference_pitch_hz"].is_null());
+        assert!(value["honesty_note"].as_str().unwrap().contains("not a truth"));
+    }
+
+    /// Step 5.6's roadmap check: the scoreboard runs across the whole
+    /// corpus and is committed. Needs both the corpus and `uade123` on
+    /// `PATH`; skips (CI-safe) if either is missing.
+    #[test]
+    fn fidelity_scoreboard_runs_across_full_corpus_without_error() {
+        if std::process::Command::new("uade123")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: uade123 not found on PATH");
+            return;
+        }
+        if corpus_path("mdat.turrican intro").is_none() {
+            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+            return;
+        }
+
+        let output = std::env::temp_dir().join("tfmx-cli-test-fidelity-scoreboard.json");
+        let args = FidelityScoreboardArgs {
+            testdata_dir: PathBuf::from(format!("{}/../testdata", env!("CARGO_MANIFEST_DIR"))),
+            song: 0,
+            seconds: 3,
+            reference_player: "uade123".to_string(),
+            output: output.clone(),
+        };
+        run_fidelity_scoreboard(&args).expect("scoreboard runs across the full corpus");
+
+        let text = std::fs::read_to_string(&output).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
+        let modules = value["modules"].as_array().expect("modules array");
+        assert_eq!(modules.len(), CORPUS_MODULES.len());
+        for m in modules {
+            assert!(m["module"].as_str().is_some());
+        }
+
+        std::fs::remove_file(&output).ok();
     }
 }

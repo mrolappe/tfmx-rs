@@ -1,0 +1,66 @@
+{
+  "honesty_note": "Regression detection only, not a truth oracle: this project's history includes onset/RMS metrics moving while a human ear judged no improvement (docs/m5-session-log.md). A metric that moves is evidence to investigate, not proof of (in)fidelity. our_pitch_hz/reference_pitch_hz are measured over the whole rendered span of a dense polyphonic mix, the same scope this project's own fidelity investigation already found untrustworthy for measure-pitch (autocorrelation collapses toward the shortest allowed lag rather than tracking a real note) -- treat these two fields as noise unless a module happens to be near-monophonic, not as a pitch comparison.",
+  "seconds": 30,
+  "modules": [
+    {
+      "module": "turrican intro",
+      "onset_correlation": 0.4818378289432236,
+      "our_pitch_hz": 8820.0,
+      "reference_pitch_hz": 8820.0
+    },
+    {
+      "module": "turrican outside",
+      "onset_correlation": -0.014735352618500001,
+      "our_pitch_hz": 8820.0,
+      "reference_pitch_hz": 8820.0
+    },
+    {
+      "module": "r-type",
+      "onset_correlation": -0.37011392431132734,
+      "our_pitch_hz": 8820.0,
+      "reference_pitch_hz": 8820.0
+    },
+    {
+      "module": "x-out (title)",
+      "onset_correlation": 0.2149955711448763,
+      "our_pitch_hz": 8820.0,
+      "reference_pitch_hz": 8820.0
+    },
+    {
+      "module": "turrican 2 title (st)",
+      "onset_correlation": 0.13483997249264762,
+      "our_pitch_hz": 8820.0,
+      "reference_pitch_hz": 8820.0
+    },
+    {
+      "module": "turrican 2 level 1-desert",
+      "onset_correlation": -0.11812080286397404,
+      "our_pitch_hz": 8820.0,
+      "reference_pitch_hz": 8820.0
+    },
+    {
+      "module": "turrican 2 level 3-flight",
+      "onset_correlation": 0.9905111426021599,
+      "our_pitch_hz": 8820.0,
+      "reference_pitch_hz": 8820.0
+    },
+    {
+      "module": "turrican 3 level 1",
+      "onset_correlation": -0.35212143653220224,
+      "our_pitch_hz": 8820.0,
+      "reference_pitch_hz": 8820.0
+    },
+    {
+      "module": "apidya (title)",
+      "onset_correlation": 0.4303259571504475,
+      "our_pitch_hz": 176.4,
+      "reference_pitch_hz": 8820.0
+    },
+    {
+      "module": "apidya (level 1)",
+      "onset_correlation": -0.046910070344693765,
+      "our_pitch_hz": 8820.0,
+      "reference_pitch_hz": 8820.0
+    }
+  ]
+}
