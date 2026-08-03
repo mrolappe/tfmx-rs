@@ -55,6 +55,17 @@ pub struct SampleRegion {
     pub looped: bool,
 }
 
+/// One reference from a pattern or macro to another pattern/macro, found
+/// while walking. `SpanKind` doubles as the node label: it already
+/// distinguishes `Pattern(n)`/`Macro(n)`, so a call graph needs no separate
+/// node enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub struct Edge {
+    pub from: SpanKind,
+    pub to: SpanKind,
+}
+
 /// Everything statically reachable from one song.
 #[derive(Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
@@ -67,6 +78,9 @@ pub struct WalkResult {
     /// through `Player::voice_of`'s `& 0x03` mask, since nibbles 4-7 are the
     /// 7V detector's own signature (`docs/m5-plan.md`'s "7V posture").
     pub voice_nibbles: BTreeSet<u8>,
+    /// Pattern->pattern, pattern->macro and macro->macro references, in
+    /// walk order. Phase 5.8's call graph is this field, as-is.
+    pub edges: Vec<Edge>,
 }
 
 impl WalkResult {
@@ -122,6 +136,10 @@ pub fn walk_song(module: &Module, song: u8) -> Result<WalkResult, AccessError> {
                 } => {
                     result.voice_nibbles.insert(voice);
                     queue(&mut macro_queue, &mut queued_macros, macro_number);
+                    result.edges.push(Edge {
+                        from: SpanKind::Pattern(n),
+                        to: SpanKind::Macro(macro_number),
+                    });
                 }
                 PatternEntry::Command(cmd) => {
                     match cmd {
@@ -129,6 +147,10 @@ pub fn walk_song(module: &Module, song: u8) -> Result<WalkResult, AccessError> {
                         | PatternCommand::GoSub { pattern, .. }
                         | PatternCommand::PlayPattern { pattern, .. } => {
                             queue(&mut pattern_queue, &mut queued_patterns, pattern);
+                            result.edges.push(Edge {
+                                from: SpanKind::Pattern(n),
+                                to: SpanKind::Pattern(pattern),
+                            });
                         }
                         _ => {}
                     }
@@ -169,7 +191,13 @@ pub fn walk_song(module: &Module, song: u8) -> Result<WalkResult, AccessError> {
                     sample.set_len(word23 as u32);
                     touched = true;
                 }
-                0x06 => queue(&mut macro_queue, &mut queued_macros, aa),
+                0x06 | 0x15 | 0x21 => {
+                    queue(&mut macro_queue, &mut queued_macros, aa);
+                    result.edges.push(Edge {
+                        from: SpanKind::Macro(n),
+                        to: SpanKind::Macro(aa),
+                    });
+                }
                 0x11 if aa == 0 => {
                     sample.add_begin(i16::from_be_bytes([bb, cc]) as i32);
                     touched = true;
@@ -178,7 +206,6 @@ pub fn walk_song(module: &Module, song: u8) -> Result<WalkResult, AccessError> {
                     sample.add_len(word23 as u32);
                     touched = true;
                 }
-                0x15 => queue(&mut macro_queue, &mut queued_macros, aa),
                 0x18 => {
                     sample.sampleloop(sext24(aa, bb, cc));
                     touched = true;
@@ -187,7 +214,6 @@ pub fn walk_song(module: &Module, song: u8) -> Result<WalkResult, AccessError> {
                     sample = SamplePointer::default();
                     touched = true;
                 }
-                0x21 => queue(&mut macro_queue, &mut queued_macros, aa),
                 0x07 => break,
                 _ => {}
             }
@@ -475,6 +501,64 @@ mod tests {
             !result.is_7v(),
             "nibble 3 present rules out the 7V signature"
         );
+    }
+
+    #[test]
+    fn edges_record_pattern_to_macro_and_pattern_to_pattern_references() {
+        let lines = [line([
+            track_word(1, 0),
+            STOP_TRACK,
+            STOP_TRACK,
+            STOP_TRACK,
+            STOP_TRACK,
+            STOP_TRACK,
+            STOP_TRACK,
+            STOP_TRACK,
+        ])];
+        // Pattern 1: note on macro 9, then $F2 Jump to pattern 2.
+        let pattern1: &[[u8; 4]] = &[[0x00, 0x09, 0x02, 0x00], [0xF2, 0x02, 0x00, 0x00]];
+        let pattern2: &[[u8; 4]] = &[[0xF0, 0x00, 0x00, 0x00]];
+        let macro9: &[[u8; 4]] = &[[0x07, 0x00, 0x00, 0x00]];
+        let mdat = minimal_module(&lines, &[(1, pattern1), (2, pattern2)], &[(9, macro9)]);
+        let module = Module::parse(&mdat, &[]).expect("valid header");
+
+        let result = walk_song(&module, 0).expect("song 0 in range");
+
+        assert!(result.edges.contains(&Edge {
+            from: SpanKind::Pattern(1),
+            to: SpanKind::Macro(9),
+        }));
+        assert!(result.edges.contains(&Edge {
+            from: SpanKind::Pattern(1),
+            to: SpanKind::Pattern(2),
+        }));
+    }
+
+    #[test]
+    fn edges_record_macro_to_macro_references() {
+        let lines = [line([
+            track_word(1, 0),
+            STOP_TRACK,
+            STOP_TRACK,
+            STOP_TRACK,
+            STOP_TRACK,
+            STOP_TRACK,
+            STOP_TRACK,
+            STOP_TRACK,
+        ])];
+        let pattern1: &[[u8; 4]] = &[[0x00, 0x00, 0x00, 0x00], [0xF0, 0x00, 0x00, 0x00]];
+        // Macro 0: $21 Play macro 3, then STOP.
+        let macro0: &[[u8; 4]] = &[[0x21, 0x03, 0x00, 0x00], [0x07, 0x00, 0x00, 0x00]];
+        let macro3: &[[u8; 4]] = &[[0x07, 0x00, 0x00, 0x00]];
+        let mdat = minimal_module(&lines, &[(1, pattern1)], &[(0, macro0), (3, macro3)]);
+        let module = Module::parse(&mdat, &[]).expect("valid header");
+
+        let result = walk_song(&module, 0).expect("song 0 in range");
+
+        assert!(result.edges.contains(&Edge {
+            from: SpanKind::Macro(0),
+            to: SpanKind::Macro(3),
+        }));
     }
 
     #[test]

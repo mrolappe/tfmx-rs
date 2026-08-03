@@ -3,9 +3,14 @@
 //!
 //! See `docs/m5-plan.md` Phase 5.2 for the design brief this implements.
 
+mod view;
 mod walker;
 mod zones;
-pub use walker::{SampleRegion, Span, SpanKind, WalkResult, walk_song};
+pub use view::{
+    LineCommandView, SongView, StepView, TrackSlotView, TrackstepMap, TrackstepStep,
+    WaveformRegion, WaveformView, build_song_view,
+};
+pub use walker::{Edge, SampleRegion, Span, SpanKind, WalkResult, walk_song};
 pub use zones::{
     Envelope, MacroVolume, NOTE_MAX, VOLUME_MAX, Zone, ZoneExit, ZoneTable, resolve_zones,
 };

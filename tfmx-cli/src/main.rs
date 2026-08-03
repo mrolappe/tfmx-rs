@@ -6,9 +6,11 @@ use clap::{Parser, Subcommand};
 use tfmx::TraceEvent;
 
 mod export;
+mod mermaid;
 mod midi;
 mod midi_mapping;
 mod serialize;
+mod visualize;
 
 #[derive(Parser)]
 #[command(name = "tfmx-cli", about = "Render and inspect TFMX modules")]
@@ -70,6 +72,20 @@ enum Command {
     /// `smpl` loop chunk, SFZ, or a DecentSampler `.dspreset` -- built over
     /// 5.3's zone table. `docs/m5-plan.md` Phase 5.7.
     ExportInstruments(ExportInstrumentsArgs),
+    /// Render a song's waveform regions, pattern->macro call graph and
+    /// trackstep structure to a single self-contained HTML file.
+    /// `docs/m5-plan.md` Phase 5.8.
+    Visualize(VisualizeArgs),
+}
+
+#[derive(clap::Args)]
+struct VisualizeArgs {
+    mdat: PathBuf,
+    smpl: PathBuf,
+    #[arg(short = 'o', long = "output")]
+    output: PathBuf,
+    #[arg(long, default_value_t = 0)]
+    song: u8,
 }
 
 #[derive(clap::Args)]
@@ -982,6 +998,22 @@ fn run_trace(args: &TraceArgs, out: &mut impl Write) -> Result<(), CliError> {
     Ok(())
 }
 
+fn run_visualize(args: &VisualizeArgs) -> Result<(), CliError> {
+    let mdat = std::fs::read(&args.mdat)?;
+    let smpl = std::fs::read(&args.smpl)?;
+    let module = tfmx::Module::parse(&mdat, &smpl)?;
+
+    let view = tfmx_analysis::build_song_view(&module, args.song)?;
+    let module_name = args
+        .mdat
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("module");
+    let html = visualize::render_html(module_name, &view);
+    std::fs::write(&args.output, html)?;
+    Ok(())
+}
+
 fn run_dump(args: &DumpArgs, out: &mut impl Write) -> Result<(), CliError> {
     let mdat = std::fs::read(&args.mdat)?;
     let smpl = std::fs::read(&args.smpl)?;
@@ -1774,6 +1806,7 @@ fn main() {
         Command::ExportMidi(args) => run_export_midi(args),
         Command::FidelityScoreboard(args) => run_fidelity_scoreboard(args),
         Command::ExportInstruments(args) => run_export_instruments(args),
+        Command::Visualize(args) => run_visualize(args),
     };
     if let Err(e) = result {
         eprintln!("tfmx-cli: {e}");
@@ -3132,5 +3165,40 @@ mod tests {
         }
 
         std::fs::remove_file(&output).ok();
+    }
+
+    #[test]
+    fn visualize_runs_across_full_corpus_without_error() {
+        let mut ran_any = false;
+        for name in CORPUS_MODULES {
+            let Some(mdat) = corpus_path(&format!("mdat.{name}")) else {
+                eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+                return;
+            };
+            let smpl = corpus_path(&format!("smpl.{name}")).expect("smpl present alongside mdat");
+
+            let output = std::env::temp_dir().join(format!(
+                "tfmx-cli-test-visualize-{}.html",
+                name.replace(' ', "_")
+            ));
+            let args = VisualizeArgs {
+                mdat,
+                smpl,
+                output: output.clone(),
+                song: 0,
+            };
+            run_visualize(&args).unwrap_or_else(|e| panic!("{name}: {e}"));
+
+            let html = std::fs::read_to_string(&output).unwrap();
+            assert!(html.starts_with("<!doctype html>"), "{name}: not well-formed HTML");
+            assert!(html.contains("flowchart LR"), "{name}: no call graph");
+            assert!(
+                html.contains("<table class=\"trackstep\">"),
+                "{name}: no trackstep table"
+            );
+            std::fs::remove_file(&output).ok();
+            ran_any = true;
+        }
+        assert!(ran_any, "no corpus modules found -- run `sh testdata/fetch.sh`");
     }
 }

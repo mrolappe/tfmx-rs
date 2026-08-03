@@ -483,3 +483,78 @@ export path only, no playback code touched).
 **Phase 5.7's `check:` criteria are now fully closed** — structurally (prior session) and by real
 tool load plus the user's own ear (this session), with a bug the structural checks alone had missed
 found and fixed along the way.
+
+## Phase 5.8 — Visualization (session 23)
+
+M5's last planned phase. Built the view-model structs the plan calls the actual deliverable, plus
+a thin HTML renderer as one (replaceable) consumer.
+
+**`tfmx-analysis/src/view.rs`**: `build_song_view(module, song) -> SongView` assembles three view
+models per song:
+- `WaveformView`: for every macro reachable from the song (per `walk_song`), `resolve_zones` is
+  called and each zone's resolved `Zone.sample` becomes a `WaveformRegion` (macro number, start,
+  len, looped, and `out_of_bounds` computed directly against `module.smpl().len()`). This reuses
+  Phase 5.7's own reading of `Zone.sample` as "the region that actually played" rather than raw
+  terminal register state.
+- The pattern→macro call graph: rather than a new struct, `walker::WalkResult` gained a field,
+  `edges: Vec<Edge>` (`Edge { from: SpanKind, to: SpanKind }`, reusing `SpanKind` as the node label
+  since it already distinguishes `Pattern(n)`/`Macro(n)`). Pushed at the exact three points
+  `walk_song`'s existing single BFS pass already discovers a reference: `PatternEntry::Note` →
+  pattern→macro; `Jump`/`GoSub`/`PlayPattern` → pattern→pattern; macro opcodes `$06`/`$15`/`$21` →
+  macro→macro. No second traversal, no duplicated match logic.
+- `TrackstepMap`: `song_start..=song_end` decoded line by line via the existing `decode_line`.
+  Local `TrackSlotView`/`LineCommandView` enums mirror `tfmx`'s `TrackSlot`/`LineCommand`
+  one-for-one (`From` impls) purely so they can carry `#[cfg_attr(feature = "serde", derive(...))]`
+  — the core crate stays `serde`-free per the standing hard rule.
+
+All new types serialize under the crate's existing (default-off) `serde` feature;
+`tfmx-analysis` gained no HTML and no new dependency.
+
+**`tfmx-cli`**: two new modules.
+- `mermaid.rs`: `call_graph_to_mermaid(&WalkResult) -> String`, pure string building (no
+  dependency) emitting a `flowchart LR` block — patterns as boxes (`P<n>`), macros as circles
+  (`M<n>`), disjoint id namespaces so a pattern and macro sharing a number never collide.
+- `visualize.rs`: `render_html(module_name, &SongView) -> String`, one self-contained page: an
+  inline SVG waveform (one row per macro, one `<rect>` per region, red/`class="oob"` for
+  out-of-bounds), the Mermaid graph embedded as raw source text inside a `<pre>` (deliberately
+  *not* rendered to SVG — that would need fetching a JS library, and the point of
+  "self-contained" here is the page opens with no network access), and an HTML table for the
+  trackstep structure map.
+- New `tfmx-cli visualize <mdat> <smpl> -o <file> [--song N]` subcommand wires it together.
+
+**Check results**: `visualize_runs_across_full_corpus_without_error` renders all 10 corpus modules
+at song 0 to HTML that starts with `<!doctype html>`, contains `flowchart LR`, and contains the
+trackstep table. `SongView` round-trips through `serde_json` with no HTML anywhere in
+`tfmx-analysis` (`song_view_serializes_to_valid_json`).
+
+**Disclosed rather than silently worked around**: none of the 10 corpus modules produce an
+`out_of_bounds` region in this phase's *static, zone-resolved* sense at song 0 (checked directly,
+not assumed). This doesn't contradict Phase 5.7's fixed `lint` findings — those came from
+runtime/trace-time register states (e.g. the `$11 AddBegin` post-loop wobble) that a zone's single
+final snapshot doesn't capture. So "the out-of-bounds regions are visibly marked" is proven via two
+targeted synthetic fixtures (`waveform_view_flags_a_region_that_reads_past_smpl` in `view.rs`,
+`out_of_bounds_region_is_visibly_marked` in `visualize.rs`) rather than a live corpus example — the
+capability is real and tested, there just isn't a corpus module to demonstrate it on today.
+
+One rendered page (`turrican intro` song 0) was shown to the user as a Claude Artifact for a visual
+sanity check of the waveform bars, call-graph text and trackstep table before write-up.
+
+**TDD note, for honesty against the standing rule**: `walker.rs`'s edge-tracking tests and the
+Mermaid emitter's tests were written alongside their small, mechanical implementations rather than
+strictly red-first. `view.rs`'s and `visualize.rs`'s tests were written first and confirmed to fail
+(missing types/functions, then a real panic caught by the corpus test — an SVG-width clamp with
+`min > max` on a region reading past `smpl_len`, fixed) before the implementations were completed.
+
+Full workspace suite: 98 `tfmx-cli` tests (up from 90) + 31 `tfmx-analysis` tests (up from 24),
+clippy clean (the one pre-existing unrelated `mutation_robustness.rs` warning, untouched),
+`mutation_robustness` and the `wasm32-unknown-unknown` build for `tfmx` unaffected,
+`tfmx/Cargo.toml`'s `[dependencies]` still empty, `tfmx-cli/tests/golden.rs` hashes byte-identical
+(no playback path touched, as expected — this phase only adds a read-only view over already-static
+analysis).
+
+**This closes every phase `docs/m5-plan.md` planned** (5.0 through 5.8). The deferred-ideas ledger
+in `docs/analysis-tooling-ideas.md` (probe-module generator, opcode census, static conformance
+linter, smpl directory reconstruction, cross-module macro fingerprinting, trace explorer,
+spectrogram comparison, web module explorer, tracker/score export) stays open for whoever picks up
+next, alongside `ROADMAP.md`'s "Later milestones" section (7V support, GUI, etc.). Per this
+project's phase-gate rule, this needs the user's explicit sign-off before anything past it starts.
