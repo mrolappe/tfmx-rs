@@ -601,5 +601,9 @@ in `docs/analysis-tooling-ideas.md` (probe-module generator, opcode census, stat
 linter, smpl directory reconstruction, cross-module macro fingerprinting, trace explorer,
 spectrogram comparison, web module explorer, tracker/score export, and now the call-graph layout
 tuning above) stays open for whoever picks up next, alongside `ROADMAP.md`'s "Later milestones"
-section (7V support, GUI, etc.). Per this project's phase-gate rule, this needs the user's explicit
-sign-off before anything past it starts.
+section (7V support, GUI, etc.).
+
+**M5 signed off by the user, same session.** "Export and static analysis" is complete as a
+milestone, not just phase 5.8. Nothing is pre-selected for what comes next -- a fresh session
+should read the deferred-ideas ledger and `ROADMAP.md`'s "Later milestones" section and ask, not
+assume.
