@@ -376,34 +376,59 @@ impl MacroInterpreter {
     /// A pattern's `Note` command. If `macro_number` is the instrument
     /// already running on this voice (per the last `trigger()`, not
     /// necessarily `self.macro_number` -- a keysplit instrument's `$06
-    /// <Cont>` moves the program counter to a different macro number
-    /// within the same jiffy as the trigger) and is genuinely still
-    /// *sustaining* it -- either its own `$01 DMAon` hasn't fired yet this
-    /// cycle, or it has and the program is parked in `$14 <Wait key up>` --
-    /// this updates the note/volume in place instead of restarting the
-    /// program at step 0. A fast note run that keeps retriggering the same
-    /// instrument would otherwise never survive past `$00 aa=0`'s mandatory
-    /// 1-jiffy pause to reach its own `$01 DMAon` (the pre-attack case), and
-    /// a `$14`-held pad instrument is meant to glide/legato onto the new
-    /// note rather than re-attack (the sustain case). **Uncertain**: no
+    /// <Cont>` moves the program counter to a different macro number within
+    /// the same jiffy as the trigger) and is genuinely still *sustaining* it
+    /// -- either its own `$01 DMAon` hasn't fired yet this cycle, or it has
+    /// and the program is parked in `$14 <Wait key up>` with no envelope
+    /// actively running and a nonzero volume -- this updates the note/volume
+    /// in place instead of restarting the program at step 0. A fast note run
+    /// that keeps retriggering the same instrument would otherwise never
+    /// survive past `$00 aa=0`'s mandatory 1-jiffy pause to reach its own
+    /// `$01 DMAon` (the pre-attack case), and a `$14`-held pad with no
+    /// envelope of its own -- a genuine indefinite hold, unchanging until an
+    /// external key-up or a new note -- is meant to glide/legato onto the
+    /// new note rather than re-attack (the sustain case). **Uncertain**: no
     /// [S1] citation states either half of this; the pre-attack half is
     /// grounded empirically by an A/B against `uade123` on `turrican
-    /// intro`'s voice 1 (`docs/status.md`); the `$14` narrowing is grounded
-    /// by a second `uade123` A/B on `turrican 2 title (st)` pattern 0x52 /
-    /// macro 0x26 -- a fixed, self-terminating percussive envelope (no
-    /// `$14` anywhere) that the original unconditional "not yet `$07`"
-    /// reading wrongly treated as still-sustaining once DMAon had already
-    /// fired, silently swallowing every fast retrigger the reference
-    /// audibly re-attacks. Once DMAon has fired and the instrument is not
-    /// parked in `$14`, any further Note for it is a genuine new hit, not a
-    /// continuation, regardless of whether `$07 <STOP>` has been reached
-    /// yet.
+    /// intro`'s voice 1 (`docs/status.md`).
+    ///
+    /// The sustain half went through two narrower, and wrong, readings before
+    /// this one. First, "parked at `$14`" alone (`c919266`) -- `mdat.turrican
+    /// outside` pattern 0x1c / macro 8 (a plucked bass string whose *own*
+    /// envelope decays it to silence while still parked in `$14`, never
+    /// reaching `$07`) proved that wrong: a `uade123` A/B shows every note
+    /// re-attacking, but this crate played only the first and silently
+    /// dropped the rest, because the in-place update never re-runs
+    /// `$08 <AddNote>` (only `$08`/`$09`/`$1E`/`$1F` ever write `self.period`,
+    /// and none of them run again while parked at `$14`). Second, adding
+    /// `self.volume > 0` (a same-session stopgap) -- still wrong, because at
+    /// the pattern's real spacing (D-4 arriving 4 jiffies after D-3, `Wait(3)`)
+    /// the envelope has only decayed 56->50 out of 56, still comfortably
+    /// nonzero, so the glide still swallowed D-4. What actually distinguishes
+    /// macro 8 from a genuine sustain pad (e.g. `mdat.turrican intro` macro
+    /// 32, structurally identical down to the opcode sequence, and one of the
+    /// six voice-1 macros the original reading was validated against) is
+    /// whether an envelope is actively running: macro 8 starts its decay
+    /// *before* reaching `$14` and it free-runs independently of the wait
+    /// state (`MacroInterpreter::tick` ticks `self.envelope` unconditionally,
+    /// before checking `take_turn`), so it is really a fixed-duration pluck
+    /// wearing a `$14` disguise; macro 32 starts its envelope only *after*
+    /// `$14` resolves via an actual key-up, so while parked there it is a
+    /// true, unchanging hold. `self.volume > 0` alone is kept alongside the
+    /// envelope check because it, not the envelope's presence, is what
+    /// correctly forces a full reset once a pluck's envelope *has* finished
+    /// and been dropped (`self.envelope` back to `None`) but the program is
+    /// still parked at `$14` -- otherwise a long-enough gap (this same
+    /// pattern's step 2, a 28-jiffy `Wait(27)`) would let the now-silent
+    /// pluck fall back through the "no envelope" reading and reintroduce this
+    /// exact bug for the *next* note instead.
     ///
     /// `detune` is the pattern note record's `dd` byte (`NoteTiming::Detune`,
     /// only present when the note byte is below `$80`); like `$21`'s detune it
     /// is folded into the next `$08`/`$09`/`$1E`/`$1F`'s finetune.
     pub fn note_on(&mut self, macro_number: u8, note: u8, volume: u8, transpose: i8, detune: i8) {
-        let sustaining = !self.dma_on || matches!(self.wait, Wait::KeyUp(_));
+        let sustaining = !self.dma_on
+            || (matches!(self.wait, Wait::KeyUp(_)) && self.envelope.is_none() && self.volume > 0);
         if macro_number == self.instrument && !self.is_stopped() && sustaining {
             self.last_note = self.note;
             self.note = note as i32;
@@ -1364,6 +1389,84 @@ mod tests {
             "a fresh percussive retrigger must restart DMA (off this jiffy, \
              back on once the reset macro runs through again), not silently \
              continue the still-running program"
+        );
+    }
+
+    #[test]
+    fn note_on_retriggers_every_note_in_a_fast_percussive_pattern_even_before_the_pluck_decays() {
+        // Mirrors `mdat.turrican outside` macro 8 exactly (`tfmx-cli disasm
+        // --macro 8`) and pattern 0x1c's real spacing (`tfmx-cli disasm
+        // --pattern 28`): DMAoff+Reset, SetBegin, SetLen, AddVolume, AddNote,
+        // DMAon, Envelope amount=6/every=1/target=0, Wait, Sampleloop, Wait
+        // key up (indefinite), Envelope (release), Stop -- a plucked bass
+        // string that decays to silence *while parked in $14*, retriggered
+        // by the pattern with `timing: Wait(3)` (4 jiffies) between notes.
+        // At that real spacing the previous pluck's envelope has only
+        // decayed 56->50 (out of 56) by the time the next Note arrives --
+        // still clearly audible -- so a first-attempt `self.volume > 0`
+        // guard on the `Wait::KeyUp` "genuinely sustaining" check does not
+        // disqualify it either, and the note is still folded into the dying
+        // pluck instead of re-attacking. Confirmed via `uade123` A/B: the
+        // reference re-attacks the pluck on every note (D-3 *and* D-4); this
+        // crate's render played only the first (D-3) and silently dropped
+        // every later one, including D-4.
+        //
+        // `mdat.turrican intro` macro 32 -- structurally identical (SetBegin,
+        // SetLen, AddVolume, AddNote, DMAon, Wait, Sampleloop, `$14`,
+        // Envelope target=0, Wait, Stop) and one of the six voice-1 macros
+        // the original `Wait::KeyUp` sustaining branch (`5da3623`/`c919266`)
+        // was validated against -- starts its envelope only *after* `$14`
+        // resolves via a real key-up, so while parked there it has no active
+        // envelope. That is the actual distinguishing signal: the
+        // `Wait::KeyUp` half of `sustaining` now also requires
+        // `self.envelope.is_none()`, so macro 8's still-decaying pluck no
+        // longer qualifies while a true `$14`-held pad like macro 32 still
+        // does.
+        let mdat = macro_module(&[&[
+            [0x00, 0x00, 0x00, 0x00],
+            [0x02, 0x00, 0x30, 0xF6],
+            [0x03, 0x00, 0x08, 0x00],
+            [0x0D, 0x00, 0x00, 0x14],
+            [0x08, 0xFA, 0x00, 0x00],
+            [0x01, 0x00, 0x00, 0x00],
+            [0x0F, 0x06, 0x01, 0x00],
+            [0x04, 0x00, 0x00, 0x00],
+            [0x18, 0x00, 0x0F, 0x80],
+            [0x14, 0x00, 0x00, 0x00],
+            [0x0F, 0x04, 0x01, 0x00],
+            [0x07, 0x00, 0x00, 0x00],
+        ]]);
+        let module = Module::parse(&mdat, &[]).expect("valid header parses");
+        let mut mac = MacroInterpreter::new();
+        let mut paula = Paula::new(100);
+
+        mac.note_on(0, 32, 12, 0, 0);
+        run(&mut mac, &module, &mut paula, 4); // pattern step 1's `Wait(3)`
+        assert!(
+            paula.voice(0).dma_on,
+            "the pluck should have reached its own $01 well within 4 jiffies"
+        );
+        assert!(
+            paula.voice(0).volume > 0,
+            "at this real spacing the pluck is still audibly decaying, not yet silent"
+        );
+        let period_after_d3 = paula.voice(0).period;
+
+        // The pattern's next note (D-4) arrives here, at the real spacing --
+        // still mid-decay, not yet silent.
+        mac.note_on(0, 44, 12, 0, 0);
+        tick(&mut mac, &module, &mut paula);
+        assert!(
+            !paula.voice(0).dma_on,
+            "a fresh retrigger must restart DMA (off this jiffy, back on \
+             once the reset macro runs through again), not silently \
+             continue the still-decaying D-3 pluck"
+        );
+        run(&mut mac, &module, &mut paula, 3);
+        assert_ne!(
+            paula.voice(0).period,
+            period_after_d3,
+            "D-4's own $08 <AddNote> must set a different period than D-3's"
         );
     }
 

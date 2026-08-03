@@ -1413,3 +1413,62 @@ modules' hashes changed (only `turrican intro` and `turrican outside` are byte-i
 reassuring for `turrican intro` specifically, since it's the module bug 2's original heuristic was
 tuned against, and its render is unaffected by the narrowing). `tfmx-cli lint` across the corpus shows
 no new findings.
+
+## Update (2026-08-03, continued): `note_on`'s `$14`-sustain reading was still wrong -- `mdat.turrican
+outside` pattern 0x1c / macro 8 played its first note and silently dropped every retrigger after
+
+User-reported, listening to `turrican outside` song 0: pattern `$1c`'s first note (D-3, step 1) is
+audible, every later note in the pattern (alternating D-3/D-4 on macro 8, a plucked bass string) is
+not.
+
+### Root cause: `$14`-parked alone doesn't mean "genuinely sustaining"
+
+`MacroInterpreter::note_on`'s bug-2 fix (above) treated *any* instrument parked in `$14 <Wait key up>`
+as a legato-glide candidate -- skip the restart, just update `self.note`/`self.volume` in place. Macro
+8 (`tfmx-cli disasm --macro 8`) parks in `$14` too, but it is not a real sustain pad: its own `$0F
+<Envelope>` (amount 6, every 1, target 0) starts decaying volume to silence *before* it ever reaches
+`$14`, and free-runs independently of the wait state (`MacroInterpreter::tick` ticks `self.envelope`
+unconditionally, ahead of `take_turn`) -- so by the time it parks at `$14` it is already mid-release, a
+fixed-duration pluck wearing a `$14` disguise, not an indefinite hold. The in-place update never
+re-runs `$08 <AddNote>` (only `$08`/`$09`/`$1E`/`$1F` ever write `self.period`, and none of them run
+again while parked at `$14`), so every later note's pitch/envelope silently froze onto whatever the
+first note left behind, and once that decayed to volume 0, so did the whole pattern.
+
+**First attempt, insufficient**: gating the `$14` branch on `self.volume > 0` (the instrument hasn't
+fully decayed yet). Traced with `tfmx-cli trace --voice 3 --format json`: at the pattern's real
+spacing (D-4 arriving 4 jiffies after D-3, `timing: Wait(3)`) the envelope has only decayed 56->50 out
+of 56 by then -- still comfortably nonzero -- so the glide still swallowed D-4. Confirmed by ear: D-3
+now re-attacked correctly, D-4 still didn't (user's own listening test, not just the trace).
+
+**Actual fix**: the `$14` branch now also requires `self.envelope.is_none()` -- no envelope actively
+running. `mdat.turrican intro` macro 32, structurally identical to macro 8 (SetBegin, SetLen,
+AddVolume, AddNote, DMAon, Wait, Sampleloop, `$14`, Envelope target=0, Wait, Stop) and one of the six
+voice-1 macros the original bug-2 heuristic was itself validated against, starts its envelope only
+*after* `$14` resolves via a real key-up -- so while genuinely parked there it has no active envelope
+and a nonzero volume, correctly reading as a true sustain. `self.volume > 0` is kept alongside the
+envelope check: without it, a pluck whose envelope has already fully decayed and been dropped
+(`self.envelope` back to `None`, e.g. after this same pattern's step 2, a 28-jiffy `Wait(27)` gap)
+would fall back through the "no envelope" reading and reintroduce the exact same silent-retrigger bug
+for the *next* note.
+
+**Tests**: `macro_interp::tests::note_on_retriggers_every_note_in_a_fast_percussive_pattern_even_before_the_pluck_decays`
+(new, red→green, built from macro 8's exact real bytecode and pattern 0x1c's real 4-jiffy note
+spacing -- deliberately timed so the volume-only guard would still pass it wrongly). All existing
+`note_on`-heuristic tests, including the two exercising the genuine fast-per-jiffy-retrigger case
+(`note_on_retriggering_the_still_running_macro_does_not_reset_dma`,
+`note_on_retriggering_through_a_cont_indirection_does_not_reset_dma`), still pass unchanged.
+
+**Verified against `uade123`** (executed as a black box, never read, per the provenance policy): a
+trimmed reference render of `turrican outside` song 0 (1.4s-9.4s, spanning pattern `$1c`) re-attacks
+the plucked bass on every note; this crate's pre-fix render played exactly one pluck and then silence
+for the rest of the pattern. **User confirmed by ear** after the fix: D-3 and D-4 both re-attack now.
+User's own assessment: the module's overall rendering is still not completely correct beyond this --
+left as open, not chased further this session.
+
+### Scope and verification
+
+Same shared code path as bug 2 above (`MacroInterpreter::note_on`); no other fix site needed.
+`cargo test --workspace` is green. Golden hashes regenerated: 3 of 10 corpus modules' hashes changed
+(`turrican outside`, `turrican 2 level 3-flight`, `turrican 3 level 1`) -- `turrican intro` is
+byte-identical to before, confirming the narrowing doesn't disturb the case bug 2's `$14` reading was
+originally built for.
