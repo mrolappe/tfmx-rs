@@ -21,6 +21,7 @@ pub(crate) const MAX_STEPS: usize = 256;
 
 /// What a [`Span`] covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum SpanKind {
     Pattern(u8),
     Macro(u8),
@@ -29,6 +30,7 @@ pub enum SpanKind {
 /// A claimed `mdat` byte range: from a pattern's or macro's start to the
 /// terminator (or step cap) the walk stopped at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Span {
     pub kind: SpanKind,
     pub start: u32,
@@ -41,6 +43,7 @@ pub struct Span {
 /// know which `$1C`/`$1D` branch a real note would take, or resolve `$11`'s
 /// oscillating (`aa != 0`) form to a fixed offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct SampleRegion {
     pub macro_number: u8,
     pub start: u32,
@@ -49,6 +52,7 @@ pub struct SampleRegion {
 
 /// Everything statically reachable from one song.
 #[derive(Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct WalkResult {
     pub reachable_patterns: BTreeSet<u8>,
     pub reachable_macros: BTreeSet<u8>,
@@ -568,5 +572,31 @@ mod tests {
         if !ran_any {
             eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
         }
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn walk_result_serializes_to_valid_json() {
+        let mut result = WalkResult::default();
+        result.reachable_patterns.insert(1);
+        result.reachable_macros.insert(2);
+        result.mdat_spans.push(Span {
+            kind: SpanKind::Pattern(1),
+            start: 0,
+            end: 10,
+        });
+        result.sample_regions.push(SampleRegion {
+            macro_number: 2,
+            start: 4,
+            len: 8,
+        });
+        result.voice_nibbles.insert(0);
+
+        let json = serde_json::to_string(&result).expect("WalkResult serializes");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(value["reachable_patterns"], serde_json::json!([1]));
+        assert_eq!(value["mdat_spans"][0]["start"], 0);
+        assert_eq!(value["mdat_spans"][0]["end"], 10);
+        assert_eq!(value["sample_regions"][0]["len"], 8);
     }
 }

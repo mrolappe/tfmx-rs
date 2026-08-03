@@ -35,6 +35,7 @@ pub const VOLUME_MAX: u8 = 64;
 /// `clamp(e+k+b, clamp(lo+b, 0, 64), clamp(hi+b, 0, 64))`, so the form is
 /// closed under the opcodes that touch it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum MacroVolume {
     Entry {
         offset: i32,
@@ -98,6 +99,7 @@ impl MacroVolume {
 /// A `$0F <Envelope>`: every `jiffies` jiffies, volume moves `step` towards
 /// `target` (`docs/playback-model.md:511`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Envelope {
     pub step: u8,
     pub jiffies: u8,
@@ -106,6 +108,7 @@ pub struct Envelope {
 
 /// Where a zone's path through the macro ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum ZoneExit {
     /// `$07 <STOP>`.
     Stop,
@@ -124,6 +127,7 @@ pub enum ZoneExit {
 
 /// One `(note range, volume range)` rectangle and what the macro does for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Zone {
     /// Inclusive note range, within `0..=`[`NOTE_MAX`]. This is the raw
     /// pattern note: `$1C` compares `self.note` *before* the track transpose
@@ -144,6 +148,7 @@ pub struct Zone {
 /// Every zone of one macro. The zones are disjoint and, taken together,
 /// cover the whole `0..=NOTE_MAX` x `0..=VOLUME_MAX` rectangle.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct ZoneTable {
     pub macro_number: u8,
     pub zones: Vec<Zone>,
@@ -727,5 +732,25 @@ mod tests {
             "the high half hands off to the high instrument"
         );
         assert!(table.zones.iter().all(|z| z.volumes == (0..=VOLUME_MAX)));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn zone_table_serializes_to_valid_json() {
+        let zones = zones_of(&[
+            [0x02, 0x00, 0x01, 0x00], // SetBegin $000100
+            [0x03, 0x00, 0x00, 0x10], // SetLen 16 words
+            [0x07, 0x00, 0x00, 0x00], // STOP
+        ]);
+        let table = ZoneTable {
+            macro_number: 0,
+            zones,
+        };
+
+        let json = serde_json::to_string(&table).expect("ZoneTable serializes");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(value["macro_number"], 0);
+        assert_eq!(value["zones"][0]["exit"], serde_json::json!("Stop"));
+        assert_eq!(value["zones"][0]["sample"]["start"], 0x100);
     }
 }

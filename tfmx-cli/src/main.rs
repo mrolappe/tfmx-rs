@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use tfmx::TraceEvent;
 
+mod serialize;
+
 #[derive(Parser)]
 #[command(name = "tfmx-cli", about = "Render and inspect TFMX modules")]
 struct Cli {
@@ -48,6 +50,25 @@ enum Command {
     /// note table. For isolating `note_period()`/pitch from every other
     /// layer (trackstep, pattern, macro effects) that could also be wrong.
     MeasurePitch(MeasurePitchArgs),
+    /// Dump a song's static walk (reachable patterns/macros, `mdat`/`smpl`
+    /// provenance) plus a zone table for every reachable macro -- the
+    /// machine-readable module dump `docs/m5-plan.md` Phase 5.4 calls for.
+    Dump(DumpArgs),
+}
+
+#[derive(clap::Args)]
+struct DumpArgs {
+    mdat: PathBuf,
+    smpl: PathBuf,
+    #[arg(long, default_value_t = 0)]
+    song: u8,
+    #[arg(long, value_enum, default_value_t = DumpFormat::Json)]
+    format: DumpFormat,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
+enum DumpFormat {
+    Json,
 }
 
 #[derive(clap::Args)]
@@ -303,6 +324,7 @@ struct TraceArgs {
 #[derive(Copy, Clone, PartialEq, Eq, clap::ValueEnum)]
 enum TraceFormat {
     Text,
+    Json,
 }
 
 #[derive(clap::Args)]
@@ -332,6 +354,7 @@ enum CliError {
     Wav(hound::Error),
     Parse(tfmx::ParseError),
     Access(tfmx::AccessError),
+    Json(serde_json::Error),
     Usage(&'static str),
 }
 
@@ -359,6 +382,12 @@ impl From<tfmx::AccessError> for CliError {
     }
 }
 
+impl From<serde_json::Error> for CliError {
+    fn from(e: serde_json::Error) -> Self {
+        CliError::Json(e)
+    }
+}
+
 impl std::fmt::Display for CliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -366,6 +395,7 @@ impl std::fmt::Display for CliError {
             CliError::Wav(e) => write!(f, "WAV error: {e}"),
             CliError::Parse(e) => write!(f, "invalid module: {e:?}"),
             CliError::Access(e) => write!(f, "out-of-range access: {e:?}"),
+            CliError::Json(e) => write!(f, "JSON error: {e}"),
             CliError::Usage(msg) => write!(f, "usage error: {msg}"),
         }
     }
@@ -812,6 +842,7 @@ fn write_trace(
     events: &[TraceEvent],
     voice: Option<u8>,
     track: Option<u8>,
+    format: TraceFormat,
     out: &mut impl Write,
 ) -> std::io::Result<()> {
     let mut last_voice_state: [Option<tfmx::Voice>; 4] = [None; 4];
@@ -831,7 +862,10 @@ fn write_trace(
             }
             _ => {}
         }
-        write_text_event(e, out)?;
+        match format {
+            TraceFormat::Text => write_text_event(e, out)?,
+            TraceFormat::Json => serialize::write_json_event(e, out)?,
+        }
     }
     Ok(())
 }
@@ -856,8 +890,24 @@ fn run_trace(args: &TraceArgs, out: &mut impl Write) -> Result<(), CliError> {
         frames_left -= chunk_frames;
     }
 
+    write_trace(&events, args.voice, args.track, args.format, out)?;
+    Ok(())
+}
+
+fn run_dump(args: &DumpArgs, out: &mut impl Write) -> Result<(), CliError> {
+    let mdat = std::fs::read(&args.mdat)?;
+    let smpl = std::fs::read(&args.smpl)?;
+    let module = tfmx::Module::parse(&mdat, &smpl)?;
+
+    let walk = tfmx_analysis::walk_song(&module, args.song)?;
+    let zones: Vec<_> = walk
+        .reachable_macros
+        .iter()
+        .filter_map(|&m| tfmx_analysis::resolve_zones(&module, m).ok())
+        .collect();
+
     match args.format {
-        TraceFormat::Text => write_trace(&events, args.voice, args.track, out)?,
+        DumpFormat::Json => serialize::write_dump_json(args.song, &walk, &zones, out)?,
     }
     Ok(())
 }
@@ -1394,6 +1444,7 @@ fn main() {
         Command::RenderMacro(args) => run_render_macro(args),
         Command::RenderPattern(args) => run_render_pattern(args),
         Command::MeasurePitch(args) => run_measure_pitch(args, &mut std::io::stdout().lock()),
+        Command::Dump(args) => run_dump(args, &mut std::io::stdout().lock()),
     };
     if let Err(e) = result {
         eprintln!("tfmx-cli: {e}");
@@ -1690,7 +1741,7 @@ mod tests {
             stopped: false,
         }];
         let mut out = Vec::new();
-        write_trace(&events, None, None, &mut out).unwrap();
+        write_trace(&events, None, None, TraceFormat::Text, &mut out).unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "JIFFY     frame=42 line=5 tempo=6 stopped=false\n"
@@ -1703,7 +1754,7 @@ mod tests {
             tfmx::LineCommand::Stop,
         ))];
         let mut out = Vec::new();
-        write_trace(&events, None, None, &mut out).unwrap();
+        write_trace(&events, None, None, TraceFormat::Text, &mut out).unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "TRACKSTEP Command(Stop)\n"
@@ -1727,7 +1778,7 @@ mod tests {
             },
         ];
         let mut out = Vec::new();
-        write_trace(&events, None, Some(1), &mut out).unwrap();
+        write_trace(&events, None, Some(1), TraceFormat::Text, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(!text.contains("track=0"));
         assert!(text.contains("track=1"));
@@ -1752,7 +1803,7 @@ mod tests {
             },
         ];
         let mut out = Vec::new();
-        write_trace(&events, Some(2), None, &mut out).unwrap();
+        write_trace(&events, Some(2), None, TraceFormat::Text, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(!text.contains("voice=0"));
         assert!(text.contains("voice=2"));
@@ -1766,7 +1817,7 @@ mod tests {
             TraceEvent::Voice { voice: 0, state },
         ];
         let mut out = Vec::new();
-        write_trace(&events, None, None, &mut out).unwrap();
+        write_trace(&events, None, None, TraceFormat::Text, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert_eq!(text.matches("VOICE").count(), 1);
     }
@@ -1784,7 +1835,7 @@ mod tests {
             },
         ];
         let mut out = Vec::new();
-        write_trace(&events, None, None, &mut out).unwrap();
+        write_trace(&events, None, None, TraceFormat::Text, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert_eq!(text.matches("VOICE").count(), 2);
     }
@@ -1797,7 +1848,7 @@ mod tests {
             TraceEvent::Voice { voice: 1, state },
         ];
         let mut out = Vec::new();
-        write_trace(&events, None, None, &mut out).unwrap();
+        write_trace(&events, None, None, TraceFormat::Text, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert_eq!(text.matches("VOICE").count(), 2);
     }
@@ -2167,6 +2218,75 @@ mod tests {
             run_lint(&args, &mut out).unwrap_or_else(|e| panic!("{name}: {e}"));
             let text = String::from_utf8(out).expect("output is UTF-8");
             assert!(text.contains("Jiffies:"), "{name}: report has a summary");
+        }
+    }
+
+    #[test]
+    fn write_trace_json_emits_one_valid_json_object_per_line() {
+        let events = vec![
+            TraceEvent::Jiffy {
+                frame: 42,
+                line: 5,
+                tempo: 6,
+                stopped: false,
+            },
+            TraceEvent::Trigger {
+                voice: 1,
+                macro_number: 2,
+                note: 12,
+                volume: 64,
+                transpose: 0,
+            },
+        ];
+        let mut out = Vec::new();
+        write_trace(&events, None, None, TraceFormat::Json, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let jiffy: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(jiffy["type"], "jiffy");
+        assert_eq!(jiffy["frame"], 42);
+        let trigger: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(trigger["type"], "trigger");
+        assert_eq!(trigger["macro"], 2);
+    }
+
+    /// Phase 5.4's roadmap check: `dump` produces valid, re-parseable JSON
+    /// with a zone table present, across the whole corpus.
+    #[test]
+    fn dump_json_is_valid_and_has_zone_tables_across_full_corpus() {
+        let names = [
+            "turrican intro",
+            "turrican outside",
+            "r-type",
+            "x-out (title)",
+            "turrican 2 title (st)",
+            "turrican 2 level 1-desert",
+            "turrican 2 level 3-flight",
+            "turrican 3 level 1",
+            "apidya (title)",
+            "apidya (level 1)",
+        ];
+
+        for name in names {
+            let Some(mdat) = corpus_path(&format!("mdat.{name}")) else {
+                eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+                return;
+            };
+            let smpl = corpus_path(&format!("smpl.{name}")).expect("smpl present alongside mdat");
+
+            let args = DumpArgs {
+                mdat,
+                smpl,
+                song: 0,
+                format: DumpFormat::Json,
+            };
+            let mut out = Vec::new();
+            run_dump(&args, &mut out).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let value: serde_json::Value =
+                serde_json::from_slice(&out).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let zones = value["zones"].as_array().expect("zones is an array");
+            assert!(!zones.is_empty(), "{name}: expected at least one zone table");
         }
     }
 

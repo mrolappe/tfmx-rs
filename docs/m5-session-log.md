@@ -236,3 +236,44 @@ song (it's statically reachable in `turrican intro` song 2 per the static walker
 `$06 Cont` chain from macros never observed triggered in that window), so this fix has no
 corpus-audible effect the existing regression net could catch either way; a real in-song A/B is
 still open for whoever finds where macro 5's chain actually plays.
+
+## Phase 5.4 — JSON dump + serialization seam
+
+Wired up the `serde` feature `tfmx-analysis` had carried unused since Phase 5.2, and filled the
+`TraceFormat` TODO at `tfmx-cli/src/main.rs:766`.
+
+**`tfmx-analysis`**: `#[cfg_attr(feature = "serde", derive(serde::Serialize))]` added to every
+public walker/zone type (`SpanKind`, `Span`, `SampleRegion`, `WalkResult`, `MacroVolume`,
+`Envelope`, `ZoneExit`, `Zone`, `ZoneTable`) — feature stays optional and default-off, so this
+touches nothing for callers that don't opt in. `RangeInclusive<u8>` (`Zone::notes`/`volumes`)
+serializes via serde's built-in `Range`/`RangeInclusive` support, no extra code needed.
+
+**`tfmx-cli`**: new `dump` subcommand (`--format json`, mirroring `trace`'s own
+value-enum-with-one-variant-for-now seam) runs `walk_song` + `resolve_zones` for every reachable
+macro and serializes the result. New `trace --format json`: `TraceEvent` lives in the
+dependency-free `tfmx` core crate (hard rule, no `serde`), so its JSON encoding is hand-written in
+a new `tfmx-cli/src/serialize.rs` (`write_json_event`, one `serde_json::json!` arm per variant,
+ndjson — one object per line, mirroring `write_text_event`'s one-line-per-event shape) rather than
+derived. `write_trace` gained a `format: TraceFormat` parameter and now switches on it internally
+instead of `run_trace` doing the format dispatch, one function per format as the existing doc
+comment already called for. `CliError` gained a `Json(serde_json::Error)` variant for
+`dump`'s `serde_json::to_writer_pretty` call; `trace --format json`'s per-line writes can't
+actually fail with a JSON error (the `Value` is already built), so it stays a plain
+`std::io::Result` like `write_text_event`.
+
+**Check results**: all 10 corpus modules' `dump --format json` output is valid, re-parseable JSON
+with a non-empty `zones` array (new `dump_json_is_valid_and_has_zone_tables_across_full_corpus`
+test, mirroring the existing `lint_runs_across_full_corpus_without_error` corpus-loop shape);
+`cargo build -p tfmx-analysis --no-default-features` still compiles and exposes the same structs
+(feature gate is additive-only). New tests, TDD-adjacent (written alongside implementation, not
+strictly red-green-refactor since Sonnet did the wiring directly): `walk_result_serializes_to_valid_json`
+and `zone_table_serializes_to_valid_json` in `tfmx-analysis` (gated `#[cfg(feature = "serde")]`,
+needed a new `serde_json` dev-dependency), `write_trace_json_emits_one_valid_json_object_per_line`
+and the corpus-wide dump test in `tfmx-cli`. 65 relevant tests pass (61 `tfmx-cli` + new
+`tfmx-analysis` serde tests), full workspace suite green, clippy clean (one pre-existing unrelated
+warning in `tfmx/tests/mutation_robustness.rs`, not touched), `wasm32-unknown-unknown` build for
+`tfmx` unaffected (only `tfmx-analysis`/`tfmx-cli` touched).
+
+Not done, out of scope for this phase: `dump`'s output is one song's walk plus that song's
+reachable macros' zone tables — dumping every song, or every macro regardless of reachability,
+was not asked for by the phase brief and would be speculative scope.
