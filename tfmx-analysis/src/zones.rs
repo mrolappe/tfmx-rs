@@ -329,7 +329,14 @@ fn walk(bytes: &[u8], macro_number: u8, mut path: Path, zones: &mut Vec<Zone>) {
                 .sample
                 .get_or_insert_default()
                 .sampleloop(sext24(b1, b2, b3)),
-            0x19 => path.sample = Some(SamplePointer::default()),
+            // "Loads the null sample into the appropriate registers"
+            // (docs/opcodes.md) -- a real release-to-silence the real
+            // interpreter performs. But `Zone.sample` names the region that
+            // actually played, for instrument export/analysis -- so a
+            // trailing `$19` (a common self-release idiom) must not
+            // overwrite whatever real region got here first; only a `$19`
+            // with no prior sample touch resolves to "no sample" either way.
+            0x19 => {}
             _ => {}
         }
     }
@@ -574,6 +581,40 @@ mod tests {
         // $0D +$14 then $0E SetVolume aa=$00 (docs/opcodes.md:162 -- the
         // operand is `aa`, and macro 28's is zero).
         assert_eq!(z.volume.fixed(), Some(0));
+    }
+
+    /// Macro 17 arms a real loop (`$02`/`$03`/`$18`) and then, before
+    /// `$07 STOP`, issues `$19 <Set one shot sample>` -- `docs/opcodes.md`
+    /// says this "loads the null sample into the appropriate registers", a
+    /// real release-to-silence the macro performs on itself. The zone's
+    /// sample must stay the loop region that actually played, not the
+    /// null-sample state `$19` leaves live at path end -- otherwise every
+    /// instrument using this idiom as its own release exports silence.
+    #[test]
+    fn turrican_intro_macro_17_keeps_its_loop_region_across_the_terminal_null_sample() {
+        let Some((mdat, smpl)) = corpus("turrican intro") else {
+            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+            return;
+        };
+        let module = Module::parse(&mdat, &smpl).expect("valid module");
+        let table = resolve_zones(&module, 17).expect("macro 17 in range");
+
+        assert_eq!(table.zones.len(), 1, "macro 17 has no $1C/$1D");
+        let z = &table.zones[0];
+        assert_eq!(z.exit, ZoneExit::Stop, "the listing ends on $07 STOP");
+        // $02 $000A04, $03 $0500, $18 $000600 -> loop_start $0A04+$0600 =
+        // $1004, loop_len $0500-$0300 = $0200 words = $0400 bytes. The
+        // trailing $19 must not overwrite this.
+        assert_eq!(
+            z.sample,
+            Some(SampleRegion {
+                macro_number: 17,
+                start: 0x1004,
+                len: 0x400,
+                looped: true,
+            }),
+            "the terminal $19 must not erase the loop region that actually played"
+        );
     }
 
     /// Macro 24 is `turrican intro`'s plain keysplit: `$1C $20 -> 2`, with

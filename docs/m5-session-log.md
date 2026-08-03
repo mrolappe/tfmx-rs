@@ -451,3 +451,35 @@ Not done, explicitly out of scope: nobody has loaded the exported files in real 
 DecentSampler — the phase's own check criterion needs that and it is not something this environment
 can automate; whoever has those tools available should do that pass before treating 5.7 as fully
 closed in the tool-verification sense, not just the structural sense recorded here.
+
+**Update (2026-08-03, session 22): the tool-verification gap above is closed, and closing it found
+a real bug.** sfizz and DecentSampler were installed; `sfizz`'s AU (`aumu samp Sfzt`) passes
+`auval -v` outright (format/render/MIDI tests all `PASS`). `turrican intro`'s exported
+`.dspreset`/`.sfz` were then loaded directly in DecentSampler and sfizz (Ableton Live hosting the
+VST3) — the user checked several of the 24 exported instruments and recognized real sounds from the
+song, but flagged that several WAVs looked suspiciously short/empty and asked whether the PCM was
+even real (it was — `build_instrument` reads straight out of `Module::sample`, never synthesizes).
+That question led to finding a real bug: 7 of the 24 macros (17, 18, 19, 22, 23, 43, 44) exported
+completely silent (44-byte, zero-PCM) WAVs. Root cause: each of those macros' chains legitimately
+arm a real sample region via `$02 SetBegin`/`$03 SetLen`/`$18 Sampleloop`, then release themselves
+to silence via `$19 <Set one shot sample>` ("loads the null sample into the appropriate registers",
+`docs/opcodes.md`) right before `$07 STOP` — a real, spec-documented release idiom, not a decode
+bug. But `tfmx-analysis/src/zones.rs`'s `resolve_zones` tracked `Zone.sample` as whatever sample
+state is live *at the end of the resolved path*, so the terminal `$19` silently overwrote the real,
+audible loop region with a fictional zero-length one before `build_instrument` ever saw it.
+
+Fixed with a one-line change: `$19` is now a no-op for the zone's tracked sample state (previously
+`path.sample = Some(SamplePointer::default())`), since `Zone.sample` exists to name "the region
+that actually played" for export/analysis consumers, not raw terminal register state — a zone that
+never touched a sample opcode still correctly resolves to `None`. One new TDD test,
+`turrican_intro_macro_17_keeps_its_loop_region_across_the_terminal_null_sample`, pins macro 17's
+expected post-fix region (`start: 0x1004, len: 0x400, looped: true`, hand-derived from its
+`$02`/`$03`/`$18` operands the same way the existing macro-28 test does) — written failing against
+the bug first, then passing after the fix. Re-exported `turrican intro`: zero empty WAVs remain
+across all 24 macros (previously 7). Full workspace suite green, clippy clean (same one
+pre-existing unrelated warning as every prior phase, untouched), no golden-hash impact (`tfmx-cli`
+export path only, no playback code touched).
+
+**Phase 5.7's `check:` criteria are now fully closed** — structurally (prior session) and by real
+tool load plus the user's own ear (this session), with a bug the structural checks alone had missed
+found and fixed along the way.
