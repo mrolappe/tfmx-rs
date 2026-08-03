@@ -277,3 +277,65 @@ warning in `tfmx/tests/mutation_robustness.rs`, not touched), `wasm32-unknown-un
 Not done, out of scope for this phase: `dump`'s output is one song's walk plus that song's
 reachable macros' zone tables — dumping every song, or every macro regardless of reachability,
 was not asked for by the phase brief and would be speculative scope.
+
+## Phase 5.5 — MIDI export
+
+`tfmx-cli export-midi`, per the phase brief in `docs/m5-plan.md`: a JSON mapping keyed on
+`(macro, note range, velocity range) → program | drum note | drop`, auto-drafted from 5.3's zone
+tables and hand-editable, driving a note event stream built from an actual song trace (the same
+`Player::render_traced` seam `trace` uses), written out as a Standard MIDI File via `midly`.
+
+**New `tfmx-cli/src/midi_mapping.rs`**: `MidiMapping`/`MacroMapping`/`MappingZone`/`ZoneOutput`
+(serde `Serialize`+`Deserialize`, unlike `tfmx-analysis`'s serialize-only types — this file is
+meant to be loaded back after a hand-edit). `draft_mapping(module, &WalkResult)` calls
+`tfmx_analysis::resolve_zones` for every reachable macro and defaults each zone's output to
+`Program { program: macro_number }`, transpose 0 — a starting point, not a final answer, per the
+plan's own framing.
+
+**New `tfmx-cli/src/midi.rs`**: `build_events(trace: &[TraceEvent], &MidiMapping) -> Vec<MidiEvent>`
+walks a trace chronologically, one absolute MIDI tick per `Jiffy` event — trivially satisfies the
+plan's "PPQ chosen so 1 jiffy = an exact integer tick count" (it's exactly 1), with real
+wall-clock accuracy coming from a MIDI tempo meta event emitted whenever the trace's own `Jiffy.
+tempo` changes (`docs/playback-model.md` §3.2's `50/(v+1)` jiffy rate → microseconds/quarter,
+scaled by the fixed header `PPQ`). Each `Trigger` becomes one `NoteOn` (looked up through the
+mapping's zone for `(macro_number, note, volume)`; `Drop` emits nothing, `Drum` fixes the MIDI
+note and routes to the GM percussion channel, `Program` computes the MIDI note from this crate's
+own `MIDDLE_C_NOTE = 0x18 → MIDI 60` anchor plus the trace's `transpose` plus the zone's own
+hand-authored transpose); a voice's previous note is explicitly closed first on retrigger, and any
+still-sounding note gets a final `NoteOff` at the trace's end. Channel = voice number for pitched
+output, drums share the GM channel 10. `write_smf` converts the absolute-tick list to `midly`'s
+own relative-delta `Track` and writes a Format-0 (single-track) SMF.
+
+**Vibrato/portamento → pitch bend**: rather than decoding `$0B`/`$0C` specifically, every voice's
+`Voice.period` (already traced every jiffy) is compared against a per-trigger reference (the
+period the first jiffy it goes nonzero after a `Trigger`) — any deviation, from whichever opcode
+caused it, becomes a 14-bit pitch bend (`period` is inversely proportional to frequency, same
+relationship as `tfmx/src/macro_interp.rs`'s `note_period`). A wide ±24-semitone bend range is set
+once per channel via RPN 0 so portamento glides spanning more than an octave don't clip; bend
+resets to center on every new trigger.
+
+**`tfmx-cli` CLI wiring**: `render_trace` extracted out of `run_trace` (previously inlined) so
+`export-midi` can share the exact same trace-collection loop rather than duplicating it —
+`ExportMidiArgs` mirrors `TraceArgs`' `song`/`seconds`/`gate` shape, plus `-o`/`--output` and an
+optional `--mapping <path>`: if the path doesn't exist yet it's auto-drafted and written there for
+hand-editing on the next run; omitted entirely, the mapping is auto-drafted in memory only.
+
+**Check results**: `export_midi_produces_valid_midi_matching_trigger_count_across_full_corpus`
+(new, mirrors `dump_json...`'s corpus-loop shape) confirms all 10 corpus modules export MIDI that
+re-parses via `midly::Smf::parse`, with note count matching the trace's own `Trigger` count exactly
+both before and after the tick-delta round trip through `midly`.
+`editing_the_mapping_changes_the_exported_notes` confirms dropping a triggered macro's zones
+removes notes from the export. 19 new tests total, written test-first per this project's TDD rule
+(5 in `midi_mapping.rs`, 12 in `midi.rs`, the 2 corpus-level ones above in `main.rs`), full
+workspace suite green (80 `tfmx-cli` tests total, up from 61), clippy clean (the same one
+pre-existing unrelated warning as Phase 5.4, not touched),
+`wasm32-unknown-unknown` build for `tfmx` unaffected (only `tfmx-cli` touched; `midly` added as a
+`tfmx-cli`-only dependency with `rayon`/`parallel` off).
+
+Not done, out of scope for this phase: the actual DAW-open/listen half of the check criterion (a
+corpus module opens in a real cross-platform DAW/player) — structurally verified via `midly`'s own
+parser, but per this project's own standing rule, structural validation is not the same as ears on
+it; flagged here for whoever picks up the ear-check. `$08`/`$09`/`$1E`/`$1F` macro-internal note
+changes are not decoded into their own `NoteOn`s — only the pattern-level `Trigger`'s note is
+mapped, and any pitch movement from those opcodes shows up as pitch bend instead (same mechanism as
+vibrato/portamento, since it's driven off the observed period, not the opcode).

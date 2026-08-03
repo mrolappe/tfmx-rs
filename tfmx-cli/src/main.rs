@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use tfmx::TraceEvent;
 
+mod midi;
+mod midi_mapping;
 mod serialize;
 
 #[derive(Parser)]
@@ -54,6 +56,31 @@ enum Command {
     /// provenance) plus a zone table for every reachable macro -- the
     /// machine-readable module dump `docs/m5-plan.md` Phase 5.4 calls for.
     Dump(DumpArgs),
+    /// Export a song to a Standard MIDI File, via a hand-editable JSON
+    /// mapping from 5.3's zone tables to MIDI program/drum/drop.
+    /// `docs/m5-plan.md` Phase 5.5.
+    ExportMidi(ExportMidiArgs),
+}
+
+#[derive(clap::Args)]
+struct ExportMidiArgs {
+    mdat: PathBuf,
+    smpl: PathBuf,
+    #[arg(short = 'o', long = "output")]
+    output: PathBuf,
+    #[arg(long, default_value_t = 0)]
+    song: u8,
+    #[arg(long, default_value_t = 30)]
+    seconds: u32,
+    /// JSON mapping file: `(macro, note range, velocity range) -> program |
+    /// drum note | drop` (docs/m5-plan.md Phase 5.5). If the path doesn't
+    /// exist yet, it is auto-drafted from the song's zone tables and
+    /// written there for hand-editing before the export runs; omit
+    /// entirely to auto-draft in memory only, for a quick one-off export.
+    #[arg(long)]
+    mapping: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = GateArg::All)]
+    gate: GateArg,
 }
 
 #[derive(clap::Args)]
@@ -870,18 +897,23 @@ fn write_trace(
     Ok(())
 }
 
-fn run_trace(args: &TraceArgs, out: &mut impl Write) -> Result<(), CliError> {
-    let mdat = std::fs::read(&args.mdat)?;
-    let smpl = std::fs::read(&args.smpl)?;
-    let module = tfmx::Module::parse(&mdat, &smpl)?;
-
+/// Renders `module`'s `song` for `seconds` at the trace seam
+/// (`Player::render_traced`), collecting every `TraceEvent` in order.
+/// Shared by `trace` and `export-midi`, the two commands that consume a
+/// full state-machine trace rather than just the PCM.
+fn render_trace(
+    module: &tfmx::Module,
+    song: u8,
+    seconds: u32,
+    gate: GateArg,
+) -> Result<Vec<TraceEvent>, CliError> {
     const SAMPLE_RATE: u32 = 44_100;
     const SEPARATION: u8 = 100;
-    let mut player = tfmx::Player::new(&module, args.song, SAMPLE_RATE, SEPARATION)?;
-    player.set_trackstep_gate(args.gate.into());
+    let mut player = tfmx::Player::new(module, song, SAMPLE_RATE, SEPARATION)?;
+    player.set_trackstep_gate(gate.into());
 
     let mut events = Vec::new();
-    let total_frames = SAMPLE_RATE as usize * args.seconds as usize;
+    let total_frames = SAMPLE_RATE as usize * seconds as usize;
     let mut buf = vec![0i16; 4096 * 2];
     let mut frames_left = total_frames;
     while frames_left > 0 {
@@ -889,6 +921,15 @@ fn run_trace(args: &TraceArgs, out: &mut impl Write) -> Result<(), CliError> {
         player.render_traced(&mut buf[..chunk_frames * 2], |e| events.push(e))?;
         frames_left -= chunk_frames;
     }
+    Ok(events)
+}
+
+fn run_trace(args: &TraceArgs, out: &mut impl Write) -> Result<(), CliError> {
+    let mdat = std::fs::read(&args.mdat)?;
+    let smpl = std::fs::read(&args.smpl)?;
+    let module = tfmx::Module::parse(&mdat, &smpl)?;
+
+    let events = render_trace(&module, args.song, args.seconds, args.gate)?;
 
     write_trace(&events, args.voice, args.track, args.format, out)?;
     Ok(())
@@ -909,6 +950,40 @@ fn run_dump(args: &DumpArgs, out: &mut impl Write) -> Result<(), CliError> {
     match args.format {
         DumpFormat::Json => serialize::write_dump_json(args.song, &walk, &zones, out)?,
     }
+    Ok(())
+}
+
+/// Loads `args.mapping` if it exists; otherwise auto-drafts one from the
+/// song's zone tables (`docs/m5-plan.md` Phase 5.3/5.5) and, if a path was
+/// given, writes it there for hand-editing on the next run.
+fn load_or_draft_mapping(
+    module: &tfmx::Module,
+    args: &ExportMidiArgs,
+) -> Result<midi_mapping::MidiMapping, CliError> {
+    if let Some(path) = &args.mapping
+        && path.exists()
+    {
+        let text = std::fs::read_to_string(path)?;
+        return Ok(serde_json::from_str(&text)?);
+    }
+    let walk = tfmx_analysis::walk_song(module, args.song)?;
+    let mapping = midi_mapping::draft_mapping(module, &walk);
+    if let Some(path) = &args.mapping {
+        std::fs::write(path, serde_json::to_string_pretty(&mapping)?)?;
+    }
+    Ok(mapping)
+}
+
+fn run_export_midi(args: &ExportMidiArgs) -> Result<(), CliError> {
+    let mdat = std::fs::read(&args.mdat)?;
+    let smpl = std::fs::read(&args.smpl)?;
+    let module = tfmx::Module::parse(&mdat, &smpl)?;
+
+    let mapping = load_or_draft_mapping(&module, args)?;
+    let trace = render_trace(&module, args.song, args.seconds, args.gate)?;
+    let events = midi::build_events(&trace, &mapping);
+    let file = std::fs::File::create(&args.output)?;
+    midi::write_smf(&events, file)?;
     Ok(())
 }
 
@@ -1445,6 +1520,7 @@ fn main() {
         Command::RenderPattern(args) => run_render_pattern(args),
         Command::MeasurePitch(args) => run_measure_pitch(args, &mut std::io::stdout().lock()),
         Command::Dump(args) => run_dump(args, &mut std::io::stdout().lock()),
+        Command::ExportMidi(args) => run_export_midi(args),
     };
     if let Err(e) = result {
         eprintln!("tfmx-cli: {e}");
@@ -2288,6 +2364,109 @@ mod tests {
             let zones = value["zones"].as_array().expect("zones is an array");
             assert!(!zones.is_empty(), "{name}: expected at least one zone table");
         }
+    }
+
+    /// Phase 5.5's own check: a corpus module exports valid MIDI (parses
+    /// back via `midly`) whose note count matches the trace's own
+    /// `Trigger` event count -- one `NoteOn` per `Trigger`, per
+    /// `midi::build_events`'s contract.
+    #[test]
+    fn export_midi_produces_valid_midi_matching_trigger_count_across_full_corpus() {
+        let names = [
+            "turrican intro",
+            "turrican outside",
+            "r-type",
+            "x-out (title)",
+            "turrican 2 title (st)",
+            "turrican 2 level 1-desert",
+            "turrican 2 level 3-flight",
+            "turrican 3 level 1",
+            "apidya (title)",
+            "apidya (level 1)",
+        ];
+
+        for name in names {
+            let Some(mdat) = corpus_path(&format!("mdat.{name}")) else {
+                eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+                return;
+            };
+            let smpl = corpus_path(&format!("smpl.{name}")).expect("smpl present alongside mdat");
+            let mdat_bytes = std::fs::read(mdat).unwrap();
+            let smpl_bytes = std::fs::read(smpl).unwrap();
+            let module = tfmx::Module::parse(&mdat_bytes, &smpl_bytes)
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+
+            let trace = render_trace(&module, 0, 10, GateArg::All)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let trigger_count =
+                trace.iter().filter(|e| matches!(e, TraceEvent::Trigger { .. })).count();
+
+            let walk =
+                tfmx_analysis::walk_song(&module, 0).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            let mapping = midi_mapping::draft_mapping(&module, &walk);
+            let events = midi::build_events(&trace, &mapping);
+            let note_on_count =
+                events.iter().filter(|e| matches!(e.kind, midi::EventKind::NoteOn { .. })).count();
+            assert_eq!(note_on_count, trigger_count, "{name}: one NoteOn per Trigger");
+
+            let mut bytes = Vec::new();
+            midi::write_smf(&events, &mut bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let smf = midly::Smf::parse(&bytes).unwrap_or_else(|e| panic!("{name}: invalid MIDI: {e}"));
+            let parsed_note_ons = smf.tracks[0]
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e.kind,
+                        midly::TrackEventKind::Midi {
+                            message: midly::MidiMessage::NoteOn { .. },
+                            ..
+                        }
+                    )
+                })
+                .count();
+            assert_eq!(parsed_note_ons, note_on_count, "{name}: note count survives the round trip");
+        }
+    }
+
+    /// Phase 5.5's check: editing the mapping changes the output -- dropping
+    /// the zones of a macro that actually gets triggered removes its notes.
+    #[test]
+    fn editing_the_mapping_changes_the_exported_notes() {
+        let Some(mdat) = corpus_path("mdat.turrican intro") else {
+            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+            return;
+        };
+        let smpl = corpus_path("smpl.turrican intro").expect("smpl present alongside mdat");
+        let mdat_bytes = std::fs::read(mdat).unwrap();
+        let smpl_bytes = std::fs::read(smpl).unwrap();
+        let module = tfmx::Module::parse(&mdat_bytes, &smpl_bytes).unwrap();
+
+        let trace = render_trace(&module, 0, 10, GateArg::All).unwrap();
+        let walk = tfmx_analysis::walk_song(&module, 0).unwrap();
+        let mut mapping = midi_mapping::draft_mapping(&module, &walk);
+
+        let before = midi::build_events(&trace, &mapping)
+            .iter()
+            .filter(|e| matches!(e.kind, midi::EventKind::NoteOn { .. }))
+            .count();
+        assert!(before > 0, "expected some notes before editing the mapping");
+
+        let triggered_macro = trace
+            .iter()
+            .find_map(|e| match e {
+                TraceEvent::Trigger { macro_number, .. } => Some(*macro_number),
+                _ => None,
+            })
+            .expect("song has at least one Trigger in the first 10s");
+        for zone in &mut mapping.macros.get_mut(&triggered_macro).unwrap().zones {
+            zone.output = midi_mapping::ZoneOutput::Drop;
+        }
+
+        let after = midi::build_events(&trace, &mapping)
+            .iter()
+            .filter(|e| matches!(e.kind, midi::EventKind::NoteOn { .. }))
+            .count();
+        assert!(after < before, "dropping a triggered macro's zones must remove notes");
     }
 
     /// Step 11.4's roadmap check: a corpus run of two songs produces
