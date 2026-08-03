@@ -1335,3 +1335,81 @@ user has listened: it needs a fresh full-mix **and** per-voice-stem A/B against 
   so proving that needs new instrumentation; the outputs were checked instead -- min executed
   non-zero period across all song slots of all ten modules is 37, on a non-default `turrican intro`
   subsong, which transpose/portamento/`$17 <Set period>` explain without any large finetune.)
+
+## Update (2026-08-03): two real bugs in `mdat.turrican 2 title (st)` pattern 0x52 / macro 0x26 -- both fixed
+
+User-reported, listening to `turrican 2 title`'s song 0: pattern `$52`'s first four notes are coded
+`Wait(3)`, the remaining eight `Wait(1)` (`tfmx-cli disasm --pattern 82`, decimal), but all twelve
+played back with the same audible length; separately, the macro they trigger (`$26`/38) sounded like
+it had no release phase compared to the TFMX editor.
+
+### Bug 1: `$19 <Set one shot sample>` (and any mid-playback region change) cut the voice dead instead of releasing it
+
+**Root cause**: `Paula::set_sample_region` (`tfmx/src/paula.rs`) wrote the new `start`/`len` straight
+into the *actively playing* voice registers the instant a macro genuinely changed them -- even while
+DMA was already on and a note was mid-flight. Real Paula double-buffers `AUDxLC`/`AUDxLEN`: a write
+only takes effect at the voice's next automatic reload, which is *how* `docs/playback-model.md` §2.3
+says `$18 Sampleloop`/`$19 Set one shot sample` are supposed to work ("timing the register rewrite to
+land before Paula's next automatic reload" / "$19 ... to silence a voice without an audible click").
+Applying it immediately meant `$19` (macro 38's own release mechanism: attack, brief loop, one-shot
+silence, stop) hard-cut every note about two jiffies in, before its natural decay or the pattern's own
+timing ever mattered.
+
+**Fix**: `set_sample_region` now only latches `start`/`len` immediately while DMA is *off* (nothing is
+playing yet, so it's safe); while DMA is on it only records `requested_region`, and the actual switch
+happens through the wrap-triggered handoff `Voice::next_sample` already performs for the normal
+attack→loop transition -- the same mechanism, now also correctly deferring one-shot/loop rewrites made
+mid-note.
+
+**Tests**: `paula::tests::set_sample_region_while_dma_is_on_does_not_stomp_the_playing_region` (new,
+red→green). One pre-existing test (`macro_interp::tests::take_turn_resumes_once_loop_completions_reach_target`)
+called `set_dma(true)` *before* `set_sample_region`/`set_loop_region` -- the wrong order vs. every real
+caller (`MacroInterpreter::tick`) and every other Paula test; reordered it rather than special-casing
+the fix for it.
+
+**User confirmed by ear**: macro's release now sounds right.
+
+### Bug 2: `note_on`'s "same instrument still running" optimization swallowed fast percussive retriggers
+
+**Root cause**: `MacroInterpreter::note_on` (`tfmx/src/macro_interp.rs`) skipped restarting a macro
+program -- just updating note/volume in place -- whenever the incoming Note named the instrument
+already running on that voice and it hadn't reached `$07 <STOP>` yet. This was built and empirically
+validated (`docs/status.md`, 2026-07-26 entries above) for `turrican intro`'s voice-1/voice-3
+instruments, which are `$14 <Wait key up>`-held sustain pads: a fast retrigger there is meant to
+glide/legato onto the new note, and skipping the restart is also the only way such a retrigger
+survives `$00 aa=0`'s mandatory 1-jiffy pause. But the condition was unconditional on *any*
+not-yet-stopped instrument -- and macro 38 is a fixed, self-terminating **percussive** envelope (no
+`$14` anywhere, `$00 aa=1` so no stall to survive): once its own `$01 DMAon` had fired, every faster
+pattern retrigger (the `Wait(1)` notes) was silently absorbed into the still-running note instead of
+striking a fresh attack, collapsing all twelve notes to the same audible length regardless of what the
+pattern actually encoded.
+
+**Fix**: narrowed the skip-restart condition to instruments genuinely still *sustaining*: either their
+own `$01 DMAon` hasn't fired yet this cycle (`!self.dma_on`, the pre-attack case the heuristic was
+built for), or the program is parked in `$14 <Wait key up>` (the legato-pad case). Once DMAon has
+fired and the program is not in `$14`, a further Note for the same instrument is a genuine new hit and
+gets the normal full `trigger()` reset.
+
+**Tests**: `macro_interp::tests::note_on_retriggers_a_still_sounding_percussive_instrument` (new,
+red→green, built from macro 38's exact real bytecode). All existing `note_on`-heuristic tests
+(same-macro-while-running, cont-indirection, different-macro, after-stop) still pass unchanged --
+confirmed this is a narrowing, not a reversal, of the 2026-07-26 fix.
+
+**Verified against `uade123`** (executed as a black box, never read, per the provenance policy): a
+fresh reference render of `turrican 2 title (st)` shows pattern `$52`'s onsets cleanly split into a
+320 ms-spaced block (the four `Wait(3)` notes) then a 160 ms-spaced block (the eight `Wait(1)` notes)
+-- exactly what our render now produces (previously: a uniform 320 ms throughout, matching neither the
+pattern data nor the reference). **User confirmed by ear**: note lengths now sound right.
+
+### Scope and verification
+
+Both bugs live in `tfmx`'s single shared code paths -- `Paula::set_sample_region`/`set_loop_region`
+and `MacroInterpreter::note_on` -- and every dispatch site (`player.rs`'s real playback, `tfmx-cli`'s
+standalone `render-macro`/`render-pattern`) already routes through them; neither `tfmx-web` nor
+`tfmx-analysis` reimplements this logic. No other fix site needed.
+
+`cargo test --workspace` is green. Golden hashes regenerated (`TFMX_REGEN_GOLDEN=1`): 8 of 10 corpus
+modules' hashes changed (only `turrican intro` and `turrican outside` are byte-identical to before --
+reassuring for `turrican intro` specifically, since it's the module bug 2's original heuristic was
+tuned against, and its render is unaffected by the narrowing). `tfmx-cli lint` across the corpus shows
+no new findings.

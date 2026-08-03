@@ -377,20 +377,34 @@ impl MacroInterpreter {
     /// already running on this voice (per the last `trigger()`, not
     /// necessarily `self.macro_number` -- a keysplit instrument's `$06
     /// <Cont>` moves the program counter to a different macro number
-    /// within the same jiffy as the trigger) and hasn't reached `$07
-    /// <STOP>` (or been silenced by `$FE`), this updates the note/volume in
-    /// place instead of restarting the program at step 0 -- a fast note run
-    /// that keeps retriggering the same instrument would otherwise never
-    /// survive past `$00 aa=0`'s mandatory 1-jiffy pause to reach its own
-    /// `$01 DMAon`. **Uncertain**: no [S1] citation states this; grounded
-    /// empirically by an A/B against `uade123` on `turrican intro`'s voice 1
-    /// (`docs/status.md`), not by the published spec.
+    /// within the same jiffy as the trigger) and is genuinely still
+    /// *sustaining* it -- either its own `$01 DMAon` hasn't fired yet this
+    /// cycle, or it has and the program is parked in `$14 <Wait key up>` --
+    /// this updates the note/volume in place instead of restarting the
+    /// program at step 0. A fast note run that keeps retriggering the same
+    /// instrument would otherwise never survive past `$00 aa=0`'s mandatory
+    /// 1-jiffy pause to reach its own `$01 DMAon` (the pre-attack case), and
+    /// a `$14`-held pad instrument is meant to glide/legato onto the new
+    /// note rather than re-attack (the sustain case). **Uncertain**: no
+    /// [S1] citation states either half of this; the pre-attack half is
+    /// grounded empirically by an A/B against `uade123` on `turrican
+    /// intro`'s voice 1 (`docs/status.md`); the `$14` narrowing is grounded
+    /// by a second `uade123` A/B on `turrican 2 title (st)` pattern 0x52 /
+    /// macro 0x26 -- a fixed, self-terminating percussive envelope (no
+    /// `$14` anywhere) that the original unconditional "not yet `$07`"
+    /// reading wrongly treated as still-sustaining once DMAon had already
+    /// fired, silently swallowing every fast retrigger the reference
+    /// audibly re-attacks. Once DMAon has fired and the instrument is not
+    /// parked in `$14`, any further Note for it is a genuine new hit, not a
+    /// continuation, regardless of whether `$07 <STOP>` has been reached
+    /// yet.
     ///
     /// `detune` is the pattern note record's `dd` byte (`NoteTiming::Detune`,
     /// only present when the note byte is below `$80`); like `$21`'s detune it
     /// is folded into the next `$08`/`$09`/`$1E`/`$1F`'s finetune.
     pub fn note_on(&mut self, macro_number: u8, note: u8, volume: u8, transpose: i8, detune: i8) {
-        if macro_number == self.instrument && !self.is_stopped() {
+        let sustaining = !self.dma_on || matches!(self.wait, Wait::KeyUp(_));
+        if macro_number == self.instrument && !self.is_stopped() && sustaining {
             self.last_note = self.note;
             self.note = note as i32;
             self.transpose = transpose;
@@ -1300,6 +1314,60 @@ mod tests {
     }
 
     #[test]
+    fn note_on_retriggers_a_still_sounding_percussive_instrument() {
+        // Mirrors `mdat.turrican 2 title (st)` macro 38 (0x26) exactly, per
+        // `tfmx-cli disasm --macro 38`: DMAoff+Reset aa=1 (no stall), SetBegin,
+        // SetLen, AddVolume, AddNote, DMAon, Wait, OneShot, Wait, Stop -- a
+        // fixed, self-terminating percussive envelope, never a `$14 <Wait key
+        // up>` sustain. Pattern 0x52 in that module retriggers this same
+        // instrument every 2 jiffies (`timing: Wait(1)`), well before the
+        // program's own ~3-jiffy cycle reaches `$07 STOP` on its own --
+        // confirmed via `uade123` A/B to produce a distinct, audible re-attack
+        // each time (clean 160ms-spaced onsets), not a swallowed note. Before
+        // this fix, `note_on`'s "same instrument, not stopped yet" in-place
+        // update (`c919266`, meant for `$14`-sustained pads mid-legato) also
+        // caught this percussive case, silently dropping every fast retrigger.
+        let mdat = macro_module(&[&[
+            [0x00, 0x01, 0x00, 0x00],
+            [0x02, 0x00, 0x00, 0x04],
+            [0x03, 0x00, 0x06, 0x00],
+            [0x0D, 0x00, 0x00, 0x01],
+            [0x08, 0xFA, 0x00, 0x00],
+            [0x01, 0x00, 0x00, 0x00],
+            [0x04, 0x00, 0x00, 0x00],
+            [0x19, 0x00, 0x00, 0x00],
+            [0x04, 0x00, 0x00, 0x00],
+            [0x07, 0x00, 0x00, 0x00],
+        ]]);
+        let module = Module::parse(&mdat, &[]).expect("valid header parses");
+        let mut mac = MacroInterpreter::new();
+        let mut paula = Paula::new(100);
+
+        mac.note_on(0, 32, 4, 0, 0);
+        run(&mut mac, &module, &mut paula, 2);
+        assert!(
+            paula.voice(0).dma_on,
+            "the instrument should have reached its own $01 by jiffy 2"
+        );
+        assert!(
+            !mac.is_stopped(),
+            "the instrument's ~3-jiffy cycle should not have reached $07 yet"
+        );
+
+        // The pattern's next note (2 jiffies later, `Wait(1)`) arrives while
+        // the instrument is still mid-cycle -- a genuine new percussive hit,
+        // not a legato update of a sustained pad.
+        mac.note_on(0, 32, 5, 0, 0);
+        tick(&mut mac, &module, &mut paula);
+        assert!(
+            !paula.voice(0).dma_on,
+            "a fresh percussive retrigger must restart DMA (off this jiffy, \
+             back on once the reset macro runs through again), not silently \
+             continue the still-running program"
+        );
+    }
+
+    #[test]
     fn note_on_retriggering_through_a_cont_indirection_does_not_reset_dma() {
         // `turrican intro`'s voice-3 percussion instrument: the *public*
         // macro number a pattern's Note event names (24 in the real
@@ -1788,10 +1856,10 @@ mod tests {
         let mut paula = Paula::new(100);
         assert!(!mac.take_turn(&mut paula, 0));
 
-        paula.set_dma(0, true);
         paula.set_period(0, 1); // very high frequency
         paula.set_sample_region(0, 0, 1); // len 1 word = 2 samples
         paula.set_loop_region(0, 0, 1); // reload the same region on wrap
+        paula.set_dma(0, true);
         let smpl = [0i8; 4];
         let mut out = [0i16; 8];
         paula.render(&smpl, 44100, &mut out);

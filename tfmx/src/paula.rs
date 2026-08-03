@@ -142,18 +142,25 @@ impl Paula {
 
     /// `MacroInterpreter::tick()` calls this every jiffy, even ones where
     /// the macro program made no change to the region (e.g. sitting in a
-    /// `$04 <Wait>`). Applying `start`/`len` unconditionally would undo
-    /// `Voice::next_sample`'s one-shot attack->loop handoff on the very next
-    /// jiffy after it happens, corrupting `frac`'s reinterpretation against
-    /// the wrong region every time. Only a genuine change to the requested
-    /// region should touch `start`/`len` here; a real retrigger re-syncs
-    /// them unconditionally via the `set_dma` off->on edge instead.
+    /// `$04 <Wait>`). Real Paula double-buffers `AUDxLC`/`AUDxLEN`: a write
+    /// while DMA is already running only takes effect at the voice's next
+    /// automatic reload, not instantly (`docs/playback-model.md` §2.3) --
+    /// applying it now would cut a still-sounding note dead instead of
+    /// letting it ring out to the end of its current pass. So while DMA is
+    /// on, this only records the request; `Voice::next_sample`'s existing
+    /// wrap-triggered handoff to `loop_start`/`loop_len` is what actually
+    /// applies it, exactly as a real register rewrite would land on the next
+    /// reload. While DMA is off nothing is playing yet, so latching
+    /// `start`/`len` immediately is safe and lets `set_dma`'s off->on edge
+    /// pick them straight from `requested_region`.
     pub fn set_sample_region(&mut self, voice: u8, start: u32, len: u32) {
         let v = &mut self.voices[voice as usize];
         if v.requested_region != Some((start, len)) {
             v.requested_region = Some((start, len));
-            v.start = start;
-            v.len = len;
+            if !v.dma_on {
+                v.start = start;
+                v.len = len;
+            }
         }
     }
 
@@ -508,6 +515,43 @@ mod tests {
             left[150] < 0,
             "expected loop-region output after transition, got {}",
             left[150]
+        );
+    }
+
+    #[test]
+    fn set_sample_region_while_dma_is_on_does_not_stomp_the_playing_region() {
+        // `docs/playback-model.md` §2.3: a mid-playback register rewrite
+        // (`$18 Sampleloop`, `$19 Set one shot sample`) is timed "to land
+        // before Paula's next automatic reload" -- real Paula double-buffers
+        // AUDxLC/AUDxLEN, so a write while DMA is already running only takes
+        // effect at the next wrap, not instantly. Applying it immediately
+        // (the bug) cuts a still-sounding note dead instead of letting it
+        // ring out to the end of its current pass -- reported as macro $26
+        // in `mdat.turrican 2 title (st)` losing its release phase.
+        let sample_rate = 8_000u32;
+        let period = (PAULA_CLOCK_HZ / sample_rate as f64).round() as u16;
+        let source = vec![100i8; 200];
+
+        let mut paula = Paula::new(100);
+        paula.set_period(0, period);
+        paula.set_volume(0, 64);
+        paula.set_sample_region(0, 0, 50); // 50 words = 100 samples
+        paula.set_loop_region(0, 0, 50);
+        paula.set_dma(0, true);
+
+        // A few samples into the still-playing region, a genuine change
+        // arrives mid-flight -- the same shape as `$19` zeroing
+        // sample_start/sample_len while a note is already sounding.
+        let mut out = vec![0i16; 10 * 2];
+        paula.render(&source, sample_rate, &mut out);
+        paula.set_sample_region(0, 0, 0);
+        paula.set_loop_region(0, 0, 0);
+
+        assert_ne!(
+            paula.voice(0).len,
+            0,
+            "a live region change must not stomp the actively playing region \
+             before the current pass wraps"
         );
     }
 
