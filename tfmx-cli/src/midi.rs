@@ -27,8 +27,8 @@ pub const PPQ: u16 = 96;
 /// middle-C anchor (`tfmx::macro_interp::MIDDLE_C_NOTE = 0x18`,
 /// `docs/m5-session-log.md`'s pitch-anchor finding) -- both are semitone-
 /// linear, so `midi_note = 60 + (tfmx_note - 0x18)`.
-const MIDDLE_C_MIDI: i32 = 60;
-const MIDDLE_C_TFMX: i32 = 0x18;
+pub(crate) const MIDDLE_C_MIDI: i32 = 60;
+pub(crate) const MIDDLE_C_TFMX: i32 = 0x18;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
@@ -69,7 +69,7 @@ fn midi_note_for(note: u8, transpose: i8, zone_transpose: i8) -> u8 {
 /// The pattern note record's `0-64` volume (`docs/playback-model.md` §4) as
 /// a MIDI velocity `1-127` -- never 0, since a `NoteOn` velocity of 0 is a
 /// `NoteOff` by MIDI convention.
-fn velocity_for(volume: u8) -> u8 {
+pub(crate) fn velocity_for(volume: u8) -> u8 {
     ((volume as u32 * 127) / 64).clamp(1, 127) as u8
 }
 

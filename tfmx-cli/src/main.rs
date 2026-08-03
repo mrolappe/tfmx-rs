@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use tfmx::TraceEvent;
 
+mod export;
 mod midi;
 mod midi_mapping;
 mod serialize;
@@ -65,6 +66,10 @@ enum Command {
     /// file. `docs/m5-plan.md` Phase 5.6. Regression detection, not a truth
     /// oracle -- see the scoreboard's own `honesty_note` field.
     FidelityScoreboard(FidelityScoreboardArgs),
+    /// Export a song's (or one macro's) sampler instruments -- WAV with a
+    /// `smpl` loop chunk, SFZ, or a DecentSampler `.dspreset` -- built over
+    /// 5.3's zone table. `docs/m5-plan.md` Phase 5.7.
+    ExportInstruments(ExportInstrumentsArgs),
 }
 
 #[derive(clap::Args)]
@@ -86,6 +91,24 @@ struct ExportMidiArgs {
     mapping: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = GateArg::All)]
     gate: GateArg,
+}
+
+#[derive(clap::Args)]
+struct ExportInstrumentsArgs {
+    mdat: PathBuf,
+    smpl: PathBuf,
+    /// Directory to write the export into; created if missing. All macros'
+    /// files share this one directory, prefixed with their macro number, so
+    /// nothing collides.
+    #[arg(short = 'o', long = "output")]
+    output: PathBuf,
+    #[arg(long, default_value_t = 0)]
+    song: u8,
+    #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(export::FORMAT_NAMES))]
+    format: String,
+    /// Export only this macro instead of every macro reachable from `song`.
+    #[arg(long = "macro")]
+    macro_number: Option<u8>,
 }
 
 #[derive(clap::Args)]
@@ -1011,6 +1034,43 @@ fn run_export_midi(args: &ExportMidiArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+fn run_export_instruments(args: &ExportInstrumentsArgs) -> Result<(), CliError> {
+    let mdat = std::fs::read(&args.mdat)?;
+    let smpl = std::fs::read(&args.smpl)?;
+    let module = tfmx::Module::parse(&mdat, &smpl)?;
+
+    let Some(serializer) = export::by_name(&args.format) else {
+        return Err(CliError::Usage("unknown --format: expected wav, sfz, or dspreset"));
+    };
+
+    let macros: Vec<u8> = match args.macro_number {
+        Some(n) => vec![n],
+        None => tfmx_analysis::walk_song(&module, args.song)?
+            .reachable_macros
+            .into_iter()
+            .collect(),
+    };
+
+    std::fs::create_dir_all(&args.output)?;
+    let mut instruments_written = 0;
+    for macro_number in macros {
+        let Ok(instrument) = export::build_instrument(&module, macro_number) else {
+            continue;
+        };
+        if instrument.zones.is_empty() {
+            continue;
+        }
+        serializer.serialize(&instrument, &args.output)?;
+        instruments_written += 1;
+    }
+    println!(
+        "wrote {instruments_written} instrument(s) as {} to {}",
+        serializer.name(),
+        args.output.display()
+    );
+    Ok(())
+}
+
 /// One thing worth looking at, named so a test (and a grep over a corpus
 /// run) can key on it. `detail` says which voice/opcode/second it is about.
 #[derive(Debug)]
@@ -1713,6 +1773,7 @@ fn main() {
         Command::Dump(args) => run_dump(args, &mut std::io::stdout().lock()),
         Command::ExportMidi(args) => run_export_midi(args),
         Command::FidelityScoreboard(args) => run_fidelity_scoreboard(args),
+        Command::ExportInstruments(args) => run_export_instruments(args),
     };
     if let Err(e) = result {
         eprintln!("tfmx-cli: {e}");

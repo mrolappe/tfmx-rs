@@ -390,3 +390,64 @@ Not done, out of scope for this phase: no attempt to make `onset_correlation` it
 informative (e.g. per-voice comparison) — the plan scoped this phase to reusing the existing
 metrics, not improving them; per-voice onset detection is already recorded as a known ceiling on
 `detect_onsets` itself, not reopened here.
+
+## Phase 5.7 — Sample and sampler-instrument export
+
+New `tfmx-cli export-instruments` subcommand and a new `tfmx-cli/src/export/` module, per
+`docs/m5-plan.md`'s Phase 5.7 brief: one `InstrumentSerializer` trait over 5.3's zone table, three
+formats registered by name (`export::by_name`, `export::FORMAT_NAMES`) — `wav`, `sfz`, `dspreset` —
+each its own file (`wav.rs`, `sfz.rs`, `dspreset.rs`) so a fourth format is one new file plus one
+registry line, per the plan's own structure-first instruction. Kontakt `.nki` and Ableton `.adg`
+stayed ruled out, per the plan (encrypted/undocumented, and both covered by SFZ-via-sfizz already).
+
+**Design**: `export::build_instrument(module, macro_number)` resolves the macro's `ZoneTable`
+(`tfmx_analysis::resolve_zones`) and, for every zone carrying a sample region, fetches its live PCM
+via `Module::sample` — zones with no sample region (a keysplit handing off to another macro) or an
+out-of-bounds region are skipped per-zone rather than failing the whole instrument, mirroring `lint`'s
+existing `sample-region-out-of-bounds` finding being a per-zone, not per-module, problem. Each zone's
+note/volume rectangle maps onto MIDI key/velocity ranges via the same anchor/formula `midi.rs`'s MIDI
+export already established (`MIDDLE_C_TFMX`/`MIDDLE_C_MIDI`/`velocity_for`, promoted to `pub(crate)`
+so `export` reuses them instead of re-deriving the pitch anchor a second place) — every exported
+sample is written at TFMX's own native rate (8363 Hz, the same `MIDDLE_C_HZ` `macro_interp.rs` plays
+raw note `0x18` at), so MIDI note 60 is always the pitch-keycenter regardless of which zone it came
+from, and a sampler resamples the rest of the key range from there.
+
+**`SampleRegion` extended with a `looped: bool` field** (`tfmx-analysis/src/walker.rs`), threaded
+from `SamplePointer`'s existing (previously module-private) `loop_active` flag via a new
+`is_looped()` accessor. Without it, every exported zone would have to guess one-shot vs.
+indefinite-sustain-loop — a real correctness gap, not a speculative one, since a wrong guess either
+silences a one-shot's tail (loop mode where none was armed) or leaves a sustained pad decaying to
+silence (no loop where `$18 <Sampleloop>` really was armed). Contained to `tfmx-analysis`: nothing
+in `tfmx-cli` outside the new `export` module read `SampleRegion`'s fields, so the six call sites
+(two production, four test) were the whole blast radius. TDD'd against real corpus data: `zones.rs`'s
+existing `turrican_intro_macro_28_is_a_single_unsplit_zone` (has `$18` in its chain) now pins
+`looped: true`, and `a_macro_without_splits_is_one_full_range_zone` (no `$18`) pins `looped: false`.
+
+**WAV writer is hand-rolled RIFF**, not layered on `hound` (this crate's other WAV writer, used for
+rendered audio): `hound` finalizes a plain `fmt `/`data` file with no support for extra chunks, and
+patching one on after the fact would mean hand-fixing its RIFF size fields anyway — no simpler than
+writing the ~90 lines directly. `fmt `/`data` always; a `smpl` chunk (one loop record, whole clip)
+only when the zone's `looped` flag is set, so a one-shot zone's WAV carries no loop metadata at all
+rather than a vacuous full-clip loop. 8-bit PCM's unsigned/128-bias convention (WAV's own quirk for
+that bit depth) is applied by hand the same way `hound`'s own `Sample for i8` impl does.
+
+**Check results — structural and independently-verified, not tool-in-the-loop** (no sfizz, Kontakt,
+or DecentSampler installed in this environment; the plan's own check criterion needs those to fully
+close, so this is disclosed as a gap rather than claimed done). What *was* verified: 10 new unit
+tests (TDD'd) covering `build_instrument` against real corpus data (macro 28 of `turrican intro`,
+matching `tfmx-analysis`'s own pinned zone), the WAV writer's loop points via a hand-rolled parser
+round-trip, and the SFZ/`.dspreset` text output's region/sample count and attribute values. Beyond
+this crate's own tests: `export-instruments` was run end-to-end against `turrican intro` song 0 for
+all three formats (24 instruments each), the resulting WAV was checked with macOS's own `afinfo`
+(confirms valid 8-bit/8363 Hz PCM independently of this crate's parser) and a `.dspreset` file was
+checked with `xmllint --noout` (well-formed XML) — both external tools, not this crate re-checking
+its own output. Full workspace suite green (90 `tfmx-cli` tests, up from 83), clippy clean (the same
+one pre-existing unrelated warning as prior phases, not touched — two new clippy findings in the new
+code, `write!`-ending-in-`\n` and a manual `% 2` check, were fixed rather than left), `wasm32-
+unknown-unknown` build for `tfmx` unaffected, golden hashes unchanged (this phase adds export and
+touches no playback path).
+
+Not done, explicitly out of scope: nobody has loaded the exported files in real sfizz, Kontakt, or
+DecentSampler — the phase's own check criterion needs that and it is not something this environment
+can automate; whoever has those tools available should do that pass before treating 5.7 as fully
+closed in the tool-verification sense, not just the structural sense recorded here.

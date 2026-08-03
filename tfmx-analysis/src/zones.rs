@@ -216,6 +216,7 @@ impl Path {
                     macro_number,
                     start,
                     len: len * 2, // word count -> bytes, docs/format.md §8
+                    looped: s.is_looped(),
                 }
             }),
             volume: self.volume,
@@ -393,7 +394,8 @@ mod tests {
             Some(SampleRegion {
                 macro_number: 0,
                 start: 0x100,
-                len: 32
+                len: 32,
+                looped: false,
             })
         );
     }
@@ -564,8 +566,10 @@ mod tests {
             Some(SampleRegion {
                 macro_number: 28,
                 start: 0x7F04,
-                len: 0x100
-            })
+                len: 0x100,
+                looped: true,
+            }),
+            "macro 28's chain ends on $18 Sampleloop"
         );
         // $0D +$14 then $0E SetVolume aa=$00 (docs/opcodes.md:162 -- the
         // operand is `aa`, and macro 28's is zero).

@@ -48,6 +48,11 @@ pub struct SampleRegion {
     pub macro_number: u8,
     pub start: u32,
     pub len: u32,
+    /// Whether `$18 <Sampleloop>` was armed by the time this region was
+    /// snapshotted -- `false` means it's the one-shot `$02`/`$03` region,
+    /// `true` means it's the post-`$18` loop region. Export formats need
+    /// this to know whether to loop the region indefinitely or play it once.
+    pub looped: bool,
 }
 
 /// Everything statically reachable from one song.
@@ -192,6 +197,7 @@ pub fn walk_song(module: &Module, song: u8) -> Result<WalkResult, AccessError> {
                     macro_number: n,
                     start,
                     len: len * 2, // word count -> bytes, docs/format.md §8
+                    looped: sample.loop_active,
                 });
             }
         }
@@ -260,6 +266,10 @@ impl SamplePointer {
         } else {
             (self.sample_start, self.sample_len)
         }
+    }
+
+    pub(crate) fn is_looped(&self) -> bool {
+        self.loop_active
     }
 }
 
@@ -589,6 +599,7 @@ mod tests {
             macro_number: 2,
             start: 4,
             len: 8,
+            looped: false,
         });
         result.voice_nibbles.insert(0);
 
