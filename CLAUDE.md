@@ -10,6 +10,10 @@ has been approved yet. Each step carries its deliverable, its verification and a
 minimum model. Tick the checkbox *and* update the Status block in the same commit that
 completes the step.
 
+**Turnaround loop, every completed step, every session, no exceptions**: tick the checkbox, update
+the Status block, commit, **push**, **then stop** so the user can start a fresh session. Do not
+treat "commit" as satisfying this on its own -- an uncommitted or unpushed step is not done.
+
 `git log` is the record of what happened — commit subjects name their step, e.g. `(step 0.3)`.
 
 ## Delegating to agents
