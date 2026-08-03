@@ -1,8 +1,9 @@
-//! Self-contained HTML renderer over `tfmx_analysis::SongView`
-//! (`docs/m5-plan.md` Phase 5.8). No external CSS/JS/fonts, so the page
-//! opens with no network access. The Mermaid call graph is embedded as its
-//! raw source text (not rendered to SVG) -- reading Mermaid source is fine
-//! for a static dump, and it keeps this renderer free of a JS dependency.
+//! HTML renderer over `tfmx_analysis::SongView` (`docs/m5-plan.md` Phase
+//! 5.8). Waveform SVG and trackstep table are inline, no dependency either
+//! way. The Mermaid call graph gets two tabs: "Diagram" tries to load
+//! Mermaid.js from a CDN at view time and render it, falling back to a
+//! plain message if that fetch fails (no internet at open time); "Source"
+//! always shows the raw Mermaid text, so the graph is never unreadable.
 
 use tfmx_analysis::{SongView, StepView, TrackSlotView};
 
@@ -67,6 +68,13 @@ fn waveform_svg(view: &SongView) -> String {
     svg
 }
 
+/// Escapes text content for embedding inside an HTML `<pre>` element.
+/// Attribute-only characters (quotes) are left alone; this crate's own
+/// Mermaid/table cell text never carries attributes.
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
 fn track_slot_cell(slot: TrackSlotView) -> String {
     match slot {
         TrackSlotView::Pattern { number, transpose } => format!("P{number} ({transpose:+})"),
@@ -107,13 +115,52 @@ body { font: 14px sans-serif; margin: 2rem; }
 table.trackstep { border-collapse: collapse; font-size: 12px; }
 table.trackstep td, table.trackstep th { border: 1px solid #ccc; padding: 2px 6px; }
 pre.mermaid-source { background: #f4f4f4; padding: 1rem; overflow-x: auto; }
+.tabs { margin: 0.5rem 0 0; }
+.tab-button { font: inherit; padding: 0.3rem 0.9rem; border: 1px solid #ccc; border-bottom: none;
+  background: #eee; cursor: pointer; }
+.tab-button.active { background: #fff; font-weight: bold; }
+.tab-panel { border: 1px solid #ccc; padding: 1rem; }
+.tab-panel[hidden] { display: none; }
+#mermaid-offline-note { color: #8a2c2c; }
+";
+
+/// The tabbed "Diagram"/"Source" pair over the call graph: "Diagram" tries
+/// to load Mermaid.js from a CDN at view time and render `graph`, falling
+/// back to `#mermaid-offline-note` if that script fails to load (no
+/// internet at open time); "Source" always shows `graph`'s raw text.
+const GRAPH_SCRIPT: &str = "
+(function () {
+  var tabDiagram = document.getElementById('tab-diagram');
+  var tabSource = document.getElementById('tab-source');
+  var panelDiagram = document.getElementById('panel-diagram');
+  var panelSource = document.getElementById('panel-source');
+  function show(tab) {
+    var diagram = tab === 'diagram';
+    tabDiagram.classList.toggle('active', diagram);
+    tabSource.classList.toggle('active', !diagram);
+    panelDiagram.hidden = !diagram;
+    panelSource.hidden = diagram;
+  }
+  tabDiagram.addEventListener('click', function () { show('diagram'); });
+  tabSource.addEventListener('click', function () { show('source'); });
+
+  var script = document.createElement('script');
+  script.src = 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js';
+  script.onload = function () { mermaid.initialize({ startOnLoad: true }); };
+  script.onerror = function () {
+    document.getElementById('mermaid-offline-note').hidden = false;
+  };
+  document.head.appendChild(script);
+})();
 ";
 
 /// Renders `view` (already built via `tfmx_analysis::build_song_view`) as a
-/// single self-contained HTML page: waveform regions (out-of-bounds ones
-/// visibly marked in red), the pattern->macro call graph as Mermaid source,
-/// and the trackstep structure map.
+/// single HTML page: waveform regions (out-of-bounds ones visibly marked in
+/// red), the pattern->macro call graph (a rendered diagram when the page
+/// can reach a CDN, its Mermaid source always), and the trackstep structure
+/// map.
 pub fn render_html(module_name: &str, view: &SongView) -> String {
+    let graph = escape_html(&call_graph_to_mermaid(&view.walk));
     format!(
         "<!doctype html>\n<html><head><meta charset=\"utf-8\">\n\
          <title>{module_name} -- song {song}</title>\n\
@@ -123,14 +170,24 @@ pub fn render_html(module_name: &str, view: &SongView) -> String {
          <p>smpl length: {smpl_len} bytes; red = out of bounds</p>\n\
          {svg}\
          <h2>Pattern &rarr; macro call graph</h2>\n\
-         <pre class=\"mermaid-source\">{graph}</pre>\n\
+         <div class=\"tabs\">\
+         <button type=\"button\" id=\"tab-diagram\" class=\"tab-button active\">Diagram</button>\
+         <button type=\"button\" id=\"tab-source\" class=\"tab-button\">Source</button>\
+         </div>\n\
+         <div id=\"panel-diagram\" class=\"tab-panel\">\
+         <pre class=\"mermaid\">{graph}</pre>\
+         <p id=\"mermaid-offline-note\" hidden>Rendering the diagram needs internet access to \
+         load Mermaid.js from a CDN. Showing the raw diagram source instead -- see the Source \
+         tab.</p>\
+         </div>\n\
+         <div id=\"panel-source\" class=\"tab-panel\" hidden><pre class=\"mermaid-source\">{graph}</pre></div>\n\
          <h2>Trackstep structure</h2>\n\
          {table}\
+         <script>{GRAPH_SCRIPT}</script>\n\
          </body></html>\n",
         song = view.song,
         smpl_len = view.waveform.smpl_len,
         svg = waveform_svg(view),
-        graph = call_graph_to_mermaid(&view.walk),
         table = trackstep_table(view),
     )
 }
@@ -220,6 +277,29 @@ mod tests {
         assert!(html.contains("P1 --> M9") || html.contains("P1[\"Pattern 1\"]"));
         assert!(html.contains("<table class=\"trackstep\">"));
         assert!(html.contains("P1 (+0)"));
+    }
+
+    #[test]
+    fn graph_has_a_diagram_tab_that_tries_a_cdn_and_a_source_tab_with_the_offline_fallback() {
+        let view = view_with_regions(vec![], 8);
+
+        let html = render_html("probe", &view);
+
+        // Two tabs, each with its own panel.
+        assert!(html.contains("id=\"tab-diagram\""));
+        assert!(html.contains("id=\"tab-source\""));
+        assert!(html.contains("id=\"panel-diagram\""));
+        assert!(html.contains("id=\"panel-source\""));
+        // The diagram panel holds a `.mermaid` block Mermaid.js renders in
+        // place, plus a fallback note that starts hidden.
+        assert!(html.contains("<pre class=\"mermaid\">"));
+        assert!(html.contains("id=\"mermaid-offline-note\" hidden"));
+        // The source panel always has the raw text, unconditionally.
+        assert!(html.contains("<pre class=\"mermaid-source\">"));
+        // Mermaid.js is loaded dynamically (not a static <script src=...>),
+        // so `onerror` can reveal the offline note instead of a broken page.
+        assert!(html.contains("cdn.jsdelivr.net"));
+        assert!(html.contains("script.onerror"));
     }
 
     #[test]

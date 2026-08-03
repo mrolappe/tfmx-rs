@@ -58,3 +58,4 @@ pick any of them up cold in a later session.
 | M5-P10 | Web module explorer | Browser UI over `tfmx-web`, consuming the same walker output as the CLI tools | `proposed` |
 | M5-P11 | Tracker (XM/MOD/IT) export | Converts a resolved song into a tracker format for editing in tools outside this project | `proposed` |
 | M5-P12 | Score/notation export | Converts a resolved song into conventional music notation | `proposed` |
+| M5-P13 | Call-graph layout tuning | Phase 5.8's Mermaid `flowchart LR` clusters most nodes on the left for graphs with many low-numbered patterns/macros and few edges relative to node count (e.g. `turrican intro`: 134 distinct edges over ~75 nodes). Worth trying Mermaid's own layout knobs (`flowchart TB`, `elk` renderer, subgraphs grouping patterns vs. macros) before reaching for a different tool | `proposed` |

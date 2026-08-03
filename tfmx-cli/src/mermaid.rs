@@ -1,6 +1,8 @@
 //! Pure string building: a `WalkResult`'s reachable patterns/macros and
 //! edges as a Mermaid flowchart. `docs/m5-plan.md` Phase 5.8.
 
+use std::collections::BTreeSet;
+
 use tfmx_analysis::{SpanKind, WalkResult};
 
 fn node_id(kind: SpanKind) -> String {
@@ -29,7 +31,12 @@ pub fn call_graph_to_mermaid(walk: &WalkResult) -> String {
     for &n in &walk.reachable_macros {
         out.push_str(&format!("    {}\n", node_label(SpanKind::Macro(n))));
     }
-    for edge in &walk.edges {
+    // `walk.edges` carries one entry per reference *occurrence* (e.g. a
+    // pattern triggering the same macro on several different notes) --
+    // useful raw data, but the diagram only needs one arrow per distinct
+    // (from, to) pair.
+    let distinct_edges: BTreeSet<_> = walk.edges.iter().copied().collect();
+    for edge in distinct_edges {
         out.push_str(&format!(
             "    {} --> {}\n",
             node_id(edge.from),
@@ -86,5 +93,27 @@ mod tests {
     fn empty_walk_renders_just_the_header() {
         let mermaid = call_graph_to_mermaid(&WalkResult::default());
         assert_eq!(mermaid, "flowchart LR\n");
+    }
+
+    #[test]
+    fn repeated_edges_are_deduplicated() {
+        // A pattern with the same note (same macro) played several times
+        // pushes the same edge onto `WalkResult::edges` once per note --
+        // real, not synthetic: e.g. `turrican intro` pattern 80 triggers
+        // macro 39 seventeen times. The diagram must draw that arrow once.
+        let edge = Edge {
+            from: SpanKind::Pattern(1),
+            to: SpanKind::Macro(9),
+        };
+        let walk = WalkResult {
+            reachable_patterns: BTreeSet::from([1]),
+            reachable_macros: BTreeSet::from([9]),
+            edges: vec![edge, edge, edge],
+            ..WalkResult::default()
+        };
+
+        let mermaid = call_graph_to_mermaid(&walk);
+
+        assert_eq!(mermaid.matches("P1 --> M9").count(), 1);
     }
 }

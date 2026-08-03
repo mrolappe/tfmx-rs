@@ -552,9 +552,54 @@ clippy clean (the one pre-existing unrelated `mutation_robustness.rs` warning, u
 (no playback path touched, as expected — this phase only adds a read-only view over already-static
 analysis).
 
+**Update, same session: the "embed Mermaid as raw text" call was reversed after real user
+feedback.** The user viewed the rendered page and reported the call graph showed only Mermaid
+source text, not a diagram. Asked via `AskUserQuestion` for the fix's shape (CDN-loaded vs. fully
+offline-vendored Mermaid.js); the user's answer was more specific than either option: two tabs,
+"Diagram" and "Source", with the diagram tab dynamically checking for internet access and falling
+back to a text message if unavailable, and the source tab always showing the raw text regardless.
+Implemented in `visualize.rs`: `render_html` now emits a small hand-rolled tab widget (two
+buttons, two panels, no framework) plus an inline script that appends a `<script src="https://
+cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js">` at view time — its `onload` calls
+`mermaid.initialize({ startOnLoad: true })` to render `.mermaid` blocks in place, its `onerror`
+reveals a plain fallback note. This *is* the connectivity check: attempting the real resource load
+and reacting to success/failure, rather than a separate ping, is both simpler and cannot race with
+the actual thing being tested. `escape_html` was added (`&`/`<`/`>` only, matching what HTML text
+content actually requires) since the Mermaid source is now embedded in two places.
+
+Verifying this took an extra round-trip: viewing the generated file through Claude's own published
+Artifact preview reliably showed the offline fallback, which looked like a bug (the user did have
+real internet). It wasn't one — Claude's Artifact sandbox enforces a strict CSP that blocks all
+external requests including CDN scripts, so the fallback path was firing correctly for that
+viewing context, just not for the reason it first appeared to. Resolved by opening the generated
+file directly in an ordinary browser tab (`open /tmp/....html`), which is how this tool's own
+output is actually meant to be viewed — that showed the real diagram rendering as intended, with
+real internet access.
+
+Building this out surfaced a second, independent, real bug: `WalkResult.edges` (this phase's own
+new field, see above) records one entry per reference *occurrence*, not per distinct pair — a
+pattern retriggering the same macro across many different notes pushes that same edge repeatedly
+(`turrican intro` pattern 80 → macro 39, eighteen times). `mermaid.rs`'s emitter was drawing one
+arrow per occurrence, so the diagram was cluttered with dozens of overlapping duplicate arrows on
+some edges. Fixed test-first (`repeated_edges_are_deduplicated`, confirmed red before the fix) by
+collecting `walk.edges` through a `BTreeSet` before emitting `-->` lines — `Edge` already derives
+`Ord` from `walker.rs`, so no new trait work was needed. `turrican intro`'s rendered graph dropped
+from well over a thousand lines to 134 distinct edges.
+
+**User-reported, deferred, not fixed this session**: with the duplicate-arrow clutter gone, most
+nodes in a graph shaped like `turrican intro`'s (many low-numbered pattern/macro nodes, comparatively
+few edges relative to node count) still cluster on the left side of Mermaid's default `flowchart LR`
+layout. Recorded as `M5-P13` in `docs/analysis-tooling-ideas.md`'s ledger (worth trying Mermaid's
+own layout options — `flowchart TB`, the `elk` renderer, subgraphs separating patterns from
+macros — before reaching for a different tool) for whoever picks it up next.
+
+Re-verified after these fixes: full workspace suite (100 `tfmx-cli` tests, up from 98; 31
+`tfmx-analysis` unaffected), clippy clean, golden hashes unchanged.
+
 **This closes every phase `docs/m5-plan.md` planned** (5.0 through 5.8). The deferred-ideas ledger
 in `docs/analysis-tooling-ideas.md` (probe-module generator, opcode census, static conformance
 linter, smpl directory reconstruction, cross-module macro fingerprinting, trace explorer,
-spectrogram comparison, web module explorer, tracker/score export) stays open for whoever picks up
-next, alongside `ROADMAP.md`'s "Later milestones" section (7V support, GUI, etc.). Per this
-project's phase-gate rule, this needs the user's explicit sign-off before anything past it starts.
+spectrogram comparison, web module explorer, tracker/score export, and now the call-graph layout
+tuning above) stays open for whoever picks up next, alongside `ROADMAP.md`'s "Later milestones"
+section (7V support, GUI, etc.). Per this project's phase-gate rule, this needs the user's explicit
+sign-off before anything past it starts.
