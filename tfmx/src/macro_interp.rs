@@ -593,6 +593,19 @@ impl MacroInterpreter {
             ),
             None => self.period,
         };
+        // Before `$18 <Sampleloop>` ever runs, there is no separate loop
+        // region yet -- real Paula only has one pair of double-buffered
+        // pointer/length registers, and `Voice::next_sample`'s wrap-triggered
+        // reload always lands on `loop_start`/`loop_len` (`Paula::
+        // set_sample_region`'s own doc comment). So until `$18` hands
+        // playback off, `loop_start`/`loop_len` must keep mirroring
+        // whatever `sample_start`/`sample_len` currently is -- otherwise a
+        // mid-playback `$11`/`$12` change (recorded via `set_sample_region`
+        // but deferred while DMA is on) is silently discarded at the next
+        // wrap in favor of the stale region `$02`/`$03` set at trigger time.
+        // Confirmed on r-type macro 13: a pointer sweep driven purely by
+        // `$11`/`$12` inside a loop, no `$18` anywhere, played back as a
+        // static loop over the untouched attack region.
         let (sample_start, sample_len) = match &mut self.pointer_vibrato {
             Some(pv) => {
                 let delta = pv.delta();
@@ -600,10 +613,19 @@ impl MacroInterpreter {
                     self.loop_start = self.loop_start.wrapping_add_signed(delta);
                     (self.sample_start, self.sample_len)
                 } else {
-                    (self.sample_start.wrapping_add_signed(delta), self.sample_len)
+                    let start = self.sample_start.wrapping_add_signed(delta);
+                    self.loop_start = start;
+                    self.loop_len = self.sample_len;
+                    (start, self.sample_len)
                 }
             }
-            None => (self.sample_start, self.sample_len),
+            None => {
+                if !self.loop_active {
+                    self.loop_start = self.sample_start;
+                    self.loop_len = self.sample_len;
+                }
+                (self.sample_start, self.sample_len)
+            }
         };
 
         paula.set_period(voice, period);
@@ -768,11 +790,27 @@ impl MacroInterpreter {
                     }
                     self.pointer_vibrato = None;
                 } else {
-                    self.pointer_vibrato = Some(PointerVibrato {
-                        half_period: b1,
-                        step,
-                        t: 0,
-                    });
+                    // Re-arming an already-running vibrato updates its
+                    // parameters in place instead of resetting `t` to 0 --
+                    // real macros (r-type macro 13) issue this opcode every
+                    // pass of an enclosing `$05 <Loop>`, with the loop's own
+                    // repeat count matching `half_period` (one continuous
+                    // ramp across the whole loop). Resetting phase on every
+                    // re-arm would make `delta()` always read 0 the instant
+                    // it's called, so the pointer would never move.
+                    match &mut self.pointer_vibrato {
+                        Some(pv) => {
+                            pv.half_period = b1;
+                            pv.step = step;
+                        }
+                        None => {
+                            self.pointer_vibrato = Some(PointerVibrato {
+                                half_period: b1,
+                                step,
+                                t: 0,
+                            });
+                        }
+                    }
                 }
                 true
             }
@@ -1873,6 +1911,57 @@ mod tests {
         let v = paula.voice(0);
         assert_eq!(v.loop_start, 108 + 256); // the wobble lands on the live loop pointer
         assert_eq!(v.start, 100); // attack region untouched, not re-dragged past the loop
+    }
+
+    #[test]
+    fn add_begin_periodic_form_keeps_ramping_when_re_armed_inside_a_loop() {
+        // r-type macro 13's real shape: `$11 <AddBegin>` in its periodic
+        // form (`aa != 0`) as the first instruction of a `$05 <Loop>` body,
+        // re-executed every pass. The loop's repeat count (254 in the real
+        // macro) is chosen to match the vibrato's own half-period (aa=$FF =
+        // 255) -- clear intent for one continuous ramp across the whole
+        // loop, sweeping the pointer through a wide sample range. Before
+        // this fix, every re-arm reset `PointerVibrato::t` to 0, so `delta()`
+        // (called once per tick, right after the re-arm) always read 0 --
+        // the pointer never moved, and Paula just DMA-looped the same tiny
+        // attack region forever. Confirmed audibly wrong on the real corpus
+        // (`docs/macro-playback-fidelity.md`).
+        //
+        // DMA is on (as in the real macro) before the loop starts, so
+        // `Paula::set_sample_region`'s writes defer to the next natural
+        // wrap -- `loop_start` (not `start`) is the field that reflects
+        // what the *next* wrap will actually land on, and is also what a
+        // second, related fix keeps synced to the live attack pointer
+        // whenever `$18` hasn't run (see `tick`'s own comment).
+        let mdat = macro_module(&[&[
+            [0x02, 0x00, 0x00, 0x64], // SetBegin +100
+            [0x03, 0x00, 0x00, 0x0A], // SetLen 10 words
+            [0x01, 0x00, 0x00, 0x00], // DMAon
+            [0x11, 0x04, 0x00, 0x02], // AddBegin periodic: half_period=4, step=+2  (step index 3)
+            [0x04, 0x00, 0x00, 0x00], // Wait -- suspends 1 jiffy every pass
+            [0x05, 0x03, 0x00, 0x03], // Loop 3 times back to step 3
+            [0x07, 0, 0, 0],
+        ]]);
+        let module = Module::parse(&mdat, &[]).expect("valid header parses");
+        let mut mac = MacroInterpreter::new();
+        mac.trigger(0, 0, 0, 0);
+        let mut paula = Paula::new(100);
+        let mut starts = Vec::new();
+        for _ in 0..5 {
+            tick(&mut mac, &module, &mut paula);
+            starts.push(paula.voice(0).loop_start);
+        }
+        // Stuck-at-100 would mean the phase reset every re-arm, never
+        // advancing past `t=0` (delta always 0) -- the bug this pins.
+        assert!(
+            starts.iter().any(|&s| s != 100),
+            "pointer never moved across the loop, got {starts:?}"
+        );
+        // Monotonically non-decreasing: a real ramp, not noise.
+        assert!(
+            starts.windows(2).all(|w| w[1] >= w[0]),
+            "expected a monotonic ramp, got {starts:?}"
+        );
     }
 
     #[test]
