@@ -120,3 +120,47 @@ Not yet settled which side of the race is miscalibrated:
   repeated failure mode.
 - Rendered A/B files for this session are in the scratchpad (not committed): `ours-pattern82-
   isolated.wav`, `ours-fullsong-{mix,voice0}-p82window.wav`, `uade-full-p82window.wav`.
+
+## Update 2026-08-04 (new session, after the doc split): editor ground truth obtained — real hardware always restarts all 5 notes
+
+The user auditioned pattern 82 directly in the real TFMX editor (the "for whoever picks this up
+next" item above): **it produces 5 distinct attacks**, every cycle, not a mix of restarts and
+swallows. This settles the open question in `note_on`'s favor of being wrong somewhere — real
+hardware never swallows a retrigger in this pattern, at any of its three gap lengths (2, 2, 4
+jiffies as measured from each note's own predecessor).
+
+**Re-examining the instrumented trace (`restart, swallow, restart, restart, swallow`) against this
+new fact**: the swallow/restart pattern is not simply "gap ≤ 2 jiffies → swallow" — note 2 has the
+same nominal 2-jiffy gap as note 1 (from its immediate predecessor's `Wait(1)`) but restarts, while
+note 1 swallows. The difference: note 1's predecessor (note 0) genuinely restarted, resetting the
+attack-latency clock, so note 1's dispatch really does land exactly 2 jiffies after a fresh
+`trigger()` — a true boundary case. Note 2's predecessor (note 1) *swallowed* rather than
+restarting, so the macro's `dma_on` state was already carried over from note 0's restart with an
+*additional* 2 jiffies elapsed on top — 4 jiffies cumulative since the last real `trigger()`, safely
+past the 2-jiffy latency, hence restart. So the current model's swallow decisions are only ever
+exactly-on-the-boundary races (gap == modeled latency to the jiffy), never a clear miss — consistent
+with **theory 2**: the 2-jiffy attack-latency figure itself is off by one. If the true latency is 1
+jiffy (not 2), every dispatch in this pattern — including the boundary ones — would find `dma_on`
+already true and always restart, matching the editor exactly.
+
+**Not yet a safe fix**: shrinking the latency to 1 jiffy would put macro 41's case (1-jiffy retrigger
+cadence, needs *always swallow*) exactly on the same boundary this session just showed is unreliable,
+risking silently flipping its ear-confirmed behavior. Per item 2 above, this still needs the `$00`/
+`$08` suspend-timing re-derivation before touching `note_on` or the opcode handlers — the editor
+result narrows *which* theory is right, it doesn't yet supply a safe fix.
+
+**Theory 2 re-derived from `docs/opcodes.md` directly, same session — does NOT hold up.** `$00`'s row
+(`docs/opcodes.md:148`): "If `aa` = 0, the voice stops at the end of the play routine and **the voice
+sequencer itself pauses for a jiffy**." `$08`'s row (`:156`): "**Ends macro processing for this
+jiffy**." Both state unambiguously that the *macro program counter itself* halts, not merely a
+DMA-hardware register — exactly what `MacroInterpreter::execute`'s `0x00`/`0x08` arms already
+implement (`self.wait = Wait::Jiffies(0)`, suspending until the next jiffy boundary in both cases).
+Tracing macro 28's shape (`$00 aa=0` → `$02`/`$02`/`$03`/`$0D` immediate → `$08` suspends → `$01
+DMAon`) against `take_turn`'s state machine confirms the current 2-jiffy trigger→`dma_on` gap is
+exactly what the documented per-opcode suspend rules produce, not an implementation slip. **This
+rules out theory 2** — the attack-latency figure is correctly modeled. The evidence now points at
+theory 1: `note_on`'s `dma_on`-based "still sustaining" heuristic is itself the wrong invariant for a
+retrigger cadence that straddles the attack latency, not a timing bug elsewhere. Redesigning it still
+carries the same regression risk flagged in item 3 above (macro 41/38/8) and needs
+`docs/status.md`'s original rationale for that heuristic (predates this document) reviewed before
+touching it — not yet done.
