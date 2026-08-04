@@ -2,6 +2,19 @@
 
 **Status: root cause found, ear-confirmed, fix NOT chosen.** Distinct from [the macro 28 pitch saga](macro-fidelity-05-macro28-pitch-saga.md) (that thread is closed) — this is a separate bug in the same pattern/macro, found afterward. See "For whoever picks this up next" below for the two live options.
 
+**▶ START HERE (2026-08-04): next session's task.** Both theories from the "Open question" section
+below are now settled — theory 2 (attack-latency timing) is ruled out, theory 1 (the `dma_on`-based
+sustain heuristic itself is the wrong invariant) is confirmed by direct editor ground truth (pattern
+82 always produces 5 distinct attacks in the real editor, never a mix of restarts/swallows). What's
+left: redesign the heuristic without silently reopening the three other cases it's load-bearing for
+(macro 41's always-swallow, macro 38's always-restart, macro 8's envelope-gated sustain — all fixed
+*before* this document existed). **First step, not yet done**: read `docs/status.md` for the
+original rationale behind `note_on`'s `dma_on`/`Wait::KeyUp` sustain check — why it was introduced,
+what specifically macro 41/38/8 needed — before proposing a redesign. Then TDD a fix that pins all
+four cases (macro 41, 38, 8, and pattern 82's mixed cadence) at once, per this doc's own "For
+whoever picks this up next" item 3, and re-run the differential-render + ear-confirmation cycle
+before calling it done.
+
 [← index](macro-playback-fidelity.md)
 
 ---

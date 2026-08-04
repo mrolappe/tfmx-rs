@@ -8,11 +8,11 @@ spanning many distinct bugs across several corpus modules; it was split 2026-08-
 document per distinct issue, linked below, so a fresh session can load only the thread it needs
 instead of the whole history.
 
-**▶ START HERE (2026-08-04): next session's task.** Report current context usage, then summarize
-the two live options for [macro-fidelity-08](macro-fidelity-08-pattern52-note-durations.md)'s open
-question (editor ground truth for pattern 82, vs. rechecking `$00`/`$08`'s real suspend timing —
-see that doc's "Open question" and "For whoever picks this up next") and ask the user which to
-pursue before doing either.
+**▶ START HERE (2026-08-04): next session's task.** Both open theories in
+[macro-fidelity-08](macro-fidelity-08-pattern52-note-durations.md) are now settled (editor ground
+truth + a docs re-derivation) — the `dma_on`-based sustain heuristic in `note_on` is confirmed the
+wrong invariant. Next: redesign it without reopening the three other cases it's load-bearing for.
+See that doc's own "START HERE" for the first concrete step (`docs/status.md`'s original rationale).
 
 ## Open threads (need work)
 
