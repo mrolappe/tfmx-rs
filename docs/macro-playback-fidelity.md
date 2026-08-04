@@ -36,6 +36,13 @@ have this problem). §9's theories 1 and 2 remain the live next steps.**
 direct editor evidence — real behavior needs a following `AddNote`/`SetNote` to do anything at
 all, and direction depends on more than just `bb`'s sign. Root cause NOT found — recorded for a
 fresh session, unrelated to §15's still-paused clock-domain thread.**
+**§18 (2026-08-04): `turrican intro` pattern `0x52`(82)/macro `0x1c`(28) has wrong note
+durations — root cause found (a race in `note_on`'s `dma_on`-based sustain heuristic), ear-confirmed
+by the user, fix NOT yet chosen.** This is the same pattern/macro §5-§12 already root-caused for
+silence/out-of-bounds; those are fixed, but a distinct bug in the same neighborhood survived: some of
+the pattern's 5 notes per cycle never get a real restart. Root cause and fix candidates below —
+touches the same `note_on` heuristic three other now-fixed bugs depend on, so needs care, not a
+quick guess.
 
 ---
 
@@ -79,6 +86,11 @@ The editor shows this as raw byte `$D7` with note name "F-2" — consistent with
 (`$D7 - $C0 = 23`, i.e. `NoteTiming::Portamento` fires correctly off `aa > $BF`; `dd = 6` is the
 dropped rate). The user confirmed by ear: this step's slide is "not rendered correctly" in our
 crate's output. That matches the code, not just a vague impression.
+
+**Re-reported independently, 2026-08-04**: same pattern, same step, described as "macro 0x6b does
+not play the note F-2/`$D7` at step 9 with portamento (speed 6)" — a second, independent hit on the
+exact same root cause. Still no code change; still blocked on the design question below, which §16
+(same session) makes harder, not easier, to answer.
 
 ### Open design question for the fix
 
@@ -1492,3 +1504,118 @@ harder to notice under the old stuck-loop symptom. First things to try in a fres
 cadence and would rule out the tooling explanation; (b) locate the blip's exact sample offset (the
 diff above only checked the first 2033 frames — extend it) and cross-reference against `tfmx-cli
 trace --macro 13` to see which opcode is executing at that jiffy.
+
+## 18. NEW, root cause found, ear-confirmed, fix NOT chosen: pattern `0x52`(82)/macro `0x1c`(28) collapses some notes into the previous one instead of restarting
+
+**User report (2026-08-04, separate session)**: `turrican intro` pattern 82's note lengths/durations
+are not correct. This is the same pattern/macro §5-§12 already investigated (silence, then
+out-of-bounds sample regions) — those fixes hold, `tfmx-cli lint` reports nothing for this
+voice/macro any more — but a distinct bug in the same neighborhood survived.
+
+### The pattern
+
+`tfmx-cli disasm --pattern 82`: five notes, all voice 0, all macro 28, looping forever (`$F1 <Loop>
+aa=0`):
+
+```
+0: Note { note: 33, macro: 28, volume: 10, timing: Wait(1) }
+1: Note { note: 33, macro: 28, volume:  5, timing: Wait(1) }
+2: Note { note: 33, macro: 28, volume: 10, timing: Wait(3) }
+3: Note { note: 33, macro: 28, volume: 10, timing: Wait(1) }
+4: Note { note: 33, macro: 28, volume: 10, timing: Wait(3) }
+   -> loop to 0
+```
+
+Occupied jiffies before the next dispatch (`wait + 1`, `tfmx/src/sequencer.rs:655-661`): `2, 2, 4, 2,
+4`, repeating. Traced against the real render (`tfmx-cli trace --track 3 --gate any`): the pattern
+dispatches on exactly this cadence, confirmed against real frame deltas at tempo 3 (12.5 Hz, 80 ms/
+jiffy) — `160, 160, 320, 160, 320` ms repeating. **Dispatch timing itself is correct**; the bug is in
+what each dispatch actually does to the voice.
+
+### Root cause: `note_on`'s `dma_on`-based "still sustaining" heuristic races macro 28's own attack latency
+
+`MacroInterpreter::note_on` (`tfmx/src/macro_interp.rs:429-439`) skips restarting the macro program
+— just updates note/volume in place — whenever the incoming Note names the instrument already
+running on that voice and it's judged still "sustaining": `!self.dma_on` (pre-attack) or parked in
+`$14 <Wait key up>` with no active envelope. This heuristic exists for three already-fixed, already
+ear-confirmed cases (`docs/status.md`): macro 41's 1-jiffy-cadence retrigger (needs the swallow —
+the retrigger is always faster than `$01 DMAon` could ever fire, so *never* restarting is the only way
+sound survives at all), macro 38's 2-jiffy-cadence retrigger (needs the opposite — `$00 aa=1` skips
+the mandatory pause, so `dma_on` is already true by the next retrigger and a genuine restart is
+correct), and macro 8's `$14`-parked-but-already-decaying pluck (needs the envelope check to avoid
+reading a fake sustain).
+
+Macro 28 (`tfmx-cli disasm --macro 28`, full listing in §5) has the exact same `$00 aa=0` shape as
+macro 41: `$00` (mandatory 1-jiffy pause) → `$02`/`$03`/`$0D` (immediate) → `$08 <AddNote*>`
+(suspends) → `$01 <DMAon>`. That is **exactly 2 real jiffies** from `trigger()` to `dma_on` becoming
+true. But unlike macro 41's uniform 1-jiffy cadence, pattern 82's cadence alternates 2 and 4 jiffies
+— sometimes faster than, sometimes slower than, sometimes exactly equal to that 2-jiffy latency.
+Dispatch happens before the current jiffy's macro tick (`docs/playback-model.md` §1's documented
+signal-chain order, `run_jiffy`, `tfmx/src/player.rs:236-240`), so a retrigger landing exactly 2
+jiffies after the previous one always finds `dma_on` still `false` — one tick before it would have
+turned `true` — and takes the swallow branch instead of restarting.
+
+**Confirmed by temporary instrumentation** (an `eprintln!` in `note_on`, added, traced, and reverted
+— `git status` clean before and after): tracing pattern 82 live shows the actual per-note pattern is
+`restart, swallow, restart, restart, swallow` each cycle — three real re-attacks and two silently
+absorbed notes, not the five the pattern data encodes. Every `TraceEvent::Trigger` fires regardless
+(`tfmx/src/player.rs:410-415` emits it unconditionally), so `tfmx-cli trace`'s own `TRIGGER` lines
+cannot be used to tell restarts from swallows — that trace event is not evidence either way for this
+class of bug.
+
+### Isolated A/B, ear-confirmed
+
+Built with `tfmx-cli render-pattern --pattern 82 --transpose 0 --tempo 3` (the pattern's real
+transpose is 0 on track 3, confirmed from the trackstep trace; tempo 3 matches the song), plus a
+trimmed `uade123` full-song reference (`uade123 -s 0 -t 22 -f uade-full.wav "mdat.turrican intro"`,
+trimmed to the pattern's real 13.04s-21s window with `ffmpeg -ss 13.0 -t 8.0`) and this crate's own
+full-song render (`--gate any`, both full mix and voice-0-solo) trimmed to the same window.
+
+- **Quantitative, isolated render alone**: 5 notes/cycle over a 1.12s cycle should give ~27 onsets in
+  6 seconds; `tfmx-cli onset-diff` on the isolated render against itself (for a raw count) reports
+  only **16** — consistent with the 3-of-5 restart ratio found by instrumentation (allowing for the
+  onset detector missing a couple of weak in-place volume-only transitions).
+- **Against `uade123`, full mix, same 8s window**: reference `44` onsets (`5.5/s`) vs. this crate's
+  `28` (`3.5/s`), inter-onset correlation `-0.108`. Confounded by the other 3 voices (uade123 has no
+  solo flag), so read as corroborating, not conclusive on its own — but the direction (reference has
+  *more* onsets) matches "we're swallowing notes that should restart," not the reverse.
+- **User confirmed by ear** on the isolated render (`ours-pattern82-isolated.wav`): "some notes merge
+  into others" instead of a clean five-note rhythm — matches the swallow/restart pattern found by
+  instrumentation exactly.
+
+### Open question: what's actually wrong, the heuristic or the latency it's racing against
+
+Not yet settled which side of the race is miscalibrated:
+
+1. **The `dma_on`-based heuristic itself may be the wrong invariant** for any cadence that isn't
+   uniformly faster or slower than the attack latency — i.e. it was only ever validated against the
+   two uniform extremes (macro 41: always-swallow-correct; macro 38: always-restart-correct), never
+   against a pattern like 82 that straddles the boundary note-to-note. A per-retrigger race on a
+   single-jiffy-resolution flag may not be what real hardware does at all.
+2. **The 2-jiffy attack-latency figure itself may be wrong** — if `$00 aa=0`'s "mandatory 1-jiffy
+   pause" or `$08`'s own suspend is miscalibrated (even by one jiffy), every dispatch in pattern 82
+   would consistently find `dma_on` already true and always restart, which is what the `uade123`
+   onset-count evidence above would also predict. This would point at `docs/playback-model.md` §2.4
+   or the `$00`/`$08` opcode handlers, not at `note_on` at all.
+3. Both could be partially true. **Do not guess a fix without more evidence** — this heuristic is
+   load-bearing for three other now-fixed, ear-confirmed, golden-hash-locked cases (macro 41 in this
+   same module, macro 38 in `turrican 2 title (st)`, macro 8 in `turrican outside`); a change here
+   risks reopening any of them silently (no lint finding would catch a wrong-but-plausible retrigger
+   decision the way `sample-region-out-of-bounds` caught §5).
+
+### For whoever picks this up next
+
+- Get editor ground truth for pattern 82 specifically (audition it directly, not just macro 28 alone
+  — §9's Recipe A already showed macro 28 auditions differently than it plays inside this pattern).
+  Does the real editor produce 5 distinct attacks, or does it also merge some notes the way our render
+  currently does even less than uade123 suggests?
+- Before changing `note_on`, re-derive `$00`/`$08`'s real suspend timing from `docs/playback-model.md`
+  §2.4 and the opcode table (`docs/opcodes.md`) with fresh eyes — theory 2 above is cheaper to falsify
+  than theory 1 (it's a local, single-opcode question, not a heuristic redesign) and would explain the
+  evidence just as well.
+- Whatever fix is chosen needs regression tests pinning **all four** now-known cases at once (macro
+  41's always-swallow, macro 38's always-restart, macro 8's envelope-gated sustain, and pattern 82's
+  mixed cadence) so a future change can't silently break one while fixing another — this thread's
+  repeated failure mode.
+- Rendered A/B files for this session are in the scratchpad (not committed): `ours-pattern82-
+  isolated.wav`, `ours-fullsong-{mix,voice0}-p82window.wav`, `uade-full-p82window.wav`.
