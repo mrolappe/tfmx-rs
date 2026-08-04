@@ -6,6 +6,17 @@ macros against the TFMX editor's own macro-audition feature and found real discr
 independent of the trackstep-timing work. This document exists so a fresh session can pick the
 investigation up without re-deriving the tooling or the findings below.
 
+**▶ START HERE (2026-08-04): next session's tasks, in order:**
+1. This document has grown to 18 sections spanning many distinct bugs across several corpus
+   modules. Split it: one document per distinct issue (e.g. §1 portamento-drop, §16 `$0B` direction,
+   §18 pattern-82 note durations, etc.), cross-linked from here rather than inlined. Keep this file
+   as an index/overview once split.
+2. Commit the split documents.
+3. Report current context usage, then summarize the two live options for §18's open question
+   (editor ground truth for pattern 82, vs. rechecking `$00`/`$08`'s real suspend timing —
+   see §18's "Open question" and "For whoever picks this up next") and ask the user which to
+   pursue before doing either.
+
 **Status (2026-08-01): §3 and §4's fixes are in, TDD'd, and structurally verified. The "unresolved
 disconnect" (user's ears said the audible symptoms were unchanged) is now explained, not
 resolved — §7: a differential render proves the fixes are far from inert (up to ~93% of samples
