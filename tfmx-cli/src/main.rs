@@ -2031,6 +2031,94 @@ mod tests {
         std::fs::remove_file(&output).ok();
     }
 
+    fn wav_sha256(path: &std::path::Path) -> String {
+        use sha2::{Digest, Sha256};
+        let mut reader = hound::WavReader::open(path).expect("output is a valid WAV file");
+        let mut hasher = Sha256::new();
+        for sample in reader.samples::<i16>() {
+            hasher.update(sample.unwrap().to_le_bytes());
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// G0 (`docs/gui-plan.md`): pins `run_render_macro`'s and
+    /// `run_render_pattern`'s exact WAV output before either is extracted
+    /// into `tfmx-analysis`, so the extraction has something to fail
+    /// against. Not a decode correctness check -- just "did the bytes
+    /// change".
+    #[test]
+    fn render_macro_output_matches_golden_hash() {
+        let Some(mdat) = read_corpus("mdat.turrican intro") else {
+            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+            return;
+        };
+        let smpl = read_corpus("smpl.turrican intro").expect("smpl present alongside mdat");
+        let mdat_path = std::env::temp_dir().join("tfmx-cli-test-golden-macro-input.mdat");
+        let smpl_path = std::env::temp_dir().join("tfmx-cli-test-golden-macro-input.smpl");
+        std::fs::write(&mdat_path, &mdat).unwrap();
+        std::fs::write(&smpl_path, &smpl).unwrap();
+        let output = std::env::temp_dir().join("tfmx-cli-test-golden-macro-output.wav");
+
+        let args = RenderMacroArgs {
+            mdat: mdat_path,
+            smpl: smpl_path,
+            output: output.clone(),
+            macro_number: 28,
+            note: 33,
+            volume: 64,
+            voice: 0,
+            tempo: 3,
+            seconds: 2,
+            rate: 44_100,
+            separation: 100,
+        };
+        run_render_macro(&args).expect("render-macro succeeds on a valid corpus file");
+
+        assert_eq!(
+            wav_sha256(&output),
+            "17dc48c406be2115179f34f44c8602397b696d9c2f442be8d22328446aa5fc11",
+            "render-macro output changed -- if intentional, update this hash"
+        );
+
+        std::fs::remove_file(&output).ok();
+    }
+
+    /// G0 (`docs/gui-plan.md`): see `render_macro_output_matches_golden_hash`.
+    #[test]
+    fn render_pattern_output_matches_golden_hash() {
+        let Some(mdat) = read_corpus("mdat.turrican intro") else {
+            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+            return;
+        };
+        let smpl = read_corpus("smpl.turrican intro").expect("smpl present alongside mdat");
+        let mdat_path = std::env::temp_dir().join("tfmx-cli-test-golden-pattern-input.mdat");
+        let smpl_path = std::env::temp_dir().join("tfmx-cli-test-golden-pattern-input.smpl");
+        std::fs::write(&mdat_path, &mdat).unwrap();
+        std::fs::write(&smpl_path, &smpl).unwrap();
+        let output = std::env::temp_dir().join("tfmx-cli-test-golden-pattern-output.wav");
+
+        let args = RenderPatternArgs {
+            mdat: mdat_path,
+            smpl: smpl_path,
+            output: output.clone(),
+            pattern: 84,
+            transpose: 0,
+            tempo: 3,
+            seconds: 2,
+            rate: 44_100,
+            separation: 100,
+        };
+        run_render_pattern(&args).expect("render-pattern succeeds on a valid corpus file");
+
+        assert_eq!(
+            wav_sha256(&output),
+            "85ba6680397ffbbff0d4d7767330eb06a36606602ed7f3327802cf9c9c1a2ec7",
+            "render-pattern output changed -- if intentional, update this hash"
+        );
+
+        std::fs::remove_file(&output).ok();
+    }
+
     #[test]
     fn resolve_mute_mask_with_neither_flag_mutes_nothing() {
         assert_eq!(resolve_mute_mask(None, &[]), [false; 4]);

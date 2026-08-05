@@ -1,8 +1,17 @@
 # Local GUI for TFMX tooling — architecture plan
 
-**Status**: architecture approved by the user (2026-08-05), no implementation started
-yet. Crate name chosen: `tfmx-web-gui` (renamed from an initial `tfmx-gui` draft, per
-explicit user request).
+**Status**: architecture approved by the user (2026-08-05). Crate name chosen:
+`tfmx-web-gui` (renamed from an initial `tfmx-gui` draft, per explicit user request).
+**Phase G0 done (2026-08-05)**: golden-hash tests for `run_render_macro`'s and
+`run_render_pattern`'s WAV output added to `tfmx-cli/src/main.rs`'s test module
+(`render_macro_output_matches_golden_hash`, `render_pattern_output_matches_golden_hash`,
+SHA-256 over the decoded i16 samples, mirroring `tests/golden.rs`'s own hashing
+convention). Both proven to fail on a one-sample perturbation (temporarily reverted,
+`git diff` clean). The two existing disasm tests already pin text byte-for-byte, per
+this phase's own note — no new disasm test needed. Full workspace suite green (151
+`tfmx` + 102 `tfmx-cli` + 31 `tfmx-analysis` tests), clippy clean (same one
+pre-existing unrelated `mutation_robustness.rs` warning as every prior phase).
+**Next: Phase G1** (extract disasm into structured `DisasmLine`s in `tfmx-analysis`).
 
 ## Context
 
@@ -192,3 +201,108 @@ TDD'd, with a golden-output test proving `render-macro`/`render-pattern`/`disasm
 produce byte-identical output before and after the move — this is a pure
 refactor with no new capability, and de-risks the rest before any HTTP code
 exists. Only then scaffold `tfmx-web-gui` itself.
+
+## Delegation and model tiers
+
+Per `CLAUDE.md`: hand an agent **only what its subtask needs** — its own row below, the
+files/line ranges it names, the `docs/` pages it builds on, the hard rules, and its
+`check:`. Not this whole plan.
+
+| Tier | Use for |
+|---|---|
+| **Haiku 4.5** | Mechanical, fully specified, single-file, criterion is a passing test |
+| **Sonnet 5** | Normal implementation with local design judgment |
+| **Opus 5** | Ambiguous, cross-cutting, reverse-engineering, or root-cause work |
+
+Nothing here is ambiguous or reverse-engineering work — the architecture is decided and
+the code being moved already works — so no subtask needs Opus 5.
+
+### Phase G0 — Golden-output safety net (write before touching any extraction code)
+
+Deliverable: a test pinning today's exact output of `run_render_macro`/`run_render_pattern`/
+`run_disasm` for a known corpus module, so every later phase has something to fail against.
+
+| Subtask | Model |
+|---|---|
+| Extend `tfmx-cli/tests/golden.rs` (or a sibling file reusing its corpus-path/hash helpers) with a SHA-256 pin of `run_render_macro`'s and `run_render_pattern`'s WAV bytes for one known corpus module | Haiku 4.5 |
+| Confirm the existing `disasm_macro_lists_a_splitkey_cont_chain_and_stops_at_stop` / `disasm_pattern_matches_the_known_decode_of_pattern_84_step_0` tests in `tfmx-cli/src/main.rs` already pin disasm text byte-for-byte — reuse as-is, no new test needed | Haiku 4.5 |
+
+**check:** new test(s) pass now, unmodified, and are proven to fail on a one-byte change (temporarily flip a sample, confirm failure, revert).
+
+### Phase G1 — Extract disasm into structured data
+
+Deliverable: `tfmx-analysis/src/disasm.rs` with a `DisasmLine` type and
+`disassemble_macro`/`disassemble_pattern`; `tfmx-cli`'s `run_disasm` (`main.rs:846-884`)
+thinned to format+print.
+
+| Subtask | Model |
+|---|---|
+| Design `DisasmLine`'s shape (macro-step vs. pattern-step variants, fields, `#[cfg_attr(feature = "serde", ...)]` per `tfmx-analysis`'s existing per-type gating convention) | Sonnet 5 |
+| Port the two match-arm loops from `run_disasm` into `disassemble_macro`/`disassemble_pattern`, pushing `DisasmLine`s instead of `writeln!`ing | Haiku 4.5 |
+| Thin `run_disasm` to call the new functions and format each line back to today's exact text | Haiku 4.5 |
+| Move the two existing disasm tests to assert on structured `DisasmLine`s in `tfmx-analysis`; add a thin formatting-only test in `tfmx-cli` | Haiku 4.5 |
+
+**check:** G0's disasm golden text unchanged; `cargo test -p tfmx-analysis -p tfmx-cli`.
+
+### Phase G2 — Extract `render_macro_pcm`
+
+Deliverable: `tfmx-analysis/src/render.rs` gains `render_macro_pcm(..) -> Vec<i16>`;
+`run_render_macro` (`main.rs:537-587`) thinned to call it + `hound`-write the result.
+
+| Subtask | Model |
+|---|---|
+| Decide the function signature, and whether the chunked-render loop (today streaming straight to `hound` per 4096-frame chunk) can collapse to one allocation now that the output is an owned `Vec<i16>`, or must keep chunking | Sonnet 5 |
+| Port the loop into `render_macro_pcm`, preserving the exact tick-then-render order per chunk | Haiku 4.5 (protected by G0's WAV golden test) |
+| Thin `run_render_macro` to call `render_macro_pcm` + `hound`-write the buffer | Haiku 4.5 |
+
+**check:** G0's render-macro golden WAV bytes unchanged.
+
+### Phase G3 — Extract `render_pattern_pcm`
+
+Deliverable: `dispatch_pattern_entry_standalone` + the render loop (`main.rs:596-741`) move
+into `tfmx-analysis/src/render.rs` as `render_pattern_pcm(..) -> Vec<i16>`;
+`run_render_pattern` thinned to match.
+
+| Subtask | Model |
+|---|---|
+| Decide the signature and move the function + its helper, preserving the already-documented PPat/track-operand simplification and the jump/lock/multi-macro state exactly as commented today | Sonnet 5 |
+| Thin `run_render_pattern` to call `render_pattern_pcm` + `hound`-write | Haiku 4.5 |
+| Add the WAV-length unit test render-pattern is currently missing, mirroring `render_macro_writes_a_wav_of_the_requested_length` | Haiku 4.5 |
+
+**check:** G0's render-pattern golden WAV bytes unchanged; new length test passes.
+
+### Phase G4 — Workspace verification and cleanup
+
+| Subtask | Model |
+|---|---|
+| Run `cargo test` across the workspace; confirm all G0 golden checks are bit-identical pre/post extraction | Haiku 4.5 |
+| Remove logic now duplicated in `tfmx-cli/src/main.rs`; judgment call on which old inline tests move vs. stay as thin adapter tests, to avoid duplicate coverage | Sonnet 5 |
+| Update this file's "Files to touch" checklist and `ROADMAP.md`'s Status block: mark the extraction done, name `tfmx-web-gui` scaffolding (W0) as next | Haiku 4.5 |
+
+**check:** full `cargo test` green; Status block updated; one commit per phase, per `CLAUDE.md`'s turnaround loop.
+
+### Phase W0 — `tfmx-web-gui` crate skeleton
+
+| Subtask | Model |
+|---|---|
+| `tfmx-web-gui/Cargo.toml`, add to workspace `members`, pick `tiny_http` version, minimal `main.rs` serving a static page | Sonnet 5 |
+| `Session` struct design (owns `Module` + current `Player`/song state, per principle 5 above) | Sonnet 5 |
+
+### Phase W1 — Routes (mechanical once G1–G3 exist and `Session` is fixed)
+
+| Subtask | Model |
+|---|---|
+| `GET /files?dir=` — list `.mdat`/`.smpl` pairs under a directory | Haiku 4.5 |
+| `POST /load` — parse + reset `Session` | Sonnet 5 (touches session state/error handling) |
+| `GET /song-view?song=` → `SongView` JSON via existing `build_song_view` | Haiku 4.5 |
+| `GET /disasm?macro=`/`?pattern=` → JSON via G1's functions | Haiku 4.5 |
+| `GET /render-macro`/`/render-pattern` → WAV bytes via G2/G3's PCM functions + in-memory `hound` write | Haiku 4.5 |
+
+### Phase W2 — Frontend
+
+| Subtask | Model |
+|---|---|
+| Page layout: file/song/pattern/macro pickers, `<audio>` element, disasm panel, waveform/call-graph panel (reuse `visualize.rs`'s HTML fragment) | Sonnet 5 |
+| Per-route `fetch` wiring, once route contracts are fixed by W1 | Haiku 4.5 |
+
+**check (W0–W2):** manual browser walkthrough against a real corpus module, matching each `tfmx-cli` command's output for the same args — see Verification above.
