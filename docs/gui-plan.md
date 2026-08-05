@@ -58,7 +58,18 @@ phase never touched -- confirmed pre-existing (stashed this phase's changes,
 diffs remained) and due to local `rustfmt` 1.9.0 disagreeing with whatever
 version originally formatted the repo (no `rustfmt.toml` pins one); not a
 G3 regression.
-**Next: Phase G4** (workspace verification and cleanup).
+**Phase G4 done (2026-08-05)**: workspace verification only — G1-G3 had already
+thinned `run_render_macro`/`run_render_pattern`/`run_disasm` down to arg-parsing +
+calling the extracted `tfmx-analysis` functions + writing output, so there was no
+leftover duplicated logic in `tfmx-cli/src/main.rs` to remove (checked: no orphaned
+`PatternRunner`/`MacroInterpreter`/`dispatch_pattern_entry` internals remained
+there). Full `cargo test --workspace` green (151 `tfmx` + 34 `tfmx-analysis` + 102
+`tfmx-cli` + `tfmx-play`/`tfmx-web` suites, G0's golden-hash tests included,
+bit-identical), `cargo clippy --workspace --all-targets` clean (same one
+pre-existing unrelated `mutation_robustness.rs` warning as every prior phase). The
+"Files to touch" checklist below is fully satisfied for the `tfmx-analysis`/
+`tfmx-cli` extraction (`tfmx-web-gui` itself is Phase W0, not yet started).
+**Next: Phase W0** (`tfmx-web-gui` crate skeleton).
 
 ## Context
 
@@ -220,14 +231,16 @@ or similar later — same core dependency, different adapter).
 ## Files to touch
 
 - New: `tfmx-web-gui/Cargo.toml`, `tfmx-web-gui/src/main.rs` (routing),
-  `tfmx-web-gui/static/index.html` + `app.js`.
+  `tfmx-web-gui/static/index.html` + `app.js`. **(not started, Phase W0)**
 - `tfmx-analysis/src/`: new `render.rs` (the two PCM functions) and `disasm.rs`
   (structured listing), wired into `lib.rs` next to the existing `view.rs`/
-  `walker.rs`/`zones.rs` exports.
+  `walker.rs`/`zones.rs` exports. **(done, G1-G3)**
 - `tfmx-cli/src/main.rs`: thin the `RenderMacro`/`RenderPattern`/`Disasm`
   handlers down to arg-parsing + calling the extracted functions + writing
-  output (WAV/stdout) — remove the now-duplicated logic.
-- Root `Cargo.toml`: add `tfmx-web-gui` to workspace members.
+  output (WAV/stdout) — remove the now-duplicated logic. **(done, G1-G3,
+  confirmed no leftover duplication in G4)**
+- Root `Cargo.toml`: add `tfmx-web-gui` to workspace members. **(not started,
+  Phase W0)**
 
 ## Verification
 
