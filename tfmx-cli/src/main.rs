@@ -566,93 +566,21 @@ fn run_render_macro(args: &RenderMacroArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Routes one decoded pattern entry to the voice it names -- the same
-/// dispatch `Player`'s private `dispatch_pattern_entry` (`tfmx/src/
-/// player.rs`) does, reimplemented here against `MacroInterpreter`'s public
-/// methods since that function isn't exported. `$FB <PPat>`'s `track`
-/// operand is dropped: with only one pattern running there is no second
-/// track to jump to, so it's read as "replace the running pattern",
-/// covering the common self-loop/chain case but not a real multi-track jump.
-fn dispatch_pattern_entry_standalone(
-    entry: tfmx::PatternEntry,
-    transpose: i8,
-    macros: &mut [tfmx::MacroInterpreter; 4],
-    paula: &mut tfmx::Paula,
-    lock: &mut [u32; 4],
-) -> Option<u8> {
-    use tfmx::{PatternCommand, PatternEntry, NoteTiming};
-    let voice_of = |nibble: u8| (nibble & 0x03) as usize;
-    match entry {
-        PatternEntry::Note {
-            note,
-            macro_number,
-            volume,
-            voice,
-            timing,
-        } => {
-            let voice = voice_of(voice);
-            if lock[voice] > 0 {
-                return None;
-            }
-            let detune = match timing {
-                NoteTiming::Detune(detune) => detune,
-                NoteTiming::Wait(_) | NoteTiming::Portamento(_) => 0,
-            };
-            macros[voice].note_on(macro_number, note, volume, transpose, detune);
-            None
-        }
-        PatternEntry::Command(command) => match command {
-            PatternCommand::KeyUp { voice } => {
-                macros[voice_of(voice)].signal_key_up();
-                None
-            }
-            PatternCommand::Vibrato { speed, voice, depth } => {
-                macros[voice_of(voice)].start_vibrato(speed, depth as i8);
-                None
-            }
-            PatternCommand::Envelope { amount, speed, voice, target } => {
-                macros[voice_of(voice)].start_envelope(amount, speed + 1, target);
-                None
-            }
-            PatternCommand::Portamento { speed, voice, rate } => {
-                macros[voice_of(voice)].start_portamento(speed, rate as i8 as i16);
-                None
-            }
-            PatternCommand::Fade { speed, target } => {
-                paula.start_master_volume_slide(speed, target);
-                None
-            }
-            PatternCommand::Lock { channel, ticks } => {
-                lock[voice_of(channel)] = ticks as u32;
-                None
-            }
-            PatternCommand::PlayPattern { pattern, .. } => Some(pattern),
-            // Flow/timing commands (`Loop`/`Jump`/`Wait`/`GoSub`/`Return`/
-            // `Nop`) and the halt commands are already applied by
-            // `PatternRunner::apply` before `emit` returns here -- nothing
-            // voice-facing left to dispatch.
-            _ => None,
-        },
-    }
-}
-
-/// Drives one `PatternRunner` + the 4-voice `MacroInterpreter` array +
-/// `Paula` directly -- no `Sequencer`, so no trackstep line and no
-/// multi-track transpose refresh (`args.transpose` stands in, constant for
-/// the whole render). Mirrors `run_jiffy`'s per-jiffy order (pattern step,
-/// then macro tick) at single-pattern scale, the same way `run_render_macro`
-/// mirrors it at single-voice scale.
 fn run_render_pattern(args: &RenderPatternArgs) -> Result<(), CliError> {
     let mdat = std::fs::read(&args.mdat)?;
     let smpl = std::fs::read(&args.smpl)?;
     let module = tfmx::Module::parse(&mdat, &smpl)?;
 
-    let mut runner = tfmx::PatternRunner::new(&module, args.pattern)?;
-    let mut macros: [tfmx::MacroInterpreter; 4] = core::array::from_fn(|_| tfmx::MacroInterpreter::new());
-    let mut paula = tfmx::Paula::new(args.separation);
-    let mut unsupported = tfmx::UnsupportedOps::default();
-    let mut lock = [0u32; 4];
-    let mut clock = tfmx::TickClock::new(args.tempo);
+    let total_frames = args.rate as usize * args.seconds as usize;
+    let pcm = tfmx_analysis::render_pattern_pcm(
+        &module,
+        args.pattern,
+        args.transpose,
+        args.tempo,
+        args.rate,
+        args.separation,
+        total_frames,
+    )?;
 
     let spec = hound::WavSpec {
         channels: 2,
@@ -661,60 +589,8 @@ fn run_render_pattern(args: &RenderPatternArgs) -> Result<(), CliError> {
         sample_format: hound::SampleFormat::Int,
     };
     let mut writer = hound::WavWriter::create(&args.output, spec)?;
-
-    let total_frames = args.rate as usize * args.seconds as usize;
-    let mut buf = vec![0i16; 4096 * 2];
-    let mut frames_left = total_frames;
-    let mut error = None;
-    while frames_left > 0 && error.is_none() {
-        let chunk_frames = frames_left.min(4096);
-        let out = &mut buf[..chunk_frames * 2];
-        let mut pos = 0usize;
-        clock.advance(args.rate, chunk_frames as u32, |tick_due, span_frames| {
-            if tick_due && error.is_none() {
-                let mut jump = None;
-                let step = runner.advance(|_pattern, _step, entry| {
-                    if let Some(target) = dispatch_pattern_entry_standalone(
-                        entry,
-                        args.transpose,
-                        &mut macros,
-                        &mut paula,
-                        &mut lock,
-                    ) {
-                        jump = Some(target);
-                    }
-                });
-                match step {
-                    Ok(()) => {}
-                    Err(e) => error = Some(e.into()),
-                }
-                if let Some(target) = jump {
-                    match tfmx::PatternRunner::new(&module, target) {
-                        Ok(r) => runner = r,
-                        Err(e) => error = Some(e.into()),
-                    }
-                }
-                for remaining in &mut lock {
-                    *remaining = remaining.saturating_sub(1);
-                }
-                for (voice, mac) in macros.iter_mut().enumerate() {
-                    if let Err(e) = mac.tick(&module, &mut paula, voice as u8, &mut unsupported, |_| {}) {
-                        error = Some(e.into());
-                    }
-                }
-            }
-            let start = pos * 2;
-            let end = start + span_frames as usize * 2;
-            paula.render(module.smpl(), args.rate, &mut out[start..end]);
-            pos += span_frames as usize;
-        });
-        if let Some(e) = error {
-            return Err(e);
-        }
-        for &sample in out.iter() {
-            writer.write_sample(sample)?;
-        }
-        frames_left -= chunk_frames;
+    for sample in pcm {
+        writer.write_sample(sample)?;
     }
     writer.finalize()?;
     Ok(())
@@ -1986,6 +1862,42 @@ mod tests {
             separation: 100,
         };
         run_render_macro(&args).expect("render-macro succeeds on a valid corpus file");
+
+        let reader = hound::WavReader::open(&output).expect("output is a valid WAV file");
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 2);
+        assert_eq!(spec.sample_rate, 44_100);
+        assert_eq!(spec.bits_per_sample, 16);
+        assert_eq!(reader.duration(), 44_100, "WAV must hold exactly 1 second");
+
+        std::fs::remove_file(&output).ok();
+    }
+
+    #[test]
+    fn render_pattern_writes_a_wav_of_the_requested_length() {
+        let Some(mdat) = read_corpus("mdat.turrican intro") else {
+            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+            return;
+        };
+        let smpl = read_corpus("smpl.turrican intro").expect("smpl present alongside mdat");
+        let mdat_path = std::env::temp_dir().join("tfmx-cli-test-pattern-input.mdat");
+        let smpl_path = std::env::temp_dir().join("tfmx-cli-test-pattern-input.smpl");
+        std::fs::write(&mdat_path, &mdat).unwrap();
+        std::fs::write(&smpl_path, &smpl).unwrap();
+        let output = std::env::temp_dir().join("tfmx-cli-test-pattern-output.wav");
+
+        let args = RenderPatternArgs {
+            mdat: mdat_path,
+            smpl: smpl_path,
+            output: output.clone(),
+            pattern: 84,
+            transpose: 0,
+            tempo: 3,
+            seconds: 1,
+            rate: 44_100,
+            separation: 100,
+        };
+        run_render_pattern(&args).expect("render-pattern succeeds on a valid corpus file");
 
         let reader = hound::WavReader::open(&output).expect("output is a valid WAV file");
         let spec = reader.spec();

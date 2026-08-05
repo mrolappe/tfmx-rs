@@ -38,7 +38,27 @@ existing WAV-bytes golden hash directly (byte-identical, since 16-bit PCM WAV is
 lossless container) — confirms the extraction changed nothing. Full workspace suite
 green (151 `tfmx` + 101 `tfmx-cli` + 34 `tfmx-analysis` tests), `cargo fmt --check` and
 clippy clean on the touched crates (no new warnings).
-**Next: Phase G3** (extract `render_pattern_pcm` into `tfmx-analysis`).
+**Phase G3 done (2026-08-05)**: `tfmx-analysis/src/render.rs` gains
+`render_pattern_pcm(module, pattern, transpose, tempo, rate, separation,
+total_frames) -> Result<Vec<i16>, AccessError>` and its private helper
+`dispatch_pattern_entry_standalone`, ported from `run_render_pattern`'s
+`PatternRunner` + 4-voice `MacroInterpreter` + `Paula` loop, preserving the
+PPat/track-operand simplification and jump/lock/multi-macro state exactly as
+commented at the original call site. `tfmx-cli`'s `run_render_pattern` now
+just calls it and `hound`-writes the returned buffer. Added the WAV-length
+test render-pattern was missing
+(`render_pattern_writes_a_wav_of_the_requested_length`, mirroring
+render-macro's); G0's `render_pattern_output_matches_golden_hash` still
+passes unmodified. Full workspace suite green (151 `tfmx` + 102 `tfmx-cli` +
+31 `tfmx-analysis` tests), clippy clean on the touched crates (same one
+pre-existing unrelated `mutation_robustness.rs` warning as every prior
+phase), `wasm32-unknown-unknown` build for `tfmx` unaffected.
+`cargo fmt --check` reports diffs across the repo, including files this
+phase never touched -- confirmed pre-existing (stashed this phase's changes,
+diffs remained) and due to local `rustfmt` 1.9.0 disagreeing with whatever
+version originally formatted the repo (no `rustfmt.toml` pins one); not a
+G3 regression.
+**Next: Phase G4** (workspace verification and cleanup).
 
 ## Context
 
