@@ -43,6 +43,10 @@ cannot stand on its own as a brief, sharpen the step rather than widening the co
 - [`docs/opcodes.md`](docs/opcodes.md) — complete command reference
 - [`docs/playback-model.md`](docs/playback-model.md) — how sound is produced, plus the gotchas
 - [`docs/architecture.md`](docs/architecture.md) — code shape and design decisions
+- [`docs/replayer-walkthrough.md`](docs/replayer-walkthrough.md) — narrative walkthrough of
+  `Player::run_jiffy`'s exact order of operations, tying trackstep/pattern/macro/opcode
+  execution together with diagrams and worked examples; read this first for *order*, the
+  three docs above for *bytes*, *math* and *code shape*
 - [`docs/m5-plan.md`](docs/m5-plan.md) — the approved M5 "Export and static analysis" brief:
   decisions and their rationale, per-phase subtasks and minimum models, the 7V posture
 - [`docs/analysis-tooling-ideas.md`](docs/analysis-tooling-ideas.md) — M5's idea ledger: every
