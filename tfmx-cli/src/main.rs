@@ -834,51 +834,37 @@ fn macro_opcode_name(op: u8) -> &'static str {
     }
 }
 
-/// A bounded linear listing, top to bottom, of one macro's or one pattern's
-/// bytecode -- not an execution trace (see `Command::Trace` for that).
-/// Stops at the opcode's own natural terminator (`$07 STOP` for a macro,
-/// `$F0 End`/`$F4 STOP` for a pattern) or after `MAX_DISASM_STEPS`, whichever
-/// comes first -- `pattern()`/`macro_()` return raw bytes "to the end of
-/// mdat" with no length field, so an untrusted or malformed module could
-/// otherwise never terminate this loop.
-const MAX_DISASM_STEPS: usize = 256;
+/// Formats one structured disassembly line back to `disasm`'s exact
+/// pre-extraction text (macro-opcode name lookup stays here since it's a
+/// display concern, not decoded data).
+fn format_disasm_line(line: &tfmx_analysis::DisasmLine) -> String {
+    match line {
+        tfmx_analysis::DisasmLine::Macro {
+            step,
+            opcode,
+            aa,
+            bb,
+            cc,
+        } => format!(
+            "{step:4}: ${opcode:02X} <{}> aa=${aa:02X} bb=${bb:02X} cc=${cc:02X}",
+            macro_opcode_name(*opcode)
+        ),
+        tfmx_analysis::DisasmLine::Pattern { step, entry } => format!("{step:4}: {entry:?}"),
+    }
+}
 
 fn run_disasm(args: &DisasmArgs, out: &mut impl Write) -> Result<(), CliError> {
     let mdat = std::fs::read(&args.mdat)?;
     let smpl = std::fs::read(&args.smpl)?;
     let module = tfmx::Module::parse(&mdat, &smpl)?;
 
-    match (args.macro_number, args.pattern) {
-        (Some(n), None) => {
-            let bytes = module.macro_(n)?;
-            for (step, word) in bytes.chunks_exact(4).take(MAX_DISASM_STEPS).enumerate() {
-                let [op, aa, bb, cc] = [word[0], word[1], word[2], word[3]];
-                writeln!(
-                    out,
-                    "{step:4}: ${op:02X} <{}> aa=${aa:02X} bb=${bb:02X} cc=${cc:02X}",
-                    macro_opcode_name(op)
-                )?;
-                if op == 0x07 {
-                    break;
-                }
-            }
-        }
-        (None, Some(n)) => {
-            let bytes = module.pattern(n)?;
-            for (step, word) in bytes.chunks_exact(4).take(MAX_DISASM_STEPS).enumerate() {
-                let entry = tfmx::decode_pattern_entry([word[0], word[1], word[2], word[3]]);
-                writeln!(out, "{step:4}: {entry:?}")?;
-                if matches!(
-                    entry,
-                    tfmx::PatternEntry::Command(
-                        tfmx::PatternCommand::End | tfmx::PatternCommand::Stop
-                    )
-                ) {
-                    break;
-                }
-            }
-        }
+    let lines = match (args.macro_number, args.pattern) {
+        (Some(n), None) => tfmx_analysis::disassemble_macro(&module, n)?,
+        (None, Some(n)) => tfmx_analysis::disassemble_pattern(&module, n)?,
         _ => return Err(CliError::Usage("pass exactly one of --macro or --pattern")),
+    };
+    for line in &lines {
+        writeln!(out, "{}", format_disasm_line(line))?;
     }
     Ok(())
 }
@@ -2888,60 +2874,37 @@ mod tests {
         assert_ne!(song0, song1);
     }
 
-    /// `turrican intro`'s macro 24 -- the keysplit/`Cont` instrument at the
-    /// centre of this session's retrigger fix (`MacroInterpreter::instrument`).
-    /// Fixes this exact bytecode as a regression check: a Splitkey into two
-    /// `Cont`s, terminated by `STOP`.
+    /// Phase G1: the decode itself is now tested against the corpus in
+    /// `tfmx-analysis::disasm`'s own tests; this only pins the text
+    /// `format_disasm_line` renders from a `DisasmLine`.
     #[test]
-    fn disasm_macro_lists_a_splitkey_cont_chain_and_stops_at_stop() {
-        let Some(mdat) = corpus_path("mdat.turrican intro") else {
-            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
-            return;
+    fn format_disasm_line_renders_macro_and_pattern_steps_as_before_extraction() {
+        let macro_line = tfmx_analysis::DisasmLine::Macro {
+            step: 0,
+            opcode: 0x1C,
+            aa: 0x05,
+            bb: 0x00,
+            cc: 0x00,
         };
-        let smpl = corpus_path("smpl.turrican intro").expect("smpl present alongside mdat");
+        assert_eq!(
+            format_disasm_line(&macro_line),
+            "   0: $1C <Splitkey> aa=$05 bb=$00 cc=$00"
+        );
 
-        let args = DisasmArgs {
-            mdat,
-            smpl,
-            macro_number: Some(24),
-            pattern: None,
+        let pattern_line = tfmx_analysis::DisasmLine::Pattern {
+            step: 0,
+            entry: tfmx::PatternEntry::Note {
+                note: 33,
+                macro_number: 48,
+                volume: 12,
+                voice: 2,
+                timing: tfmx::NoteTiming::Wait(31),
+            },
         };
-        let mut out = Vec::new();
-        run_disasm(&args, &mut out).expect("disasm succeeds on a valid corpus file");
-        let text = String::from_utf8(out).expect("output is UTF-8");
-        let lines: Vec<&str> = text.lines().collect();
-
-        assert_eq!(lines.len(), 4, "must stop right after the STOP at step 3");
-        assert!(lines[0].contains("$1C <Splitkey>"));
-        assert!(lines[1].contains("$06 <Cont>"));
-        assert!(lines[2].contains("$06 <Cont>"));
-        assert!(lines[3].contains("$07 <STOP*>"));
-    }
-
-    /// Cross-checked against `tfmx-cli trace`'s own repeated decode of this
-    /// step across many sessions (`docs/status.md`): pattern 84 step 0 is
-    /// always `Note{note:33, macro:48, volume:12, voice:2, Wait(31)}`.
-    #[test]
-    fn disasm_pattern_matches_the_known_decode_of_pattern_84_step_0() {
-        let Some(mdat) = corpus_path("mdat.turrican intro") else {
-            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
-            return;
-        };
-        let smpl = corpus_path("smpl.turrican intro").expect("smpl present alongside mdat");
-
-        let args = DisasmArgs {
-            mdat,
-            smpl,
-            macro_number: None,
-            pattern: Some(84),
-        };
-        let mut out = Vec::new();
-        run_disasm(&args, &mut out).expect("disasm succeeds on a valid corpus file");
-        let text = String::from_utf8(out).expect("output is UTF-8");
-
-        assert!(text.lines().next().unwrap().contains(
-            "Note { note: 33, macro_number: 48, volume: 12, voice: 2, timing: Wait(31) }"
-        ));
+        assert_eq!(
+            format_disasm_line(&pattern_line),
+            "   0: Note { note: 33, macro_number: 48, volume: 12, voice: 2, timing: Wait(31) }"
+        );
     }
 
     #[test]

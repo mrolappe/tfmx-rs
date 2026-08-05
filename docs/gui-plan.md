@@ -11,7 +11,21 @@ convention). Both proven to fail on a one-sample perturbation (temporarily rever
 this phase's own note — no new disasm test needed. Full workspace suite green (151
 `tfmx` + 102 `tfmx-cli` + 31 `tfmx-analysis` tests), clippy clean (same one
 pre-existing unrelated `mutation_robustness.rs` warning as every prior phase).
-**Next: Phase G1** (extract disasm into structured `DisasmLine`s in `tfmx-analysis`).
+**Phase G1 done (2026-08-05)**: new `tfmx-analysis/src/disasm.rs` — `DisasmLine`
+(`Macro { step, opcode, aa, bb, cc }` / `Pattern { step, entry: tfmx::PatternEntry }`),
+`disassemble_macro`/`disassemble_pattern`, ported straight from `run_disasm`'s two
+match arms (same `MAX_DISASM_STEPS`/terminator-stop logic, moved out of `main.rs`).
+Not `serde`-gated: `Pattern` embeds `tfmx::PatternEntry` directly rather than a
+mirrored view type, since nothing consumes disasm as JSON yet — add a mirror if that
+changes. `tfmx-cli`'s `run_disasm` now just calls the two functions and a new
+`format_disasm_line` renders each line back to the exact pre-extraction text (opcode
+name lookup stays in `tfmx-cli`, a display concern). The two former corpus-based
+disasm tests moved into `tfmx-analysis/src/disasm.rs` asserting on `DisasmLine`
+values; `tfmx-cli` keeps its usage-validation test plus one new thin formatting-only
+test pinning exact text for one macro/pattern line, no corpus needed. Full workspace
+suite green, `cargo fmt --check` clean, clippy clean (same one pre-existing warning),
+`wasm32-unknown-unknown` unaffected, golden hashes byte-identical.
+**Next: Phase G2** (extract `render_macro_pcm` into `tfmx-analysis`).
 
 ## Context
 
