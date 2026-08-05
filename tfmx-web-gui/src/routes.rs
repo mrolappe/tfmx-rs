@@ -27,6 +27,12 @@ fn error_response(status: u16, message: impl std::fmt::Display) -> ApiResponse {
     json_response(status, serde_json::json!({ "error": message.to_string() }))
 }
 
+fn html_response(html: String) -> ApiResponse {
+    let header = Header::from_bytes(&b"Content-Type"[..], b"text/html; charset=utf-8")
+        .expect("static header bytes are valid");
+    Response::from_data(html.into_bytes()).with_header(header)
+}
+
 fn wav_response(pcm: &[i16], rate: u32) -> ApiResponse {
     let spec = hound::WavSpec {
         channels: 2,
@@ -59,6 +65,18 @@ fn query_num<T: std::str::FromStr>(query: &HashMap<String, String>, key: &str, d
         .get(key)
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+fn query_u32(query: &HashMap<String, String>, key: &str) -> Option<u32> {
+    query.get(key).and_then(|v| v.parse().ok())
+}
+
+fn text_response(status: u16, body: String) -> ApiResponse {
+    let header = Header::from_bytes(&b"Content-Type"[..], b"text/plain; charset=utf-8")
+        .expect("static header bytes are valid");
+    Response::from_data(body.into_bytes())
+        .with_status_code(status)
+        .with_header(header)
 }
 
 /// `GET /files?dir=` -- every `mdat.*`/`smpl.*` pair found directly under
@@ -138,6 +156,29 @@ pub fn song_view(session: Option<&Session>, query: &HashMap<String, String>) -> 
             200,
             serde_json::to_value(view).expect("SongView always serializes"),
         ),
+        Err(e) => error_response(400, format!("{e:?}")),
+    }
+}
+
+/// `GET /song-view.html?song=` -- the same view as `/song-view`, rendered as
+/// a standalone HTML page via `tfmx-cli`'s existing `visualize::render_html`
+/// (waveform SVG, Mermaid call graph, trackstep table) rather than
+/// duplicating that renderer here. Meant to be embedded in an `<iframe>`.
+pub fn song_view_html(session: Option<&Session>, query: &HashMap<String, String>) -> ApiResponse {
+    let Some(session) = session else {
+        return error_response(400, "no module loaded; POST /load first");
+    };
+    let song = query_num(query, "song", 0u8);
+    let module = session.module();
+    match tfmx_analysis::build_song_view(&module, song) {
+        Ok(view) => {
+            let module_name = session
+                .mdat_path()
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("module");
+            html_response(tfmx_cli::visualize::render_html(module_name, &view))
+        }
         Err(e) => error_response(400, format!("{e:?}")),
     }
 }
@@ -230,6 +271,67 @@ pub fn render_pattern(session: Option<&Session>, query: &HashMap<String, String>
         total_frames,
     ) {
         Ok(pcm) => wav_response(&pcm, rate),
+        Err(e) => error_response(400, format!("{e:?}")),
+    }
+}
+
+/// `GET /module-info` -- [`tfmx_analysis::build_module_info`] as JSON. No
+/// query params needed.
+pub fn module_info(session: Option<&Session>, _query: &HashMap<String, String>) -> ApiResponse {
+    let Some(session) = session else {
+        return error_response(400, "no module loaded; POST /load first");
+    };
+    let module = session.module();
+    let info = tfmx_analysis::build_module_info(&module);
+    json_response(
+        200,
+        serde_json::to_value(info).expect("ModuleInfo always serializes"),
+    )
+}
+
+/// `GET /render-region?start=&len=&rate=` -- render a region of the module
+/// as PCM audio. `start` and `len` are required `u32` query params. `rate`
+/// is optional, defaults to `8363` (TFMX's own raw-note-0x18 playback-rate
+/// anchor, the same constant `tfmx-cli`'s export zone preview uses).
+pub fn render_region(session: Option<&Session>, query: &HashMap<String, String>) -> ApiResponse {
+    let Some(session) = session else {
+        return error_response(400, "no module loaded; POST /load first");
+    };
+    let Some(start) = query_u32(query, "start") else {
+        return error_response(400, "?start= and ?len= are required");
+    };
+    let Some(len) = query_u32(query, "len") else {
+        return error_response(400, "?start= and ?len= are required");
+    };
+    let rate = query_num(query, "rate", 8363u32);
+
+    let module = session.module();
+    match tfmx_analysis::render_region_pcm(&module, start, len) {
+        Ok(pcm) => wav_response(&pcm, rate),
+        Err(e) => error_response(400, format!("{e:?}")),
+    }
+}
+
+/// `GET /disasm-text?macro=` / `?pattern=` -- a formatted text disassembly
+/// of one macro or pattern, as `text/plain; charset=utf-8` instead of JSON.
+pub fn disasm_text(session: Option<&Session>, query: &HashMap<String, String>) -> ApiResponse {
+    let Some(session) = session else {
+        return error_response(400, "no module loaded; POST /load first");
+    };
+    let module = session.module();
+    let lines = match (query_u8(query, "macro"), query_u8(query, "pattern")) {
+        (Some(macro_number), None) => tfmx_analysis::disassemble_macro(&module, macro_number),
+        (None, Some(pattern)) => tfmx_analysis::disassemble_pattern(&module, pattern),
+        _ => return error_response(400, "exactly one of ?macro=/?pattern= is required"),
+    };
+    match lines {
+        Ok(lines) => {
+            let formatted: Vec<String> = lines
+                .iter()
+                .map(tfmx_cli::disasm_text::format_disasm_line)
+                .collect();
+            text_response(200, formatted.join("\n"))
+        }
         Err(e) => error_response(400, format!("{e:?}")),
     }
 }
@@ -343,6 +445,35 @@ mod tests {
     }
 
     #[test]
+    fn song_view_html_without_a_loaded_session_is_an_error() {
+        let query = HashMap::new();
+        let (status, body) = status_and_json(song_view_html(None, &query));
+        assert_eq!(status, 400);
+        assert!(body["error"].is_string());
+    }
+
+    #[test]
+    fn song_view_html_renders_a_standalone_page() {
+        let Some(session) = loaded_session() else {
+            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+            return;
+        };
+        let query = HashMap::from([("song".to_string(), "0".to_string())]);
+        let response = song_view_html(Some(&session), &query);
+        assert_eq!(response.status_code().0, 200);
+        let content_type = response
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Content-Type"))
+            .map(|h| h.value.as_str().to_string());
+        assert_eq!(content_type.as_deref(), Some("text/html; charset=utf-8"));
+        let bytes = response.into_reader().into_inner();
+        let html = String::from_utf8(bytes).expect("valid UTF-8");
+        assert!(html.starts_with("<!doctype html>"));
+        assert!(html.contains("mdat.turrican intro"));
+    }
+
+    #[test]
     fn disasm_requires_exactly_one_of_macro_or_pattern() {
         let query = HashMap::new();
         let (status, body) = status_and_json(disasm(None, &query));
@@ -393,5 +524,114 @@ mod tests {
         let (status, body) = status_and_json(render_pattern(None, &query));
         assert_eq!(status, 400);
         assert!(body["error"].is_string());
+    }
+
+    #[test]
+    fn module_info_without_a_loaded_session_is_an_error() {
+        let query = HashMap::new();
+        let (status, body) = status_and_json(module_info(None, &query));
+        assert_eq!(status, 400);
+        assert!(body["error"].is_string());
+    }
+
+    #[test]
+    fn module_info_returns_songs_patterns_and_macros() {
+        let Some(session) = loaded_session() else {
+            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+            return;
+        };
+        let query = HashMap::new();
+        let (status, body) = status_and_json(module_info(Some(&session), &query));
+        assert_eq!(status, 200);
+        assert!(body["songs"].is_array());
+        assert!(!body["songs"].as_array().unwrap().is_empty());
+        let first_song = &body["songs"][0];
+        assert_eq!(first_song["number"], 0);
+        assert_eq!(first_song["start"], 75);
+        assert_eq!(first_song["end"], 129);
+        assert_eq!(first_song["tempo"], 3);
+        assert!(body["patterns"].is_array());
+        assert!(!body["patterns"].as_array().unwrap().is_empty());
+        assert!(body["macros"].is_array());
+        assert!(!body["macros"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn render_region_without_a_loaded_session_is_an_error() {
+        let query = HashMap::new();
+        let (status, body) = status_and_json(render_region(None, &query));
+        assert_eq!(status, 400);
+        assert!(body["error"].is_string());
+    }
+
+    #[test]
+    fn render_region_requires_start_and_len() {
+        let Some(session) = loaded_session() else {
+            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+            return;
+        };
+        let query = HashMap::new();
+        let (status, body) = status_and_json(render_region(Some(&session), &query));
+        assert_eq!(status, 400);
+        assert!(body["error"].is_string());
+    }
+
+    #[test]
+    fn render_region_produces_a_wav_of_the_requested_length() {
+        let Some(session) = loaded_session() else {
+            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+            return;
+        };
+        let query = HashMap::from([
+            ("start".to_string(), "0".to_string()),
+            ("len".to_string(), "8".to_string()),
+        ]);
+        let response = render_region(Some(&session), &query);
+        assert_eq!(response.status_code().0, 200);
+        let bytes = response.into_reader().into_inner();
+        let reader = hound::WavReader::new(Cursor::new(bytes)).expect("valid WAV");
+        assert_eq!(reader.spec().channels, 2);
+        assert_eq!(reader.len(), 16);
+    }
+
+    #[test]
+    fn disasm_text_without_a_loaded_session_is_an_error() {
+        let query = HashMap::new();
+        let (status, body) = status_and_json(disasm_text(None, &query));
+        assert_eq!(status, 400);
+        assert!(body["error"].is_string());
+    }
+
+    #[test]
+    fn disasm_text_requires_exactly_one_of_macro_or_pattern() {
+        let Some(session) = loaded_session() else {
+            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+            return;
+        };
+        let query = HashMap::new();
+        let (status, body) = status_and_json(disasm_text(Some(&session), &query));
+        assert_eq!(status, 400);
+        assert!(body["error"].is_string());
+    }
+
+    #[test]
+    fn disasm_text_formats_as_plain_text() {
+        let Some(session) = loaded_session() else {
+            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+            return;
+        };
+        let query = HashMap::from([("pattern".to_string(), "84".to_string())]);
+        let response = disasm_text(Some(&session), &query);
+        assert_eq!(response.status_code().0, 200);
+        let content_type = response
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Content-Type"))
+            .map(|h| h.value.as_str().to_string());
+        assert_eq!(content_type.as_deref(), Some("text/plain; charset=utf-8"));
+        let bytes = response.into_reader().into_inner();
+        let body = String::from_utf8(bytes).expect("valid UTF-8");
+        assert!(body.starts_with("   0: "));
+        assert!(body.contains("Note {"));
     }
 }

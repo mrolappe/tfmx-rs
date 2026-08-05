@@ -1,0 +1,71 @@
+body {
+  font-family: system-ui, sans-serif;
+  max-width: 60rem;
+  margin: 2rem auto;
+  padding: 0 1rem;
+}
+
+section {
+  border: 1px solid #ccc;
+  border-radius: 8px;
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+
+label {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin-right: 1rem;
+}
+
+#status {
+  min-height: 1.5em;
+}
+
+#status.error {
+  color: #c00;
+}
+
+#song-view-frame {
+  width: 100%;
+  height: 32rem;
+  border: 1px solid #ccc;
+}
+
+.tabs {
+  margin: 0.5rem 0 0;
+}
+
+.tab-button {
+  font: inherit;
+  padding: 0.3rem 0.9rem;
+  border: 1px solid #ccc;
+  border-bottom: none;
+  background: #eee;
+  cursor: pointer;
+}
+
+.tab-button.active {
+  background: #fff;
+  font-weight: bold;
+}
+
+.tab-panel {
+  border: 1px solid #ccc;
+  max-height: 20rem;
+  overflow: auto;
+  background: #f5f5f5;
+  padding: 0.5rem;
+  margin: 0;
+}
+
+.tab-panel[hidden] {
+  display: none;
+}
+
+audio {
+  display: block;
+  margin-top: 0.5rem;
+  width: 100%;
+}

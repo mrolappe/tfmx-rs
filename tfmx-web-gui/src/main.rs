@@ -30,10 +30,14 @@ fn main() {
                 let _ = request.as_reader().read_to_string(&mut body);
                 routes::load(&mut session, &body)
             }
-            (Method::Get, "/song-view") => routes::song_view(session.as_ref(), &query),
             (Method::Get, "/disasm") => routes::disasm(session.as_ref(), &query),
+            (Method::Get, "/disasm-text") => routes::disasm_text(session.as_ref(), &query),
+            (Method::Get, "/module-info") => routes::module_info(session.as_ref(), &query),
             (Method::Get, "/render-macro") => routes::render_macro(session.as_ref(), &query),
             (Method::Get, "/render-pattern") => routes::render_pattern(session.as_ref(), &query),
+            (Method::Get, "/render-region") => routes::render_region(session.as_ref(), &query),
+            (Method::Get, "/song-view") => routes::song_view(session.as_ref(), &query),
+            (Method::Get, "/song-view.html") => routes::song_view_html(session.as_ref(), &query),
             (Method::Get, _) => match static_files::resolve(&static_dir, request.url()) {
                 Some(path) => {
                     let content_type = static_files::content_type(&path);

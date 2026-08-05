@@ -4,6 +4,7 @@
 //! See `docs/m5-plan.md` Phase 5.2 for the design brief this implements.
 
 mod disasm;
+mod module_info;
 mod render;
 mod view;
 mod walker;
@@ -12,7 +13,8 @@ pub use disasm::{
     DisasmLine, DisasmLineView, NoteTimingView, PatternCommandView, PatternEntryView,
     disassemble_macro, disassemble_pattern,
 };
-pub use render::{render_macro_pcm, render_pattern_pcm};
+pub use module_info::{ModuleInfo, SongInfo, build_module_info};
+pub use render::{render_macro_pcm, render_pattern_pcm, render_region_pcm};
 pub use view::{
     LineCommandView, SongView, StepView, TrackSlotView, TrackstepMap, TrackstepStep,
     WaveformRegion, WaveformView, build_song_view,

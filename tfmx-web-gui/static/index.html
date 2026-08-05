@@ -3,12 +3,97 @@
   <head>
     <meta charset="utf-8" />
     <title>tfmx-web-gui</title>
+    <link rel="stylesheet" href="style.css" />
   </head>
   <body>
     <h1>tfmx-web-gui</h1>
-    <p>
-      Skeleton page (`docs/gui-plan.md` Phase W0). File/song pickers, disasm and
-      render panels land in Phase W2, once Phase W1's routes exist.
-    </p>
+
+    <section id="file-section">
+      <h2>File</h2>
+      <label>
+        Directory
+        <input id="dir-input" type="text" value="testdata" />
+      </label>
+      <button id="list-files" type="button">List</button>
+      <label>
+        Module
+        <select id="file-select"></select>
+      </label>
+      <button id="load" type="button">Load</button>
+      <p id="status" role="status"></p>
+      <p id="module-info" hidden>
+        <span id="song-count"></span> song(s),
+        <span id="pattern-count"></span> pattern(s),
+        <span id="macro-count"></span> macro(s)
+      </p>
+    </section>
+
+    <section id="song-section" hidden>
+      <h2>Song view</h2>
+      <label>
+        Song
+        <select id="song-select"></select>
+      </label>
+      <button id="view-song" type="button">View</button>
+      <iframe id="song-view-frame" title="waveform, call graph and trackstep"></iframe>
+    </section>
+
+    <section id="render-section" hidden>
+      <h2>Render macro</h2>
+      <label>
+        Macro
+        <select id="macro-select"></select>
+      </label>
+      <label>
+        Note
+        <input id="macro-note" type="number" min="0" value="30" />
+      </label>
+      <label>
+        Volume
+        <input id="macro-volume" type="number" min="0" max="64" value="64" />
+      </label>
+      <button id="render-macro-btn" type="button">Render</button>
+      <audio id="macro-audio" controls></audio>
+
+      <h2>Render pattern</h2>
+      <label>
+        Pattern
+        <select id="pattern-select"></select>
+      </label>
+      <label>
+        Transpose
+        <input id="pattern-transpose" type="number" value="0" />
+      </label>
+      <label>
+        Tempo
+        <input id="pattern-tempo" type="number" min="0" value="0" />
+      </label>
+      <button id="render-pattern-btn" type="button">Render</button>
+      <audio id="pattern-audio" controls></audio>
+    </section>
+
+    <section id="disasm-section" hidden>
+      <h2>Disassemble</h2>
+      <label>
+        Kind
+        <select id="disasm-kind">
+          <option value="macro">Macro</option>
+          <option value="pattern">Pattern</option>
+        </select>
+      </label>
+      <label>
+        Number
+        <select id="disasm-number"></select>
+      </label>
+      <button id="disasm-btn" type="button">Disassemble</button>
+      <div class="tabs">
+        <button type="button" id="disasm-tab-json" class="tab-button active">JSON</button>
+        <button type="button" id="disasm-tab-text" class="tab-button">Text</button>
+      </div>
+      <pre id="disasm-output-json" class="tab-panel"></pre>
+      <pre id="disasm-output-text" class="tab-panel" hidden></pre>
+    </section>
+
+    <script type="module" src="app.js"></script>
   </body>
 </html>

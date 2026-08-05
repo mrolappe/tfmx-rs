@@ -197,6 +197,26 @@ pub fn render_pattern_pcm(
     Ok(pcm)
 }
 
+/// One waveform region's raw `smpl` bytes, unprocessed: no macro
+/// interpretation, no pitch shift, no loop expansion -- just `[start,
+/// start+len)` widened from signed 8-bit to i16 and stereo-centered. Meant
+/// for previewing exactly what a `WaveformRegion` covers (`docs/gui-plan.md`
+/// Phase W3's clickable waveform), the same raw data `tfmx-cli`'s `export`
+/// module writes out for a zone, at whatever rate the caller labels it --
+/// this function does no resampling, so the caller (typically 8363 Hz,
+/// TFMX's own raw-note-`0x18` anchor -- see `export::NATIVE_SAMPLE_RATE_HZ`)
+/// picks the number that makes the byte count play back at that rate.
+pub fn render_region_pcm(module: &Module, start: u32, len: u32) -> Result<Vec<i16>, AccessError> {
+    let bytes = module.sample(start, len)?;
+    let mut pcm = Vec::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        let sample = b as i16 * 256;
+        pcm.push(sample);
+        pcm.push(sample);
+    }
+    Ok(pcm)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +269,42 @@ mod tests {
             wav_sha256(&pcm),
             "17dc48c406be2115179f34f44c8602397b696d9c2f442be8d22328446aa5fc11",
             "render_macro_pcm output changed -- if intentional, update this hash"
+        );
+    }
+
+    #[test]
+    fn render_region_pcm_widens_raw_bytes_to_stereo_i16() {
+        let Some(mdat) = read_corpus("mdat.turrican intro") else {
+            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+            return;
+        };
+        let smpl = read_corpus("smpl.turrican intro").expect("smpl present alongside mdat");
+        let module = Module::parse(&mdat, &smpl).expect("valid corpus file");
+
+        let raw = module.sample(0, 8).expect("first 8 bytes of smpl are in range");
+        let pcm = render_region_pcm(&module, 0, 8).expect("region in range");
+
+        assert_eq!(pcm.len(), 16, "8 mono bytes -> 8 stereo frames -> 16 i16 samples");
+        for (i, &b) in raw.iter().enumerate() {
+            let expected = b as i16 * 256;
+            assert_eq!(pcm[i * 2], expected, "left channel at frame {i}");
+            assert_eq!(pcm[i * 2 + 1], expected, "right channel at frame {i}");
+        }
+    }
+
+    #[test]
+    fn render_region_pcm_rejects_an_out_of_bounds_region() {
+        let Some(mdat) = read_corpus("mdat.turrican intro") else {
+            eprintln!("skipping: run `sh testdata/fetch.sh` to fetch the test corpus");
+            return;
+        };
+        let smpl = read_corpus("smpl.turrican intro").expect("smpl present alongside mdat");
+        let module = Module::parse(&mdat, &smpl).expect("valid corpus file");
+
+        let huge_len = smpl.len() as u32 + 1;
+        assert_eq!(
+            render_region_pcm(&module, 0, huge_len),
+            Err(AccessError::OutOfRange)
         );
     }
 }

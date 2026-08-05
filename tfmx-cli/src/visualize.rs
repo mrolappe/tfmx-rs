@@ -50,8 +50,12 @@ fn waveform_svg(view: &SongView) -> String {
                 "region"
             };
             svg.push_str(&format!(
-                "  <rect class=\"{class}\" x=\"{x:.1}\" y=\"{y:.1}\" width=\"{w:.1}\" height=\"{:.1}\">\
-                 <title>macro {macro_number}: {} bytes at {} ({}{})</title></rect>\n",
+                "  <rect class=\"{class}\" data-start=\"{}\" data-len=\"{}\" data-loop=\"{}\" \
+                 x=\"{x:.1}\" y=\"{y:.1}\" width=\"{w:.1}\" height=\"{:.1}\">\
+                 <title>macro {macro_number}: {} bytes at {} ({}{}) -- click to play</title></rect>\n",
+                region.start,
+                region.len,
+                region.looped,
                 ROW_HEIGHT - 2.0,
                 region.len,
                 region.start,
@@ -110,7 +114,7 @@ fn trackstep_table(view: &SongView) -> String {
 
 const STYLE: &str = "
 body { font: 14px sans-serif; margin: 2rem; }
-.region { fill: #4a90d9; stroke: #2c5a8a; }
+.region { fill: #4a90d9; stroke: #2c5a8a; cursor: pointer; }
 .region.oob { fill: #d94a4a; stroke: #8a2c2c; }
 table.trackstep { border-collapse: collapse; font-size: 12px; }
 table.trackstep td, table.trackstep th { border: 1px solid #ccc; padding: 2px 6px; }
@@ -122,6 +126,30 @@ pre.mermaid-source { background: #f4f4f4; padding: 1rem; overflow-x: auto; }
 .tab-panel { border: 1px solid #ccc; padding: 1rem; }
 .tab-panel[hidden] { display: none; }
 #mermaid-offline-note { color: #8a2c2c; }
+";
+
+/// Plays a waveform region's raw `smpl` bytes via `GET /render-region` when
+/// its `<rect>` is clicked (`docs/gui-plan.md` Phase W3). Only meaningful
+/// when this page is served by `tfmx-web-gui` -- in a standalone export
+/// (`tfmx-cli visualize`) there is no server to answer the fetch, so a click
+/// there just fails silently (`.catch` swallows it; no server, no crash).
+const REGION_SCRIPT: &str = "
+(function () {
+  var audio = null;
+  document.querySelectorAll('svg rect.region').forEach(function (rect) {
+    rect.addEventListener('click', function () {
+      if (!audio) {
+        audio = document.createElement('audio');
+        audio.id = 'region-audio';
+        document.body.appendChild(audio);
+      }
+      audio.loop = rect.getAttribute('data-loop') === 'true';
+      audio.src = '/render-region?start=' + rect.getAttribute('data-start') +
+        '&len=' + rect.getAttribute('data-len');
+      audio.play().catch(function () {});
+    });
+  });
+})();
 ";
 
 /// The tabbed "Diagram"/"Source" pair over the call graph: "Diagram" tries
@@ -183,6 +211,7 @@ pub fn render_html(module_name: &str, view: &SongView) -> String {
          <div id=\"panel-source\" class=\"tab-panel\" hidden><pre class=\"mermaid-source\">{graph}</pre></div>\n\
          <h2>Trackstep structure</h2>\n\
          {table}\
+         <script>{REGION_SCRIPT}</script>\n\
          <script>{GRAPH_SCRIPT}</script>\n\
          </body></html>\n",
         song = view.song,

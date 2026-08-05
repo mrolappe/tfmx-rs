@@ -399,3 +399,96 @@ into `tfmx-analysis/src/render.rs` as `render_pattern_pcm(..) -> Vec<i16>`;
 | Per-route `fetch` wiring, once route contracts are fixed by W1 | Haiku 4.5 |
 
 **check (W0–W2):** manual browser walkthrough against a real corpus module, matching each `tfmx-cli` command's output for the same args — see Verification above.
+
+### Phase W3 — GUI refinements (user feedback after the W2 walkthrough)
+
+**Done (2026-08-05), user-confirmed in-browser.** All six items landed;
+implementation map for a future session:
+
+- `tfmx-analysis/src/render.rs`: `render_region_pcm(module, start, len)` --
+  raw `smpl` bytes widened to i16, no macro interpretation, no resampling.
+- `tfmx-analysis/src/module_info.rs` (new file): `build_module_info(module)`
+  -> `ModuleInfo { songs: Vec<SongInfo>, patterns: Vec<u8>, macros: Vec<u8> }`.
+  "Used song" = `song_end(n) > song_start(n)`; "used pattern/macro" = unioned
+  `walk_song` reachability across every used song (the format has no other
+  per-slot validity flag for either). Both re-exported from
+  `tfmx-analysis/src/lib.rs`.
+- `tfmx-cli/src/disasm_text.rs` (new file, `pub` from `tfmx-cli/src/lib.rs`):
+  `macro_opcode_name`/`format_disasm_line` moved here from `main.rs` so the
+  CLI's `disasm` subcommand and the GUI's `/disasm-text` route share one
+  opcode-mnemonic table.
+- `tfmx-cli/src/visualize.rs`: `waveform_svg` rects gained
+  `data-start`/`data-len`/`data-loop` attributes; new `REGION_SCRIPT` const
+  (event-delegated click listener, no inline `onclick`) plays
+  `/render-region?start=&len=` through a shared `<audio>` element. Degrades
+  silently in a standalone `tfmx-cli visualize` export (no server to answer
+  the fetch, `.catch` swallows it).
+- `tfmx-web-gui/src/routes.rs`: three new handlers --
+  `module_info`/`render_region`/`disasm_text`, same
+  `Option<&Session>` + `&HashMap<String, String>` -> `ApiResponse` shape as
+  every other handler in the file. `render_region` defaults `?rate=` to
+  `8363` (TFMX's raw-note-`0x18` playback-rate anchor, same constant
+  `tfmx-cli`'s `export::NATIVE_SAMPLE_RATE_HZ` uses -- kept as a documented
+  literal here rather than importing that constant, since `export` would
+  drag its `crate::midi` dependency into the shared lib surface for one
+  number). Wired into `tfmx-web-gui/src/main.rs`'s dispatch match.
+- `tfmx-web-gui/static/index.html` + `app.js`: song/macro/pattern number
+  inputs became `<select>`s populated from one `/module-info` fetch (cached
+  in `app.js`'s module-level `moduleInfo` variable) right after `/load`
+  succeeds; picking a song sets the pattern-render tempo field's default;
+  disasm panel gained JSON/Text tab buttons (`showDisasmTab`) fetching
+  `/disasm` and `/disasm-text` in parallel. Waveform click-to-play needed no
+  `app.js` changes -- it's self-contained inside the `/song-view.html`
+  iframe's own script (see `visualize.rs` above).
+
+Six asks, each backend-then-frontend:
+
+1. **Clickable waveform regions play that region.** No macro interpretation,
+   no pitch shift -- the region's raw `smpl` bytes, widened to i16 and
+   stereo-centered, played at TFMX's own raw-note-`0x18` anchor rate (8363
+   Hz, the same constant `tfmx-cli`'s `export::NATIVE_SAMPLE_RATE_HZ` already
+   uses for exported zone previews -- reused as a documented literal in
+   `tfmx-web-gui`, not a new cross-crate dependency, since `export` would
+   have to drag its `crate::midi` dependency into the shared lib surface for
+   one constant). New `tfmx_analysis::render_region_pcm(module, start, len)`.
+   New route `GET /render-region?start=&len=&rate=` (`rate` optional,
+   defaults to 8363). `visualize.rs`'s `waveform_svg` gains an `onclick` per
+   `<rect>` plus a small inline script (same file both `tfmx-cli visualize`
+   and `/song-view.html` share -- clicking in a standalone exported page
+   just fails the same-origin fetch silently, no server to answer).
+2. **Song info + picker.** New `tfmx_analysis::build_module_info(module)`:
+   every song slot where `end > start` (the empty-slot signature already
+   confirmed against the real corpus -- unused slots repeat `start==end`),
+   with its start/end/tempo. New route `GET /module-info`. Frontend: song
+   `<select>` populated from this instead of a free-number input; song count
+   + the list shown in the file section.
+3. **Pattern/macro info + pickers.** Same `build_module_info`/`/module-info`:
+   patterns/macros are whatever's in the union of `walk_song`'s
+   `reachable_patterns`/`reachable_macros` across every valid song from (2)
+   -- the format has no per-slot "used" flag, so file-wide reachability is
+   the only grounded definition of "valid". Frontend: macro/pattern
+   `<select>`s (render + disasm) populated from these lists; counts shown
+   alongside the song info.
+4. **Render-pattern tempo, defaulted from the song.** `/module-info`'s
+   per-song `tempo` (from (2)) already carries this -- no new backend field.
+   Frontend: picking a song sets the tempo input's default to that song's
+   `tempo`; still user-editable.
+5. **Disasm text tab.** `tfmx-cli/src/main.rs`'s `macro_opcode_name`/
+   `format_disasm_line` move to a new `tfmx-cli/src/disasm_text.rs`
+   (`pub mod` from `lib.rs`, same move `visualize.rs` already went through)
+   so both the CLI and the GUI format from one mnemonic table -- redoing it
+   in JS would duplicate the 34-entry opcode table by hand. New route
+   `GET /disasm-text?macro=/pattern=` (`text/plain`, one line per entry).
+   Frontend: JSON/Text tabs over the existing disasm panel.
+
+| Subtask | Model |
+|---|---|
+| `render_region_pcm`, `build_module_info` (`tfmx-analysis`, TDD'd) | Sonnet 5 |
+| `disasm_text.rs` extraction, `waveform_svg` click wiring (shared display code, `tfmx-cli`) | Sonnet 5 |
+| `/render-region`, `/module-info`, `/disasm-text` routes (mechanical once the above exist) | Haiku 4.5 |
+| Frontend: combo boxes, counts display, tempo default, JSON/Text tabs (fetch wiring once route contracts are fixed) | Haiku 4.5 |
+
+**check (W3):** same manual browser walkthrough as W0–W2, plus: click a
+waveform region and hear that exact region; song/pattern/macro pickers show
+only real numbers; render-pattern's tempo field pre-fills from the picked
+song; disasm shows readable text next to the JSON.
