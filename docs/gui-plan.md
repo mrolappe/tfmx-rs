@@ -25,7 +25,20 @@ values; `tfmx-cli` keeps its usage-validation test plus one new thin formatting-
 test pinning exact text for one macro/pattern line, no corpus needed. Full workspace
 suite green, `cargo fmt --check` clean, clippy clean (same one pre-existing warning),
 `wasm32-unknown-unknown` unaffected, golden hashes byte-identical.
-**Next: Phase G2** (extract `render_macro_pcm` into `tfmx-analysis`).
+**Phase G2 done (2026-08-05)**: new `tfmx-analysis/src/render.rs` —
+`render_macro_pcm(module, macro_number, note, volume, voice, tempo, rate, separation,
+total_frames) -> Result<Vec<i16>, AccessError>`, ported from `run_render_macro`'s
+tick-then-render loop. Collapsed to one allocation and one `TickClock::advance` call
+over the full duration: the original's 4096-frame chunking existed only to bound the
+buffer handed to the streaming `hound` writer, which doesn't exist on this side of the
+extraction, so nothing forces re-chunking. `tfmx-cli`'s `run_render_macro` now just
+calls it and `hound`-writes the returned buffer. New test
+`render_macro_pcm_matches_g0_golden_hash` hashes the raw `Vec<i16>` against G0's
+existing WAV-bytes golden hash directly (byte-identical, since 16-bit PCM WAV is a
+lossless container) — confirms the extraction changed nothing. Full workspace suite
+green (151 `tfmx` + 101 `tfmx-cli` + 34 `tfmx-analysis` tests), `cargo fmt --check` and
+clippy clean on the touched crates (no new warnings).
+**Next: Phase G3** (extract `render_pattern_pcm` into `tfmx-analysis`).
 
 ## Context
 

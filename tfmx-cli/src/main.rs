@@ -539,12 +539,18 @@ fn run_render_macro(args: &RenderMacroArgs) -> Result<(), CliError> {
     let smpl = std::fs::read(&args.smpl)?;
     let module = tfmx::Module::parse(&mdat, &smpl)?;
 
-    let mut interp = tfmx::MacroInterpreter::new();
-    let mut paula = tfmx::Paula::new(args.separation);
-    let mut unsupported = tfmx::UnsupportedOps::default();
-    let mut clock = tfmx::TickClock::new(args.tempo);
-    let voice = args.voice & 0x03;
-    interp.trigger(args.macro_number, args.note, args.volume, 0);
+    let total_frames = args.rate as usize * args.seconds as usize;
+    let pcm = tfmx_analysis::render_macro_pcm(
+        &module,
+        args.macro_number,
+        args.note,
+        args.volume,
+        args.voice,
+        args.tempo,
+        args.rate,
+        args.separation,
+        total_frames,
+    )?;
 
     let spec = hound::WavSpec {
         channels: 2,
@@ -553,34 +559,8 @@ fn run_render_macro(args: &RenderMacroArgs) -> Result<(), CliError> {
         sample_format: hound::SampleFormat::Int,
     };
     let mut writer = hound::WavWriter::create(&args.output, spec)?;
-
-    let total_frames = args.rate as usize * args.seconds as usize;
-    let mut buf = vec![0i16; 4096 * 2];
-    let mut frames_left = total_frames;
-    let mut error = None;
-    while frames_left > 0 && error.is_none() {
-        let chunk_frames = frames_left.min(4096);
-        let out = &mut buf[..chunk_frames * 2];
-        let mut pos = 0usize;
-        clock.advance(args.rate, chunk_frames as u32, |tick_due, span_frames| {
-            if tick_due
-                && error.is_none()
-                && let Err(e) = interp.tick(&module, &mut paula, voice, &mut unsupported, |_| {})
-            {
-                error = Some(e);
-            }
-            let start = pos * 2;
-            let end = start + span_frames as usize * 2;
-            paula.render(module.smpl(), args.rate, &mut out[start..end]);
-            pos += span_frames as usize;
-        });
-        if let Some(e) = error {
-            return Err(e.into());
-        }
-        for &sample in out.iter() {
-            writer.write_sample(sample)?;
-        }
-        frames_left -= chunk_frames;
+    for sample in pcm {
+        writer.write_sample(sample)?;
     }
     writer.finalize()?;
     Ok(())
