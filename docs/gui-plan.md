@@ -258,10 +258,14 @@ or similar later — same core dependency, different adapter).
 ## Files to touch
 
 - New: `tfmx-web-gui/Cargo.toml`, `tfmx-web-gui/src/main.rs` (static-file
-  serving; route handlers are W1), `tfmx-web-gui/src/session.rs` (`Session`),
-  `tfmx-web-gui/src/static_files.rs`, `tfmx-web-gui/static/index.html`
-  (placeholder; the real picker/panel layout is W2). **(crate skeleton done,
-  Phase W0; `app.js` and the real page are Phase W2)**
+  serving + route dispatch), `tfmx-web-gui/src/session.rs` (`Session`),
+  `tfmx-web-gui/src/static_files.rs`, `tfmx-web-gui/src/query.rs`
+  (percent-decoding query-string parser), `tfmx-web-gui/src/routes.rs`
+  (`/files`, `/load`, `/song-view`, `/disasm`, `/render-macro`,
+  `/render-pattern` handlers), `tfmx-web-gui/static/index.html` (placeholder;
+  the real picker/panel layout is W2). **(crate skeleton + static serving
+  done, Phase W0; routes done, Phase W1; `app.js` and the real page are Phase
+  W2)**
 - `tfmx-analysis/src/`: new `render.rs` (the two PCM functions) and `disasm.rs`
   (structured listing), wired into `lib.rs` next to the existing `view.rs`/
   `walker.rs`/`zones.rs` exports. **(done, G1-G3)**

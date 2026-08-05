@@ -4,12 +4,14 @@
 //! through `tfmx-cli`'s printed text; `tfmx-cli disasm` now just formats
 //! these lines.
 //!
-//! `DisasmLine::Pattern` embeds [`PatternEntry`] directly rather than
-//! mirroring it into a local view type (unlike `view.rs`'s `TrackSlotView`):
-//! nothing here needs JSON output yet, so there's no `serde` gating to
-//! satisfy -- add a mirror type if/when that's needed.
+//! `DisasmLine` itself embeds [`PatternEntry`] directly, unmirrored, since
+//! `tfmx-cli`'s text formatting only needs the plain Rust type. [`DisasmLineView`]
+//! is the JSON-facing mirror the `/disasm` route (`docs/gui-plan.md` Phase W1)
+//! serializes instead, the same way `view.rs`'s `TrackSlotView` mirrors
+//! `TrackSlot` -- the core crate stays `serde`-free, so anything embedding one
+//! of its types needs a local mirror to gain `Serialize`.
 
-use tfmx::{AccessError, Module, PatternCommand, PatternEntry, decode_pattern_entry};
+use tfmx::{AccessError, Module, NoteTiming, PatternCommand, PatternEntry, decode_pattern_entry};
 
 /// Stops at the opcode's own natural terminator (`$07 STOP` for a macro,
 /// `$F0 End`/`$F4 STOP` for a pattern) or after `MAX_DISASM_STEPS`, whichever
@@ -73,6 +75,211 @@ pub fn disassemble_pattern(module: &Module, pattern: u8) -> Result<Vec<DisasmLin
         }
     }
     Ok(lines)
+}
+
+/// JSON-serializable mirror of [`DisasmLine`] (`docs/gui-plan.md`'s
+/// `/disasm` route).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub enum DisasmLineView {
+    Macro {
+        step: usize,
+        opcode: u8,
+        aa: u8,
+        bb: u8,
+        cc: u8,
+    },
+    Pattern {
+        step: usize,
+        entry: PatternEntryView,
+    },
+}
+
+impl From<DisasmLine> for DisasmLineView {
+    fn from(line: DisasmLine) -> Self {
+        match line {
+            DisasmLine::Macro {
+                step,
+                opcode,
+                aa,
+                bb,
+                cc,
+            } => DisasmLineView::Macro {
+                step,
+                opcode,
+                aa,
+                bb,
+                cc,
+            },
+            DisasmLine::Pattern { step, entry } => DisasmLineView::Pattern {
+                step,
+                entry: entry.into(),
+            },
+        }
+    }
+}
+
+/// Mirrors [`NoteTiming`] for serialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub enum NoteTimingView {
+    Detune(i8),
+    Wait(u8),
+    Portamento(u8),
+}
+
+impl From<NoteTiming> for NoteTimingView {
+    fn from(timing: NoteTiming) -> Self {
+        match timing {
+            NoteTiming::Detune(v) => NoteTimingView::Detune(v),
+            NoteTiming::Wait(v) => NoteTimingView::Wait(v),
+            NoteTiming::Portamento(v) => NoteTimingView::Portamento(v),
+        }
+    }
+}
+
+/// Mirrors [`PatternEntry`] for serialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub enum PatternEntryView {
+    Note {
+        note: u8,
+        macro_number: u8,
+        volume: u8,
+        voice: u8,
+        timing: NoteTimingView,
+    },
+    Command(PatternCommandView),
+}
+
+impl From<PatternEntry> for PatternEntryView {
+    fn from(entry: PatternEntry) -> Self {
+        match entry {
+            PatternEntry::Note {
+                note,
+                macro_number,
+                volume,
+                voice,
+                timing,
+            } => PatternEntryView::Note {
+                note,
+                macro_number,
+                volume,
+                voice,
+                timing: timing.into(),
+            },
+            PatternEntry::Command(command) => PatternEntryView::Command(command.into()),
+        }
+    }
+}
+
+/// Mirrors [`PatternCommand`] for serialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub enum PatternCommandView {
+    End,
+    Loop {
+        times: u8,
+        target: u16,
+    },
+    Jump {
+        pattern: u8,
+        step: u16,
+    },
+    Wait {
+        jiffies: u8,
+    },
+    Stop,
+    KeyUp {
+        voice: u8,
+    },
+    Vibrato {
+        speed: u8,
+        voice: u8,
+        depth: u8,
+    },
+    Envelope {
+        amount: u8,
+        speed: u8,
+        voice: u8,
+        target: u8,
+    },
+    GoSub {
+        pattern: u8,
+        step: u16,
+    },
+    Return,
+    Fade {
+        speed: u8,
+        target: u8,
+    },
+    PlayPattern {
+        pattern: u8,
+        track: u8,
+        transpose: i8,
+    },
+    Portamento {
+        speed: u8,
+        voice: u8,
+        rate: u8,
+    },
+    Lock {
+        channel: u8,
+        ticks: u16,
+    },
+    StopCustom,
+    Nop,
+}
+
+impl From<PatternCommand> for PatternCommandView {
+    fn from(command: PatternCommand) -> Self {
+        match command {
+            PatternCommand::End => PatternCommandView::End,
+            PatternCommand::Loop { times, target } => PatternCommandView::Loop { times, target },
+            PatternCommand::Jump { pattern, step } => PatternCommandView::Jump { pattern, step },
+            PatternCommand::Wait { jiffies } => PatternCommandView::Wait { jiffies },
+            PatternCommand::Stop => PatternCommandView::Stop,
+            PatternCommand::KeyUp { voice } => PatternCommandView::KeyUp { voice },
+            PatternCommand::Vibrato {
+                speed,
+                voice,
+                depth,
+            } => PatternCommandView::Vibrato {
+                speed,
+                voice,
+                depth,
+            },
+            PatternCommand::Envelope {
+                amount,
+                speed,
+                voice,
+                target,
+            } => PatternCommandView::Envelope {
+                amount,
+                speed,
+                voice,
+                target,
+            },
+            PatternCommand::GoSub { pattern, step } => PatternCommandView::GoSub { pattern, step },
+            PatternCommand::Return => PatternCommandView::Return,
+            PatternCommand::Fade { speed, target } => PatternCommandView::Fade { speed, target },
+            PatternCommand::PlayPattern {
+                pattern,
+                track,
+                transpose,
+            } => PatternCommandView::PlayPattern {
+                pattern,
+                track,
+                transpose,
+            },
+            PatternCommand::Portamento { speed, voice, rate } => {
+                PatternCommandView::Portamento { speed, voice, rate }
+            }
+            PatternCommand::Lock { channel, ticks } => PatternCommandView::Lock { channel, ticks },
+            PatternCommand::StopCustom => PatternCommandView::StopCustom,
+            PatternCommand::Nop => PatternCommandView::Nop,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -141,6 +348,27 @@ mod tests {
                     timing: NoteTiming::Wait(31),
                 },
             }
+        );
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn disasm_line_view_serializes_a_pattern_note_to_the_expected_json_shape() {
+        let line = DisasmLine::Pattern {
+            step: 0,
+            entry: PatternEntry::Note {
+                note: 33,
+                macro_number: 48,
+                volume: 12,
+                voice: 2,
+                timing: NoteTiming::Wait(31),
+            },
+        };
+        let json = serde_json::to_string(&DisasmLineView::from(line)).expect("serializes");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(
+            value["Pattern"]["entry"]["Note"]["timing"],
+            serde_json::json!({ "Wait": 31 })
         );
     }
 }

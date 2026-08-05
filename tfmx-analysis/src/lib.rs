@@ -8,7 +8,10 @@ mod render;
 mod view;
 mod walker;
 mod zones;
-pub use disasm::{DisasmLine, disassemble_macro, disassemble_pattern};
+pub use disasm::{
+    DisasmLine, DisasmLineView, NoteTimingView, PatternCommandView, PatternEntryView,
+    disassemble_macro, disassemble_pattern,
+};
 pub use render::{render_macro_pcm, render_pattern_pcm};
 pub use view::{
     LineCommandView, SongView, StepView, TrackSlotView, TrackstepMap, TrackstepStep,

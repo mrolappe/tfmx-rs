@@ -1,14 +1,15 @@
-//! Local browser GUI for TFMX tooling (`docs/gui-plan.md`). Phase W0: just
-//! the crate skeleton and static-file serving. Routes over a loaded
-//! `Session` (`/files`, `/load`, `/song-view`, `/disasm`, `/render-*`) are
-//! Phase W1.
+//! Local browser GUI for TFMX tooling (`docs/gui-plan.md`). Serves the
+//! static page plus the `Session`-backed API routes (`/files`, `/load`,
+//! `/song-view`, `/disasm`, `/render-*`) Phase W1 adds; the real page layout
+//! consuming them is Phase W2.
 
-// ponytail: `session` isn't wired into a route yet -- that's Phase W1.
-#[allow(dead_code)]
+mod query;
+mod routes;
 mod session;
 mod static_files;
 
-use tiny_http::{Response, Server};
+use session::Session;
+use tiny_http::{Method, Response, Server};
 
 fn main() {
     let addr = "127.0.0.1:8080";
@@ -16,17 +17,37 @@ fn main() {
     let static_dir = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/static"));
     eprintln!("tfmx-web-gui listening on http://{addr}");
 
-    for request in server.incoming_requests() {
-        let response = match static_files::resolve(&static_dir, request.url()) {
-            Some(path) => {
-                let content_type = static_files::content_type(&path);
-                let bytes = std::fs::read(&path).unwrap_or_default();
-                let header =
-                    tiny_http::Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes())
-                        .expect("static content-type is valid header bytes");
-                Response::from_data(bytes).with_header(header)
+    let mut session: Option<Session> = None;
+
+    for mut request in server.incoming_requests() {
+        let path = request.url().split('?').next().unwrap_or("/").to_string();
+        let query = query::parse(request.url());
+
+        let response = match (request.method(), path.as_str()) {
+            (Method::Get, "/files") => routes::list_files(&query),
+            (Method::Post, "/load") => {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+                routes::load(&mut session, &body)
             }
-            None => Response::from_string("not found").with_status_code(404),
+            (Method::Get, "/song-view") => routes::song_view(session.as_ref(), &query),
+            (Method::Get, "/disasm") => routes::disasm(session.as_ref(), &query),
+            (Method::Get, "/render-macro") => routes::render_macro(session.as_ref(), &query),
+            (Method::Get, "/render-pattern") => routes::render_pattern(session.as_ref(), &query),
+            (Method::Get, _) => match static_files::resolve(&static_dir, request.url()) {
+                Some(path) => {
+                    let content_type = static_files::content_type(&path);
+                    let bytes = std::fs::read(&path).unwrap_or_default();
+                    let header = tiny_http::Header::from_bytes(
+                        &b"Content-Type"[..],
+                        content_type.as_bytes(),
+                    )
+                    .expect("static content-type is valid header bytes");
+                    Response::from_data(bytes).with_header(header)
+                }
+                None => routes::not_found(),
+            },
+            _ => routes::not_found(),
         };
         let _ = request.respond(response);
     }

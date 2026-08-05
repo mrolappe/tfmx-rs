@@ -1201,6 +1201,7 @@ dependencies = [
 name = "tfmx-web-gui"
 version = "0.1.0"
 dependencies = [
+ "hound",
  "serde_json",
  "tfmx",
  "tfmx-analysis",
