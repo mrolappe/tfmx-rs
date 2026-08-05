@@ -69,7 +69,34 @@ bit-identical), `cargo clippy --workspace --all-targets` clean (same one
 pre-existing unrelated `mutation_robustness.rs` warning as every prior phase). The
 "Files to touch" checklist below is fully satisfied for the `tfmx-analysis`/
 `tfmx-cli` extraction (`tfmx-web-gui` itself is Phase W0, not yet started).
-**Next: Phase W0** (`tfmx-web-gui` crate skeleton).
+**Phase W0 done (2026-08-05)**: new `tfmx-web-gui` binary crate, added to workspace
+`members`, depending on `tfmx`, `tfmx-analysis` (`serde` feature) and `tiny_http`
+(0.12). `src/main.rs` is a minimal `tiny_http` server serving `static/index.html`
+(a placeholder page) plus static assets under `static/`, with a path-traversal
+guard (`src/static_files.rs`'s `resolve`, canonicalizes and checks
+`starts_with(static_dir)`) and a small extension-to-MIME-type map. `src/session.rs`
+adds `Session`: owns the loaded `mdat`/`smpl` bytes and hands out a freshly
+`Module::parse`d `tfmx::Module` per call rather than caching one — every
+`tfmx-analysis` entry point (`render_*_pcm`, `disassemble_*`, `build_song_view`)
+already takes `&Module` and builds its own transient state per call (confirmed by
+reading `render_macro_pcm`'s signature), and this GUI's scope is render-ahead-to-
+WAV-blob, not live streaming, so there is no persistent `Player` to keep between
+requests — unlike `tfmx-web`'s `Core`, which leaks `mdat`/`smpl`/`Module` to
+`'static` because a wasm page's `Core` lives exactly as long as the tab; that
+pattern doesn't fit a long-running server process reloading modules repeatedly via
+`POST /load`, so `Session` re-parses instead (cheap: `Module::parse` only reads the
+fixed header). `Session` validates the pair parses at `load()` time so a bad file
+errors immediately rather than on first later request. `Session` isn't wired into
+a route yet (that's Phase W1), so `mod session;` in `main.rs` carries a `ponytail:`
+`#[allow(dead_code)]`. TDD'd: 8 new tests (`session`: loads a valid corpus module
+and re-parses consistently, rejects a missing file, rejects a non-module file;
+`static_files`: root resolves to index.html, query strings stripped, traversal
+rejected, missing file rejected, content-type lookup). Manually smoke-tested with
+`curl`: `GET /` → 200 with the placeholder HTML, `GET /../Cargo.toml` → 404
+(traversal blocked), `GET /nope` → 404. Full `cargo test --workspace` green,
+`cargo fmt --check` and `cargo clippy --workspace --all-targets` clean (same one
+pre-existing unrelated `mutation_robustness.rs` warning as every prior phase).
+**Next: Phase W1** (routes over `Session`).
 
 ## Context
 
@@ -230,8 +257,11 @@ or similar later — same core dependency, different adapter).
 
 ## Files to touch
 
-- New: `tfmx-web-gui/Cargo.toml`, `tfmx-web-gui/src/main.rs` (routing),
-  `tfmx-web-gui/static/index.html` + `app.js`. **(not started, Phase W0)**
+- New: `tfmx-web-gui/Cargo.toml`, `tfmx-web-gui/src/main.rs` (static-file
+  serving; route handlers are W1), `tfmx-web-gui/src/session.rs` (`Session`),
+  `tfmx-web-gui/src/static_files.rs`, `tfmx-web-gui/static/index.html`
+  (placeholder; the real picker/panel layout is W2). **(crate skeleton done,
+  Phase W0; `app.js` and the real page are Phase W2)**
 - `tfmx-analysis/src/`: new `render.rs` (the two PCM functions) and `disasm.rs`
   (structured listing), wired into `lib.rs` next to the existing `view.rs`/
   `walker.rs`/`zones.rs` exports. **(done, G1-G3)**
@@ -239,8 +269,7 @@ or similar later — same core dependency, different adapter).
   handlers down to arg-parsing + calling the extracted functions + writing
   output (WAV/stdout) — remove the now-duplicated logic. **(done, G1-G3,
   confirmed no leftover duplication in G4)**
-- Root `Cargo.toml`: add `tfmx-web-gui` to workspace members. **(not started,
-  Phase W0)**
+- Root `Cargo.toml`: add `tfmx-web-gui` to workspace members. **(done, W0)**
 
 ## Verification
 
